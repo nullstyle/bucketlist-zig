@@ -1,0 +1,11 @@
+# Keep compatible with slcp-zig's mise setup for explicit Zig dev builds.
+min_version = "2026.7.17"
+
+[tools]
+# The only exact Zig pin in this repo. Match ../slcp-zig/mise.toml;
+# build.zig.zon carries only minimum_zig_version.
+zig = "0.17.0-dev.1786+75044cb04"
+just = "1.58.0"
+node = "24.18.0"
+python = "3.14.7"
+actionlint = "1.7.12"

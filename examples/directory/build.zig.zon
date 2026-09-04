@@ -1,0 +1,8 @@
+.{
+    .name = .directory,
+    .version = "0.0.0",
+    .fingerprint = 0x467844daaa87868d,
+    .minimum_zig_version = "0.17.0-dev.1786",
+    .dependencies = .{ .bucketlist = .{ .path = "../.." } },
+    .paths = .{ "build.zig", "build.zig.zon", "main.zig" },
+}

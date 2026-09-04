@@ -1,0 +1,979 @@
+//! Native immutable blob storage and atomic checkpoint publication.
+//! See docs/storage.md for ownership, durability, and collection contracts.
+const std = @import("std");
+const builtin = @import("builtin");
+
+pub const Hash = [32]u8;
+pub const Error = error{
+    OutOfMemory,
+    IoFailed,
+    NotFound,
+    TooLarge,
+    CorruptBlob,
+    CorruptManifest,
+    NotRegularFile,
+    UnsupportedPlatform,
+    StoreBusy,
+    InvalidPath,
+    InvalidBucket,
+};
+
+/// Per-record workspace and total-work limits for native streaming merges.
+/// These are local resource policies, not part of the bucket hash encoding.
+pub const MergeLimits = struct {
+    max_key_bytes: u32 = 64 * 1024,
+    max_value_bytes: u32 = 1024 * 1024,
+    max_records: u64 = 1 << 32,
+    max_bucket_bytes: u64 = 1 << 40,
+};
+
+const magic = "BKLSTOR1";
+const header_len = magic.len + 8 + 32;
+const manifest_name = "manifest";
+const PublishFault = enum {
+    none,
+    after_header_write,
+    after_payload_write,
+    after_file_sync,
+    before_replace,
+    after_replace,
+    after_directory_sync,
+    after_final_file_sync,
+};
+
+pub const Store = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    blobs: std.Io.Dir,
+    lock: std.Io.File,
+
+    /// Owns open directory and exclusive advisory lock handles. The allocator
+    /// must remain valid until deinit. Calls on one Store must be serialized.
+    pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) Error!Store {
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos)
+            return error.UnsupportedPlatform;
+        const root = try openPath(io, path);
+        errdefer root.close(io);
+        const lock = root.createFile(io, "LOCK", .{
+            .exclusive = true,
+            .read = true,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+            .resolve_beneath = true,
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => root.openFile(io, "LOCK", .{
+                .mode = .read_write,
+                .allow_directory = false,
+                .follow_symlinks = false,
+                .resolve_beneath = true,
+                .lock = .exclusive,
+                .lock_nonblocking = true,
+            }) catch |e| return mapIo(e),
+            else => return mapIo(err),
+        };
+        errdefer lock.close(io);
+        if ((lock.stat(io) catch return error.IoFailed).kind != .file)
+            return error.NotRegularFile;
+        try fullSync(io, lock);
+        const blobs = root.createDirPathOpen(io, "blobs", .{
+            .open_options = .{ .follow_symlinks = false, .iterate = true },
+        }) catch return error.IoFailed;
+        errdefer blobs.close(io);
+        try syncDir(io, blobs);
+        try syncDir(io, root);
+        try fullSync(io, lock);
+        return .{ .gpa = gpa, .io = io, .root = root, .blobs = blobs, .lock = lock };
+    }
+
+    pub fn deinit(self: *Store) void {
+        self.blobs.close(self.io);
+        self.lock.close(self.io);
+        self.root.close(self.io);
+        self.* = undefined;
+    }
+
+    /// SHA256(bytes) names immutable contents. Existing contents must verify;
+    /// an existing corrupt file is an error, never silently overwritten.
+    /// A successful return means the file and its directory entry are synced.
+    pub fn putBlob(self: *Store, bytes: []const u8) Error!Hash {
+        const hash = digest(bytes);
+        const name = std.fmt.bytesToHex(hash, .lower);
+        var atomic = self.blobs.createFileAtomic(self.io, &name, .{}) catch return error.IoFailed;
+        defer atomic.deinit(self.io);
+        try writeBytes(self.io, atomic.file, bytes);
+        try fullSync(self.io, atomic.file);
+        atomic.link(self.io) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                const existing = self.getBlob(self.gpa, hash, bytes.len) catch |e| switch (e) {
+                    error.TooLarge => return error.CorruptBlob,
+                    else => return e,
+                };
+                defer self.gpa.free(existing);
+                if (!std.mem.eql(u8, bytes, existing)) return error.CorruptBlob;
+                const file = try openRegular(self.blobs, self.io, &name);
+                defer file.close(self.io);
+                try fullSync(self.io, file);
+            },
+            else => return error.IoFailed,
+        };
+        try syncDir(self.io, self.blobs);
+        // A final full sync after the directory barrier flushes the renamed
+        // entry's metadata through the drive cache on macOS too.
+        const installed = try openRegular(self.blobs, self.io, &name);
+        defer installed.close(self.io);
+        try fullSync(self.io, installed);
+        return hash;
+    }
+
+    /// The caller owns the returned allocation. max_bytes is an inclusive
+    /// bound, checked before allocation and again while reading.
+    pub fn getBlob(self: *Store, gpa: std.mem.Allocator, hash: Hash, max_bytes: usize) Error![]u8 {
+        const name = std.fmt.bytesToHex(hash, .lower);
+        const bytes = try readBounded(self.blobs, self.io, &name, gpa, max_bytes);
+        errdefer gpa.free(bytes);
+        if (!std.mem.eql(u8, &hash, &digest(bytes))) return error.CorruptBlob;
+        return bytes;
+    }
+
+    /// Merge canonical sorted buckets with newest-record precedence. The
+    /// caller may drop tombstones only at a boundary with no older records.
+    /// Two fully verified passes use bounded record workspace, independent of
+    /// bucket size. The result is durable; no manifest is published here.
+    pub fn mergeBuckets(self: *Store, older: Hash, newer: Hash, drop_tombstones: bool, limits: MergeLimits) Error!Hash {
+        const first = try mergePass(self, older, newer, drop_tombstones, limits, null);
+        var name: [64]u8 = @splat('0');
+        // Atomic holds a borrowed destination slice. Fill it with the final
+        // digest before link; no provisional destination is ever installed.
+        var atomic = self.blobs.createFileAtomic(self.io, &name, .{}) catch return error.IoFailed;
+        defer atomic.deinit(self.io);
+        var buffer: [8192]u8 = undefined;
+        var writer = atomic.file.writer(self.io, &buffer);
+        var output: MergeOutput = .{ .writer = &writer.interface, .limit = limits.max_bucket_bytes };
+        try output.write(bucket_domain);
+        var count_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &count_bytes, first.count, .big);
+        try output.write(&count_bytes);
+        const second = try mergePass(self, older, newer, drop_tombstones, limits, &output);
+        if (second.count != first.count or second.size != first.size or output.size != first.size)
+            return error.CorruptBlob;
+        writer.interface.flush() catch return error.IoFailed;
+        const hash = output.hash.finalResult();
+        name = std.fmt.bytesToHex(hash, .lower);
+        try fullSync(self.io, atomic.file);
+        atomic.link(self.io) catch |err| switch (err) {
+            error.PathAlreadyExists => try verifyFile(self.blobs, self.io, &name, hash, first.size),
+            else => return error.IoFailed,
+        };
+        try syncDir(self.io, self.blobs);
+        const installed = try openRegular(self.blobs, self.io, &name);
+        defer installed.close(self.io);
+        try fullSync(self.io, installed);
+        return hash;
+    }
+
+    /// Publish an opaque application manifest after putBlob has durably
+    /// installed EVERY referenced blob. This layer cannot inspect references.
+    /// After a post-rename error the new manifest may already be visible.
+    pub fn publish(self: *Store, manifest_bytes: []const u8) Error!void {
+        return self.publishImpl(manifest_bytes, .none);
+    }
+
+    fn publishImpl(self: *Store, bytes: []const u8, fault: PublishFault) Error!void {
+        try syncDir(self.io, self.blobs);
+        var header: [header_len]u8 = undefined;
+        @memcpy(header[0..magic.len], magic);
+        std.mem.writeInt(u64, header[magic.len..][0..8], @intCast(bytes.len), .big);
+        @memcpy(header[magic.len + 8 ..], &digest(bytes));
+        var atomic = self.root.createFileAtomic(self.io, manifest_name, .{ .replace = true }) catch return error.IoFailed;
+        defer atomic.deinit(self.io);
+        var buffer: [4096]u8 = undefined;
+        var writer = atomic.file.writer(self.io, &buffer);
+        writer.interface.writeAll(&header) catch return error.IoFailed;
+        if (fault == .after_header_write) return error.IoFailed;
+        writer.interface.writeAll(bytes) catch return error.IoFailed;
+        if (fault == .after_payload_write) return error.IoFailed;
+        writer.interface.flush() catch return error.IoFailed;
+        try fullSync(self.io, atomic.file);
+        if (fault == .after_file_sync) return error.IoFailed;
+        if (fault == .before_replace) return error.IoFailed;
+        atomic.replace(self.io) catch return error.IoFailed;
+        if (fault == .after_replace) return error.IoFailed;
+        try syncDir(self.io, self.root);
+        if (fault == .after_directory_sync) return error.IoFailed;
+        const installed = try openRegular(self.root, self.io, manifest_name);
+        defer installed.close(self.io);
+        try fullSync(self.io, installed);
+        if (fault == .after_final_file_sync) return error.IoFailed;
+    }
+
+    /// null means no checkpoint has been published. Malformed/truncated
+    /// storage envelopes are errors, never treated as an absent checkpoint.
+    pub fn readManifest(self: *Store, gpa: std.mem.Allocator, max_bytes: usize) Error!?[]u8 {
+        const wrapped = readBounded(self.root, self.io, manifest_name, gpa, max_bytes +| header_len) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer gpa.free(wrapped);
+        if (wrapped.len < header_len or !std.mem.eql(u8, wrapped[0..magic.len], magic))
+            return error.CorruptManifest;
+        const len = std.mem.readInt(u64, wrapped[magic.len..][0..8], .big);
+        if (len > max_bytes) return error.TooLarge;
+        if (len != wrapped.len - header_len) return error.CorruptManifest;
+        const bytes = wrapped[header_len..];
+        if (!std.mem.eql(u8, wrapped[magic.len + 8 .. header_len], &digest(bytes)))
+            return error.CorruptManifest;
+        return gpa.dupe(u8, bytes) catch return error.OutOfMemory;
+    }
+
+    /// Explicit reachability GC. Caller must include the current manifest,
+    /// retained checkpoints, active readers, and pending publications' blobs.
+    /// Only regular files with exactly 64 lowercase hex characters are removed.
+    /// Unknown names, symlinks, directories, and atomic-write debris survive.
+    pub fn collect(self: *Store, reachable: []const Hash) Error!usize {
+        var removed: usize = 0;
+        var iter = self.blobs.iterate();
+        while (iter.next(self.io) catch return error.IoFailed) |entry| {
+            if (entry.kind != .file) continue;
+            const hash = parseName(entry.name) orelse continue;
+            var keep = false;
+            for (reachable) |live| {
+                if (std.mem.eql(u8, &hash, &live)) {
+                    keep = true;
+                    break;
+                }
+            }
+            if (keep) continue;
+            self.blobs.deleteFile(self.io, entry.name) catch return error.IoFailed;
+            removed += 1;
+        }
+        if (removed != 0) {
+            try syncDir(self.io, self.blobs);
+            try fullSync(self.io, self.lock);
+        }
+        return removed;
+    }
+};
+
+// This native module deliberately does not import the core's bucket source:
+// both modules can coexist in one Zig graph. Literal fixtures below pin parity
+// with bucket.zig's documented canonical format and independently known hash.
+const bucket_domain = "bucketlist.bucket.v1\x00";
+const empty_bucket = bucket_domain ++ "\x00\x00\x00\x00\x00\x00\x00\x00";
+const stream_buffer_len = 8192;
+
+const StreamRecord = struct {
+    table: u32,
+    key: []const u8,
+    value: ?[]const u8,
+};
+
+fn recordOrder(a: StreamRecord, b: StreamRecord) std.math.Order {
+    if (a.table != b.table) return std.math.order(a.table, b.table);
+    return std.mem.order(u8, a.key, b.key);
+}
+
+const BucketReader = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    file: std.Io.File,
+    reader: std.Io.File.Reader,
+    scratch: []u8,
+    key_buffer: []u8,
+    previous_key: []u8,
+    value_buffer: []u8,
+    hash: std.crypto.hash.sha2.Sha256 = .init(.{}),
+    expected: Hash,
+    size: u64,
+    consumed: u64 = 0,
+    remaining: u64 = 0,
+    current: ?StreamRecord = null,
+    finished: bool = false,
+
+    fn init(store: *Store, expected: Hash, limits: MergeLimits) Error!BucketReader {
+        const name = std.fmt.bytesToHex(expected, .lower);
+        const file = try openRegular(store.blobs, store.io, &name);
+        errdefer file.close(store.io);
+        const size = (file.stat(store.io) catch return error.IoFailed).size;
+        if (size > limits.max_bucket_bytes) return error.TooLarge;
+        if (size < empty_bucket.len) return error.InvalidBucket;
+        const key_len: usize = limits.max_key_bytes;
+        const value_len: usize = limits.max_value_bytes;
+        const keys_len = std.math.mul(usize, key_len, 2) catch return error.TooLarge;
+        const records_len = std.math.add(usize, keys_len, value_len) catch return error.TooLarge;
+        const scratch_len = std.math.add(usize, records_len, stream_buffer_len) catch return error.TooLarge;
+        const scratch = store.gpa.alloc(u8, scratch_len) catch return error.OutOfMemory;
+        errdefer store.gpa.free(scratch);
+        var self: BucketReader = .{
+            .io = store.io,
+            .gpa = store.gpa,
+            .file = file,
+            .reader = file.reader(store.io, scratch[records_len..]),
+            .scratch = scratch,
+            .key_buffer = scratch[0..key_len],
+            .previous_key = scratch[key_len..keys_len],
+            .value_buffer = scratch[keys_len..records_len],
+            .expected = expected,
+            .size = size,
+        };
+        var header: [empty_bucket.len]u8 = undefined;
+        try self.read(&header);
+        if (!std.mem.eql(u8, header[0..bucket_domain.len], bucket_domain)) return error.InvalidBucket;
+        self.remaining = std.mem.readInt(u64, header[bucket_domain.len..][0..8], .big);
+        if (self.remaining > limits.max_records) return error.TooLarge;
+        if (self.remaining > (size - empty_bucket.len) / 9) return error.InvalidBucket;
+        return self;
+    }
+
+    fn deinit(self: *BucketReader) void {
+        self.file.close(self.io);
+        self.gpa.free(self.scratch);
+        self.* = undefined;
+    }
+
+    fn read(self: *BucketReader, bytes: []u8) Error!void {
+        if (bytes.len > self.size - self.consumed) return error.InvalidBucket;
+        self.reader.interface.readSliceAll(bytes) catch |err| return switch (err) {
+            error.EndOfStream => error.InvalidBucket,
+            error.ReadFailed => error.IoFailed,
+        };
+        self.hash.update(bytes);
+        self.consumed += bytes.len;
+    }
+
+    fn integer(self: *BucketReader, comptime T: type) Error!T {
+        var bytes: [@sizeOf(T)]u8 = undefined;
+        try self.read(&bytes);
+        return std.mem.readInt(T, &bytes, .big);
+    }
+
+    fn advance(self: *BucketReader) Error!void {
+        if (self.remaining == 0) {
+            self.current = null;
+            if (self.finished) return;
+            if (self.consumed != self.size) return error.InvalidBucket;
+            if (self.reader.interface.peekByte()) |_| {
+                return error.InvalidBucket;
+            } else |err| switch (err) {
+                error.EndOfStream => {},
+                error.ReadFailed => return error.IoFailed,
+            }
+            if (!std.mem.eql(u8, &self.expected, &self.hash.finalResult())) return error.CorruptBlob;
+            self.finished = true;
+            return;
+        }
+        var previous: ?StreamRecord = null;
+        if (self.current) |record| {
+            std.mem.swap([]u8, &self.previous_key, &self.key_buffer);
+            previous = .{ .table = record.table, .key = self.previous_key[0..record.key.len], .value = null };
+        }
+        const table = try self.integer(u32);
+        const key_len = try self.integer(u32);
+        if (key_len > self.key_buffer.len) return error.TooLarge;
+        const key = self.key_buffer[0..key_len];
+        try self.read(key);
+        const tag = try self.integer(u8);
+        const value: ?[]const u8 = switch (tag) {
+            0 => null,
+            1 => value: {
+                const value_len = try self.integer(u32);
+                if (value_len > self.value_buffer.len) return error.TooLarge;
+                const bytes = self.value_buffer[0..value_len];
+                try self.read(bytes);
+                break :value bytes;
+            },
+            else => return error.InvalidBucket,
+        };
+        const record: StreamRecord = .{ .table = table, .key = key, .value = value };
+        if (previous) |p| if (recordOrder(p, record) != .lt) return error.InvalidBucket;
+        self.current = record;
+        self.remaining -= 1;
+    }
+};
+
+const MergeOutput = struct {
+    writer: *std.Io.Writer,
+    hash: std.crypto.hash.sha2.Sha256 = .init(.{}),
+    size: u64 = 0,
+    limit: u64,
+
+    fn write(self: *MergeOutput, bytes: []const u8) Error!void {
+        if (bytes.len > self.limit - self.size) return error.TooLarge;
+        self.writer.writeAll(bytes) catch return error.IoFailed;
+        self.hash.update(bytes);
+        self.size += bytes.len;
+    }
+
+    fn record(self: *MergeOutput, row: StreamRecord) Error!void {
+        var header: [8]u8 = undefined;
+        std.mem.writeInt(u32, header[0..4], row.table, .big);
+        std.mem.writeInt(u32, header[4..8], @intCast(row.key.len), .big);
+        try self.write(&header);
+        try self.write(row.key);
+        if (row.value) |bytes| {
+            try self.write(&.{1});
+            std.mem.writeInt(u32, header[0..4], @intCast(bytes.len), .big);
+            try self.write(header[0..4]);
+            try self.write(bytes);
+        } else try self.write(&.{0});
+    }
+};
+
+const MergeSize = struct { count: u64 = 0, size: u64 = empty_bucket.len };
+
+fn mergePass(store: *Store, older: Hash, newer: Hash, drop_tombstones: bool, limits: MergeLimits, output: ?*MergeOutput) Error!MergeSize {
+    var old = try BucketReader.init(store, older, limits);
+    defer old.deinit();
+    var new = try BucketReader.init(store, newer, limits);
+    defer new.deinit();
+    try old.advance();
+    try new.advance();
+    var result: MergeSize = .{};
+    while (old.current != null or new.current != null) {
+        var take_old = false;
+        var take_new = false;
+        const selected: StreamRecord = if (old.current) |a| selected: {
+            if (new.current) |b| {
+                switch (recordOrder(a, b)) {
+                    .lt => {
+                        take_old = true;
+                        break :selected a;
+                    },
+                    .eq => {
+                        take_old = true;
+                        take_new = true;
+                        break :selected b;
+                    },
+                    .gt => {
+                        take_new = true;
+                        break :selected b;
+                    },
+                }
+            }
+            take_old = true;
+            break :selected a;
+        } else selected: {
+            take_new = true;
+            break :selected new.current.?;
+        };
+        if (!drop_tombstones or selected.value != null) {
+            if (result.count == limits.max_records) return error.TooLarge;
+            const size: u64 = 9 + @as(u64, selected.key.len) + if (selected.value) |v| 4 + @as(u64, v.len) else 0;
+            if (size > limits.max_bucket_bytes - result.size) return error.TooLarge;
+            result.size += size;
+            result.count += 1;
+            if (output) |dest| try dest.record(selected);
+        }
+        if (take_old) try old.advance();
+        if (take_new) try new.advance();
+    }
+    return result;
+}
+
+fn verifyFile(dir: std.Io.Dir, io: std.Io, name: []const u8, expected: Hash, expected_size: u64) Error!void {
+    const file = try openRegular(dir, io, name);
+    defer file.close(io);
+    if ((file.stat(io) catch return error.IoFailed).size != expected_size) return error.CorruptBlob;
+    var buffer: [8192]u8 = undefined;
+    var reader = file.reader(io, &.{});
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var remaining = expected_size;
+    while (remaining != 0) {
+        const n: usize = @intCast(@min(remaining, buffer.len));
+        reader.interface.readSliceAll(buffer[0..n]) catch |err| return switch (err) {
+            error.EndOfStream => error.CorruptBlob,
+            error.ReadFailed => error.IoFailed,
+        };
+        hash.update(buffer[0..n]);
+        remaining -= n;
+    }
+    var tail: [1]u8 = undefined;
+    if (reader.interface.readSliceAll(&tail)) |_| return error.CorruptBlob else |err| switch (err) {
+        error.EndOfStream => {},
+        error.ReadFailed => return error.IoFailed,
+    }
+    if (!std.mem.eql(u8, &expected, &hash.finalResult())) return error.CorruptBlob;
+}
+
+fn digest(bytes: []const u8) Hash {
+    var hash: Hash = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+    return hash;
+}
+
+fn parseName(name: []const u8) ?Hash {
+    if (name.len != 64) return null;
+    for (name) |c| if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return null;
+    var hash: Hash = undefined;
+    _ = std.fmt.hexToBytes(&hash, name) catch return null;
+    return hash;
+}
+
+fn mapIo(err: anyerror) Error {
+    return switch (err) {
+        error.FileNotFound => error.NotFound,
+        error.WouldBlock => error.StoreBusy,
+        else => error.IoFailed,
+    };
+}
+
+fn openRegular(dir: std.Io.Dir, io: std.Io, name: []const u8) Error!std.Io.File {
+    // Reject FIFOs/devices before read-only open, which can otherwise block.
+    // The handle check below remains necessary. Callers must exclude hostile
+    // concurrent directory-entry replacement; the precheck is not atomic.
+    const before = dir.statFile(io, name, .{ .follow_symlinks = false }) catch |err| return mapIo(err);
+    if (before.kind == .sym_link) return error.IoFailed;
+    if (before.kind != .file) return error.NotRegularFile;
+    const file = dir.openFile(io, name, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    }) catch |err| return mapIo(err);
+    errdefer file.close(io);
+    if ((file.stat(io) catch return error.IoFailed).kind != .file) return error.NotRegularFile;
+    return file;
+}
+
+fn readBounded(dir: std.Io.Dir, io: std.Io, name: []const u8, gpa: std.mem.Allocator, max_bytes: usize) Error![]u8 {
+    const file = try openRegular(dir, io, name);
+    defer file.close(io);
+    if ((file.stat(io) catch return error.IoFailed).size > max_bytes) return error.TooLarge;
+    var reader = file.reader(io, &.{});
+    // Reader limits are exclusive: reaching the limit before seeing EOF is
+    // StreamTooLong. Allow one lookahead byte and enforce our inclusive API.
+    const bytes = reader.interface.allocRemaining(gpa, .limited(max_bytes +| 1)) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.StreamTooLong => error.TooLarge,
+        error.ReadFailed => error.IoFailed,
+    };
+    errdefer gpa.free(bytes);
+    if (bytes.len > max_bytes) return error.TooLarge;
+    return bytes;
+}
+
+fn writeBytes(io: std.Io, file: std.Io.File, bytes: []const u8) Error!void {
+    var buffer: [4096]u8 = undefined;
+    var writer = file.writer(io, &buffer);
+    writer.interface.writeAll(bytes) catch return error.IoFailed;
+    writer.interface.flush() catch return error.IoFailed;
+}
+
+fn fullSync(io: std.Io, file: std.Io.File) Error!void {
+    file.sync(io) catch return error.IoFailed;
+    if (comptime builtin.os.tag == .macos) {
+        if (std.c.fcntl(file.handle, std.posix.F.FULLFSYNC) < 0) return error.IoFailed;
+    }
+}
+
+fn syncDir(io: std.Io, dir: std.Io.Dir) Error!void {
+    // Linux uses O_PATH for non-iterable directory handles; fsync on those
+    // descriptors fails with EBADF. Request an iterable/readable handle even
+    // when the caller only opened its directory for relative path access.
+    const readable = dir.openDir(io, ".", .{ .iterate = true, .follow_symlinks = false }) catch return error.IoFailed;
+    defer readable.close(io);
+    const file: std.Io.File = .{ .handle = readable.handle, .flags = .{ .nonblocking = false } };
+    file.sync(io) catch return error.IoFailed;
+}
+
+/// Resolve each component separately so symlinked ancestors cannot redirect
+/// a store. The caller still controls and trusts its cwd and ancestor dirs.
+fn openPath(io: std.Io, path: []const u8) Error!std.Io.Dir {
+    if (path.len == 0) return error.InvalidPath;
+    var components = std.mem.splitScalar(u8, path, '/');
+    var checked = components;
+    while (checked.next()) |part| if (std.mem.eql(u8, part, "..")) return error.InvalidPath;
+    var dir = std.Io.Dir.cwd().openDir(io, if (std.fs.path.isAbsolute(path)) "/" else ".", .{
+        .follow_symlinks = false,
+    }) catch return error.IoFailed;
+    errdefer dir.close(io);
+    while (components.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
+        const next = dir.createDirPathOpen(io, part, .{
+            .open_options = .{ .follow_symlinks = false },
+        }) catch return error.IoFailed;
+        syncDir(io, dir) catch |err| {
+            next.close(io);
+            return err;
+        };
+        dir.close(io);
+        dir = next;
+    }
+    return dir;
+}
+
+const testing = std.testing;
+
+fn testStore(tmp: *testing.TmpDir) !Store {
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(testing.io, &path);
+    return Store.open(testing.allocator, testing.io, path[0..len]);
+}
+
+test "immutable blobs verify hashes, exact limits, corruption, and truncation" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    const empty_hash = try store.putBlob("");
+    const empty = try store.getBlob(testing.allocator, empty_hash, 0);
+    defer testing.allocator.free(empty);
+    try testing.expectEqual(@as(usize, 0), empty.len);
+    const hash = try store.putBlob("bucket data");
+    try testing.expectEqual(hash, try store.putBlob("bucket data"));
+    const bytes = try store.getBlob(testing.allocator, hash, 11);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualStrings("bucket data", bytes);
+    try testing.expectError(error.TooLarge, store.getBlob(testing.allocator, hash, 10));
+    try testing.expectError(error.NotFound, store.getBlob(testing.allocator, digest("absent"), 100));
+    const name = std.fmt.bytesToHex(hash, .lower);
+    const file = try store.blobs.createFile(testing.io, &name, .{});
+    defer file.close(testing.io);
+    try writeBytes(testing.io, file, "bucket datX");
+    try testing.expectError(error.CorruptBlob, store.getBlob(testing.allocator, hash, 100));
+    try testing.expectError(error.CorruptBlob, store.putBlob("bucket data"));
+    try file.setLength(testing.io, 2);
+    try testing.expectError(error.CorruptBlob, store.getBlob(testing.allocator, hash, 100));
+}
+
+test "atomic manifest failure before replace preserves old frontier and reopen reads it" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    try testing.expectEqual(@as(?[]u8, null), try store.readManifest(testing.allocator, 100));
+    _ = try store.putBlob("first bucket");
+    try store.publish("checkpoint one");
+    _ = try store.putBlob("second bucket");
+    try testing.expectError(error.IoFailed, store.publishImpl("checkpoint two", .before_replace));
+    store.deinit();
+    store = try testStore(&tmp);
+    defer store.deinit();
+    const old = (try store.readManifest(testing.allocator, 14)).?;
+    defer testing.allocator.free(old);
+    try testing.expectEqualStrings("checkpoint one", old);
+    try testing.expectError(error.TooLarge, store.readManifest(testing.allocator, 13));
+    try store.publish("checkpoint two");
+    const next = (try store.readManifest(testing.allocator, 14)).?;
+    defer testing.allocator.free(next);
+    try testing.expectEqualStrings("checkpoint two", next);
+}
+
+test "manifest publication fault matrix recovers the frontier at every boundary" {
+    const points = [_]PublishFault{
+        .after_header_write,
+        .after_payload_write,
+        .after_file_sync,
+        .before_replace,
+        .after_replace,
+        .after_directory_sync,
+        .after_final_file_sync,
+    };
+    const old_bytes = "old referenced bucket";
+    const new_bytes = "new referenced bucket";
+    const old_hash = digest(old_bytes);
+    const new_hash = digest(new_bytes);
+    for (points) |point| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        {
+            var store = try testStore(&tmp);
+            defer store.deinit();
+            try testing.expectEqual(old_hash, try store.putBlob(old_bytes));
+            try store.publish(&old_hash);
+            try testing.expectEqual(new_hash, try store.putBlob(new_bytes));
+            try testing.expectError(error.IoFailed, store.publishImpl(&new_hash, point));
+        }
+        var restored = try testStore(&tmp);
+        defer restored.deinit();
+        const frontier = (try restored.readManifest(testing.allocator, 32)).?;
+        defer testing.allocator.free(frontier);
+        const replaced = switch (point) {
+            .after_replace, .after_directory_sync, .after_final_file_sync => true,
+            else => false,
+        };
+        try testing.expectEqualSlices(u8, if (replaced) &new_hash else &old_hash, frontier);
+        const referenced_hash = frontier[0..32].*;
+        const referenced = try restored.getBlob(testing.allocator, referenced_hash, 100);
+        defer testing.allocator.free(referenced);
+        try testing.expectEqualStrings(if (replaced) new_bytes else old_bytes, referenced);
+        // Both complete blobs survive every boundary, including the new blob
+        // that is still unreferenced when publication failed before replace.
+        const old = try restored.getBlob(testing.allocator, old_hash, 100);
+        defer testing.allocator.free(old);
+        const new = try restored.getBlob(testing.allocator, new_hash, 100);
+        defer testing.allocator.free(new);
+        try testing.expectEqualStrings(old_bytes, old);
+        try testing.expectEqualStrings(new_bytes, new);
+    }
+}
+
+test "manifest corruption and truncation fail closed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    try store.publish("frontier");
+    const file = try store.root.createFile(testing.io, manifest_name, .{ .truncate = false });
+    defer file.close(testing.io);
+    try file.writePositionalAll(testing.io, "X", header_len);
+    try testing.expectError(error.CorruptManifest, store.readManifest(testing.allocator, 100));
+    try file.writePositionalAll(testing.io, "f", header_len);
+    const restored = (try store.readManifest(testing.allocator, 100)).?;
+    defer testing.allocator.free(restored);
+    try testing.expectEqualStrings("frontier", restored);
+    var wrong_len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &wrong_len, 7, .big);
+    try file.writePositionalAll(testing.io, &wrong_len, magic.len);
+    try testing.expectError(error.CorruptManifest, store.readManifest(testing.allocator, 100));
+    try writeBytes(testing.io, file, "X");
+    try testing.expectError(error.CorruptManifest, store.readManifest(testing.allocator, 100));
+    try file.setLength(testing.io, 4);
+    try testing.expectError(error.CorruptManifest, store.readManifest(testing.allocator, 100));
+}
+
+test "collection retains explicit live blobs and ignores noncanonical files" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    const live = try store.putBlob("live");
+    const dead = try store.putBlob("dead");
+    const debris = try store.blobs.createFile(testing.io, "temp", .{});
+    debris.close(testing.io);
+    try testing.expectEqual(@as(usize, 1), try store.collect(&.{live}));
+    const bytes = try store.getBlob(testing.allocator, live, 4);
+    defer testing.allocator.free(bytes);
+    try testing.expectError(error.NotFound, store.getBlob(testing.allocator, dead, 4));
+    const surviving = try store.blobs.openFile(testing.io, "temp", .{});
+    surviving.close(testing.io);
+    try testing.expectEqual(@as(usize, 0), try store.collect(&.{live}));
+}
+
+test "symlinked blobs and store directories are rejected" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    const name = std.fmt.bytesToHex(digest("target"), .lower);
+    try store.blobs.symLink(testing.io, "../manifest", &name, .{});
+    try testing.expectError(error.IoFailed, store.getBlob(testing.allocator, digest("target"), 100));
+    try testing.expectEqual(@as(usize, 0), try store.collect(&.{}));
+    try store.root.symLink(testing.io, "blobs", "alias", .{ .is_directory = true });
+    var root_path: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(testing.io, &root_path);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/alias", .{root_path[0..len]});
+    defer testing.allocator.free(path);
+    try testing.expectError(error.IoFailed, Store.open(testing.allocator, testing.io, path));
+}
+
+test "exclusive store lock and parent traversal rejection" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    try testing.expectError(error.StoreBusy, testStore(&tmp));
+    try testing.expectError(error.InvalidPath, Store.open(testing.allocator, testing.io, "../outside"));
+}
+
+const fixture_old = bucket_domain ++ "\x00\x00\x00\x00\x00\x00\x00\x03" ++
+    "\x00\x00\x00\x01\x00\x00\x00\x01a\x01\x00\x00\x00\x03old" ++
+    "\x00\x00\x00\x01\x00\x00\x00\x01b\x01\x00\x00\x00\x03old" ++
+    "\x00\x00\x00\x02\x00\x00\x00\x01a\x01\x00\x00\x00\x05other";
+const fixture_new = bucket_domain ++ "\x00\x00\x00\x00\x00\x00\x00\x03" ++
+    "\x00\x00\x00\x01\x00\x00\x00\x01a\x00" ++
+    "\x00\x00\x00\x01\x00\x00\x00\x01b\x01\x00\x00\x00\x03new" ++
+    "\x00\x00\x00\x01\x00\x00\x00\x01c\x01\x00\x00\x00\x00";
+const fixture_merged = bucket_domain ++ "\x00\x00\x00\x00\x00\x00\x00\x04" ++
+    "\x00\x00\x00\x01\x00\x00\x00\x01a\x00" ++
+    "\x00\x00\x00\x01\x00\x00\x00\x01b\x01\x00\x00\x00\x03new" ++
+    "\x00\x00\x00\x01\x00\x00\x00\x01c\x01\x00\x00\x00\x00" ++
+    "\x00\x00\x00\x02\x00\x00\x00\x01a\x01\x00\x00\x00\x05other";
+const fixture_terminal = bucket_domain ++ "\x00\x00\x00\x00\x00\x00\x00\x03" ++
+    "\x00\x00\x00\x01\x00\x00\x00\x01b\x01\x00\x00\x00\x03new" ++
+    "\x00\x00\x00\x01\x00\x00\x00\x01c\x01\x00\x00\x00\x00" ++
+    "\x00\x00\x00\x02\x00\x00\x00\x01a\x01\x00\x00\x00\x05other";
+
+test "streaming merge matches canonical core fixture and newest/tombstone semantics" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    const core_literal = bucket_domain ++ "\x00\x00\x00\x00\x00\x00\x00\x01" ++
+        "\x00\x00\x00\x07\x00\x00\x00\x01k\x01\x00\x00\x00\x01v";
+    const empty = try store.putBlob(empty_bucket);
+    var known: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&known, "7076a8bba14bcc34e17a8a22d54a16d13b09247075da48782dac74352f01ac12");
+    try testing.expectEqual(known, empty);
+    _ = try std.fmt.hexToBytes(&known, "f0c97d1ffee7489cfcb47d1eba0918147cd67b220cbb5db08b045de3118ab940");
+    const single = try store.putBlob(core_literal);
+    try testing.expectEqual(known, single);
+    try testing.expectEqual(single, try store.mergeBuckets(empty, single, false, .{}));
+    try testing.expectEqual(empty, try store.mergeBuckets(empty, empty, true, .{}));
+    const old = try store.putBlob(fixture_old);
+    const new = try store.putBlob(fixture_new);
+    try testing.expectError(error.TooLarge, store.mergeBuckets(old, new, false, .{ .max_records = 3 }));
+    try testing.expectError(error.TooLarge, store.mergeBuckets(old, new, false, .{ .max_bucket_bytes = @max(fixture_old.len, fixture_new.len) }));
+    const merged = try store.mergeBuckets(old, new, false, .{});
+    try testing.expectEqual(digest(fixture_merged), merged);
+    const bytes = try store.getBlob(testing.allocator, merged, fixture_merged.len);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualStrings(fixture_merged, bytes);
+    try testing.expectEqual(merged, try store.mergeBuckets(old, new, false, .{}));
+    const terminal = try store.mergeBuckets(old, new, true, .{});
+    try testing.expectEqual(digest(fixture_terminal), terminal);
+    // Reversing precedence is observably different, including resurrection.
+    try testing.expect(!std.mem.eql(u8, &merged, &(try store.mergeBuckets(new, old, false, .{}))));
+}
+
+test "streaming merge rejects corrupt content, malformed frames, order, and hostile lengths" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    const empty = try store.putBlob(empty_bucket);
+    const old = try store.putBlob(fixture_old);
+    const old_name = std.fmt.bytesToHex(old, .lower);
+    const file = try store.blobs.createFile(testing.io, &old_name, .{ .truncate = false });
+    defer file.close(testing.io);
+    try file.writePositionalAll(testing.io, "X", fixture_old.len - 1);
+    try testing.expectError(error.CorruptBlob, store.mergeBuckets(old, empty, false, .{}));
+    try testing.expectError(error.CorruptBlob, store.mergeBuckets(empty, old, false, .{}));
+    const dup = bucket_domain ++ "\x00\x00\x00\x00\x00\x00\x00\x02" ++
+        "\x00\x00\x00\x01\x00\x00\x00\x01a\x00" ++
+        "\x00\x00\x00\x01\x00\x00\x00\x01a\x00";
+    try testing.expectError(error.InvalidBucket, store.mergeBuckets(try store.putBlob(dup), empty, false, .{}));
+    const unordered = bucket_domain ++ "\x00\x00\x00\x00\x00\x00\x00\x02" ++
+        "\x00\x00\x00\x01\x00\x00\x00\x01b\x00" ++
+        "\x00\x00\x00\x01\x00\x00\x00\x01a\x00";
+    try testing.expectError(error.InvalidBucket, store.mergeBuckets(try store.putBlob(unordered), empty, false, .{}));
+    const enormous_key = bucket_domain ++ "\x00\x00\x00\x00\x00\x00\x00\x01" ++
+        "\x00\x00\x00\x01\xff\xff\xff\xff\x00";
+    try testing.expectError(error.TooLarge, store.mergeBuckets(try store.putBlob(enormous_key), empty, false, .{}));
+    const enormous_value = bucket_domain ++ "\x00\x00\x00\x00\x00\x00\x00\x01" ++
+        "\x00\x00\x00\x01\x00\x00\x00\x00\x01\xff\xff\xff\xff";
+    try testing.expectError(error.TooLarge, store.mergeBuckets(try store.putBlob(enormous_value), empty, false, .{}));
+    const invalid_tag = bucket_domain ++ "\x00\x00\x00\x00\x00\x00\x00\x01" ++
+        "\x00\x00\x00\x01\x00\x00\x00\x00\x02";
+    try testing.expectError(error.InvalidBucket, store.mergeBuckets(try store.putBlob(invalid_tag), empty, false, .{}));
+    try testing.expectError(error.InvalidBucket, store.mergeBuckets(try store.putBlob(empty_bucket ++ "x"), empty, false, .{}));
+    try testing.expectError(error.InvalidBucket, store.mergeBuckets(try store.putBlob(fixture_new[0 .. fixture_new.len - 1]), empty, false, .{}));
+    try testing.expectError(error.TooLarge, store.mergeBuckets(empty, empty, false, .{ .max_bucket_bytes = 1 }));
+    const new = try store.putBlob(fixture_new);
+    try testing.expectError(error.TooLarge, store.mergeBuckets(new, empty, false, .{ .max_records = 2 }));
+    try testing.expectError(error.TooLarge, store.mergeBuckets(new, empty, false, .{ .max_value_bytes = 2 }));
+}
+
+fn manyRecords(gpa: std.mem.Allocator, count: u32, parity: u32) ![]u8 {
+    const bytes = try gpa.alloc(u8, empty_bucket.len + @as(usize, count) * 21);
+    @memcpy(bytes[0..bucket_domain.len], bucket_domain);
+    std.mem.writeInt(u64, bytes[bucket_domain.len..][0..8], count, .big);
+    var pos: usize = empty_bucket.len;
+    for (0..count) |i| {
+        const key: u32 = @as(u32, @intCast(i)) * 2 + parity;
+        std.mem.writeInt(u32, bytes[pos..][0..4], 1, .big);
+        std.mem.writeInt(u32, bytes[pos + 4 ..][0..4], 4, .big);
+        std.mem.writeInt(u32, bytes[pos + 8 ..][0..4], key, .big);
+        bytes[pos + 12] = 1;
+        std.mem.writeInt(u32, bytes[pos + 13 ..][0..4], 4, .big);
+        std.mem.writeInt(u32, bytes[pos + 17 ..][0..4], key, .big);
+        pos += 21;
+    }
+    return bytes;
+}
+
+test "streaming merge uses fixed workspace for many records and existing large output" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    const old_bytes = try manyRecords(testing.allocator, 10000, 0);
+    defer testing.allocator.free(old_bytes);
+    const new_bytes = try manyRecords(testing.allocator, 10000, 1);
+    defer testing.allocator.free(new_bytes);
+    const old = try store.putBlob(old_bytes);
+    const new = try store.putBlob(new_bytes);
+    var workspace: [17000]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&workspace);
+    store.gpa = fixed.allocator();
+    const limits: MergeLimits = .{ .max_key_bytes = 4, .max_value_bytes = 4 };
+    const merged = try store.mergeBuckets(old, new, false, limits);
+    // Exercise the existing-file verification branch under the same bound.
+    try testing.expectEqual(merged, try store.mergeBuckets(old, new, false, limits));
+    const bytes = try store.getBlob(testing.allocator, merged, empty_bucket.len + 20000 * 21);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqual(@as(u64, 20000), std.mem.readInt(u64, bytes[bucket_domain.len..][0..8], .big));
+    for (0..20000) |i| {
+        const pos = empty_bucket.len + i * 21;
+        try testing.expectEqual(@as(u32, @intCast(i)), std.mem.readInt(u32, bytes[pos + 8 ..][0..4], .big));
+        try testing.expectEqual(@as(u32, @intCast(i)), std.mem.readInt(u32, bytes[pos + 17 ..][0..4], .big));
+    }
+    try testing.expectEqual(@as(usize, 0), fixed.end_index);
+}
+
+test "streaming merge workspace OOM does not install partial output or leak" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    const old = try store.putBlob(fixture_old);
+    const new = try store.putBlob(fixture_new);
+    for (0..4) |failure| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = failure });
+        store.gpa = failing.allocator();
+        try testing.expectError(error.OutOfMemory, store.mergeBuckets(old, new, false, .{}));
+        try testing.expectError(error.NotFound, store.getBlob(testing.allocator, digest(fixture_merged), 1000));
+        try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+    store.gpa = testing.allocator;
+    try testing.expectEqual(digest(fixture_merged), try store.mergeBuckets(old, new, false, .{}));
+}
+
+fn makeTestFifo(dir: std.Io.Dir, name: []const u8) !void {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try dir.realPath(testing.io, &path_buf);
+    var fifo_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&fifo_buf, "{s}/{s}", .{ path_buf[0..len], name }, 0);
+    if (comptime builtin.os.tag == .linux) {
+        if (std.os.linux.errno(std.os.linux.mknod(path.ptr, std.os.linux.S.IFIFO | 0o600, 0)) != .SUCCESS)
+            return error.FifoCreationFailed;
+    } else if (comptime builtin.os.tag == .macos) {
+        const C = struct {
+            extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+        };
+        if (C.mkfifo(path.ptr, 0o600) != 0) return error.FifoCreationFailed;
+    } else return error.SkipZigTest;
+}
+
+test "FIFO reads reject before opening with a timeout-safe regression guard" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    try makeTestFifo(store.root, manifest_name);
+    const Guard = struct {
+        underlying: std.Io,
+        opened: bool = false,
+        fn statFile(ctx: ?*anyopaque, dir: std.Io.Dir, name: []const u8, options: std.Io.Dir.StatFileOptions) std.Io.Dir.StatFileError!std.Io.File.Stat {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            return self.underlying.vtable.dirStatFile(self.underlying.userdata, dir, name, options);
+        }
+        fn openFile(ctx: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.opened = true;
+            return error.AccessDenied; // Would block on the real FIFO.
+        }
+    };
+    var guard: Guard = .{ .underlying = testing.io };
+    var vtable = testing.io.vtable.*;
+    vtable.dirStatFile = Guard.statFile;
+    vtable.dirOpenFile = Guard.openFile;
+    const guarded_io: std.Io = .{ .userdata = &guard, .vtable = &vtable };
+    // If the precheck regresses, this assertion fails immediately before the
+    // real-backend calls below; a broken implementation cannot hang this test.
+    try testing.expectError(error.NotRegularFile, openRegular(store.root, guarded_io, manifest_name));
+    try testing.expect(!guard.opened);
+    try testing.expectError(error.NotRegularFile, store.readManifest(testing.allocator, 100));
+    const hash = digest("FIFO blob");
+    const name = std.fmt.bytesToHex(hash, .lower);
+    try makeTestFifo(store.blobs, &name);
+    try testing.expectError(error.NotRegularFile, store.getBlob(testing.allocator, hash, 100));
+}

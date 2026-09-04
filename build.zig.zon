@@ -1,0 +1,8 @@
+.{
+    .name = .bucketlist,
+    .fingerprint = 0x6a9e7a04f47d9082,
+    .version = "0.1.0-dev",
+    .minimum_zig_version = "0.17.0-dev.1786",
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "src", "tests", "examples/directory", "tools", "vectors", "docs/api.txt" },
+}

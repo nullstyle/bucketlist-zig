@@ -1,0 +1,32 @@
+bucketlist API — Experimental v1
+export Bytes
+export Codec
+export Table
+export Definition
+export Database
+export Commitment
+Database.init: fn (mem.Allocator) database.DatabaseWithDepth(api.Schema,11)
+Database.deinit: fn (*database.DatabaseWithDepth(api.Schema,11)) void
+Database.commitment: fn (*const database.DatabaseWithDepth(api.Schema,11)) database.Commitment
+Database.get: fn (*const database.DatabaseWithDepth(api.Schema,11), comptime meta.FieldEnum(api.Schema.tables__struct_ANON), anytype) anytype
+Database.batch: fn (*database.DatabaseWithDepth(api.Schema,11), mem.Allocator) error{BatchActive,ClosedBatch,CommitmentMismatch,InvalidCheckpoint,NoSpace,NonCanonical,OutOfMemory,SequenceExhausted,StaleBase,WrongAdvance}!database.DatabaseWithDepth(api.Schema,11).Batch
+Database.prepareAdvance: fn (*database.DatabaseWithDepth(api.Schema,11), mem.Allocator, u64, *database.DatabaseWithDepth(api.Schema,11).Batch) @typeInfo(@typeInfo(@TypeOf(database.DatabaseWithDepth(api.Schema,11).prepareAdvance)).@"fn".return_type.?).error_union.error_set!database.DatabaseWithDepth(api.Schema,11).Prepared
+Database.commit: fn (*database.DatabaseWithDepth(api.Schema,11), *database.DatabaseWithDepth(api.Schema,11).Prepared) error{BatchActive,ClosedBatch,CommitmentMismatch,InvalidCheckpoint,NoSpace,NonCanonical,OutOfMemory,SequenceExhausted,StaleBase,WrongAdvance}!void
+Database.readView: fn (*const database.DatabaseWithDepth(api.Schema,11)) database.DatabaseWithDepth(api.Schema,11).ReadView
+Database.Iterator: fn (comptime meta.FieldEnum(api.Schema.tables__struct_ANON)) type
+Database.checkpoint: fn (*const database.DatabaseWithDepth(api.Schema,11), mem.Allocator) @typeInfo(@typeInfo(@TypeOf(database.DatabaseWithDepth(api.Schema,11).checkpoint)).@"fn".return_type.?).error_union.error_set![]u8
+Database.restore: fn (mem.Allocator, []const u8, [32]u8) @typeInfo(@typeInfo(@TypeOf(database.DatabaseWithDepth(api.Schema,11).restore)).@"fn".return_type.?).error_union.error_set!database.DatabaseWithDepth(api.Schema,11)
+Batch.deinit: fn (*database.DatabaseWithDepth(api.Schema,11).Batch) void
+Batch.put: fn (*database.DatabaseWithDepth(api.Schema,11).Batch, comptime meta.FieldEnum(api.Schema.tables__struct_ANON), anytype, anytype) error{BatchActive,ClosedBatch,CommitmentMismatch,InvalidCheckpoint,NoSpace,NonCanonical,OutOfMemory,SequenceExhausted,StaleBase,WrongAdvance}!void
+Batch.delete: fn (*database.DatabaseWithDepth(api.Schema,11).Batch, comptime meta.FieldEnum(api.Schema.tables__struct_ANON), anytype) error{BatchActive,ClosedBatch,CommitmentMismatch,InvalidCheckpoint,NoSpace,NonCanonical,OutOfMemory,SequenceExhausted,StaleBase,WrongAdvance}!void
+Prepared.deinit: fn (*database.DatabaseWithDepth(api.Schema,11).Prepared) void
+Prepared.commitment: fn (*const database.DatabaseWithDepth(api.Schema,11).Prepared) database.Commitment
+ReadView.deinit: fn (*database.DatabaseWithDepth(api.Schema,11).ReadView) void
+ReadView.get: fn (*const database.DatabaseWithDepth(api.Schema,11).ReadView, comptime meta.FieldEnum(api.Schema.tables__struct_ANON), anytype) anytype
+ReadView.commitment: fn (*const database.DatabaseWithDepth(api.Schema,11).ReadView) database.Commitment
+ReadView.checkpoint: fn (*const database.DatabaseWithDepth(api.Schema,11).ReadView, mem.Allocator) @typeInfo(@typeInfo(@TypeOf(database.DatabaseWithDepth(api.Schema,11).ReadView.checkpoint)).@"fn".return_type.?).error_union.error_set![]u8
+ReadView.iterator: fn (*const database.DatabaseWithDepth(api.Schema,11).ReadView, comptime meta.FieldEnum(api.Schema.tables__struct_ANON)) anytype
+Codec(u64).encode: fn (u64, []u8) error{NoSpace,NonCanonical}![]const u8
+Codec(u64).decode: fn ([]const u8) error{InvalidEncoding}!u64
+Bytes(32).init: fn ([]const u8) error{TooLong}!codec.Bytes(32)
+Bytes(32).slice: fn (*const codec.Bytes(32)) []const u8

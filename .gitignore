@@ -1,0 +1,9 @@
+.DS_Store
+.zig-cache/
+zig-cache/
+zig-out/
+zig-pkg/
+mise.local.toml
+mise.*.local.toml
+preflight.log
+__pycache__/
