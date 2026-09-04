@@ -30,3 +30,14 @@ Codec(u64).encode: fn (u64, []u8) error{NoSpace,NonCanonical}![]const u8
 Codec(u64).decode: fn ([]const u8) error{InvalidEncoding}!u64
 Bytes(32).init: fn ([]const u8) error{TooLong}!codec.Bytes(32)
 Bytes(32).slice: fn (*const codec.Bytes(32)) []const u8
+Checkpoints(Database).open: fn (mem.Allocator, Io, []const u8, checkpoints.Limits) error{CommitmentMismatch,CorruptBlob,CorruptManifest,InvalidBucket,InvalidCatalog,InvalidCheckpoint,InvalidLimits,InvalidPath,InvalidReference,IoFailed,NotFound,NotRegularFile,OutOfMemory,Poisoned,StoreBusy,TooLarge,UnsupportedPlatform}!checkpoints.Checkpoints(database.DatabaseWithDepth(api.Schema,11))
+Checkpoints(Database).deinit: fn (*checkpoints.Checkpoints(database.DatabaseWithDepth(api.Schema,11))) void
+Checkpoints(Database).current: fn (*checkpoints.Checkpoints(database.DatabaseWithDepth(api.Schema,11))) error{CommitmentMismatch,CorruptBlob,CorruptManifest,InvalidBucket,InvalidCatalog,InvalidCheckpoint,InvalidLimits,InvalidPath,InvalidReference,IoFailed,NotFound,NotRegularFile,OutOfMemory,Poisoned,StoreBusy,TooLarge,UnsupportedPlatform}!?checkpoints.Reference
+Checkpoints(Database).save: fn (*checkpoints.Checkpoints(database.DatabaseWithDepth(api.Schema,11)), *const database.DatabaseWithDepth(api.Schema,11).ReadView, []const u8) error{CommitmentMismatch,CorruptBlob,CorruptManifest,InvalidBucket,InvalidCatalog,InvalidCheckpoint,InvalidLimits,InvalidPath,InvalidReference,IoFailed,NotFound,NotRegularFile,OutOfMemory,Poisoned,StoreBusy,TooLarge,UnsupportedPlatform}!checkpoints.Reference
+Checkpoints(Database).load: fn (*checkpoints.Checkpoints(database.DatabaseWithDepth(api.Schema,11)), mem.Allocator, checkpoints.Reference) error{CommitmentMismatch,CorruptBlob,CorruptManifest,InvalidBucket,InvalidCatalog,InvalidCheckpoint,InvalidLimits,InvalidPath,InvalidReference,IoFailed,NotFound,NotRegularFile,OutOfMemory,Poisoned,StoreBusy,TooLarge,UnsupportedPlatform}!checkpoints.Checkpoints(database.DatabaseWithDepth(api.Schema,11)).Restored
+Checkpoints(Database).collect: fn (*checkpoints.Checkpoints(database.DatabaseWithDepth(api.Schema,11)), []const checkpoints.Reference) error{CommitmentMismatch,CorruptBlob,CorruptManifest,InvalidBucket,InvalidCatalog,InvalidCheckpoint,InvalidLimits,InvalidPath,InvalidReference,IoFailed,NotFound,NotRegularFile,OutOfMemory,Poisoned,StoreBusy,TooLarge,UnsupportedPlatform}!usize
+Restored.deinit: fn (*checkpoints.Checkpoints(database.DatabaseWithDepth(api.Schema,11)).Restored) void
+Reference.manifest_hash: [32]u8
+Reference.database_digest: [32]u8
+CheckpointLimits.max_checkpoint_bytes: usize
+CheckpointLimits.max_metadata_bytes: usize

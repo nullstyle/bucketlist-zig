@@ -4,6 +4,8 @@
 and opaque checkpoint manifests. It accepts an explicit `std.Io` and allocator.
 The deterministic database and BucketList layers define the bytes and references;
 the store neither interprets a schema nor decides which state is authoritative.
+For typed checkpoint publication, application metadata, and automatic reference
+discovery during collection, use [Checkpoints(DatabaseType)](checkpoints.md).
 
 `Store.open(gpa, io, path)` returns an owned value. Call `deinit` exactly once.
 An exclusive advisory `LOCK` file prevents another cooperating store from opening
@@ -21,11 +23,14 @@ store/
     <64 lowercase hex characters>
 ```
 
-Each blob filename is SHA-256 of the exact contents. `putBlob(bytes)` creates a
-temporary file, writes and flushes all bytes, syncs it, atomically installs it
-without replacing an existing destination, then syncs the blob directory. On
-macOS the file sync includes `F_FULLFSYNC`. An existing blob must have the same
-contents and valid hash; corruption is reported and never silently repaired.
+Each blob filename is SHA-256 of the exact contents. For a new hash,
+`putBlob(bytes)` creates a temporary file, writes and flushes all bytes, syncs it,
+atomically installs it without replacing an existing destination, then syncs the
+blob directory. An existing blob is checked for exact length and hash using
+8 KiB of streaming scratch, without rewriting it or allocating another whole
+blob. The initial absence/link-collision path verifies the winning file too.
+Both paths retain file/directory/file synchronization. On macOS the file sync
+includes `F_FULLFSYNC`. Corruption is reported and never silently repaired.
 Successful `putBlob` means the blob is durable before its hash is returned.
 
 `getBlob(gpa, hash, max_bytes)` checks that the file is regular, enforces the
@@ -67,7 +72,8 @@ against the actual file size before looping. These limits describe local
 resource policies and do not affect canonical hashes. Two readers allocate
 exactly `2 * (2 * max_key_bytes + max_value_bytes + 8192)` scratch bytes total,
 plus constant stack and I/O backend state. Memory does not grow with bucket
-size; lower per-record limits reduce the workspace. The two passes reuse it.
+size; lower per-record limits reduce the workspace. Each pass allocates and
+releases its readers, so the peak bound covers only one pass at a time.
 
 `publish(manifest_bytes)` first syncs the blob directory, writes a new manifest
 to a temporary file, flushes and syncs it, atomically replaces `manifest`, and

@@ -99,24 +99,31 @@ pub const Store = struct {
     pub fn putBlob(self: *Store, bytes: []const u8) Error!Hash {
         const hash = digest(bytes);
         const name = std.fmt.bytesToHex(hash, .lower);
-        var atomic = self.blobs.createFileAtomic(self.io, &name, .{}) catch return error.IoFailed;
-        defer atomic.deinit(self.io);
-        try writeBytes(self.io, atomic.file, bytes);
-        try fullSync(self.io, atomic.file);
-        atomic.link(self.io) catch |err| switch (err) {
-            error.PathAlreadyExists => {
-                const existing = self.getBlob(self.gpa, hash, bytes.len) catch |e| switch (e) {
-                    error.TooLarge => return error.CorruptBlob,
-                    else => return e,
-                };
-                defer self.gpa.free(existing);
-                if (!std.mem.eql(u8, bytes, existing)) return error.CorruptBlob;
-                const file = try openRegular(self.blobs, self.io, &name);
-                defer file.close(self.io);
-                try fullSync(self.io, file);
-            },
-            else => return error.IoFailed,
+        // Shared buckets are common across checkpoints. Verify the immutable
+        // file with bounded scratch before allocating/writing a temporary copy.
+        const existing: ?std.Io.File = openVerified(self.blobs, self.io, &name, hash, bytes.len) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
         };
+        if (existing) |file| {
+            defer file.close(self.io);
+            try fullSync(self.io, file);
+        } else {
+            var atomic = self.blobs.createFileAtomic(self.io, &name, .{}) catch return error.IoFailed;
+            defer atomic.deinit(self.io);
+            try writeBytes(self.io, atomic.file, bytes);
+            try fullSync(self.io, atomic.file);
+            atomic.link(self.io) catch |err| switch (err) {
+                error.PathAlreadyExists => {
+                    // A file can appear after the initial absence check. Keep
+                    // no-replace publication and verify the winning file too.
+                    const file = try openVerified(self.blobs, self.io, &name, hash, bytes.len);
+                    defer file.close(self.io);
+                    try fullSync(self.io, file);
+                },
+                else => return error.IoFailed,
+            };
+        }
         try syncDir(self.io, self.blobs);
         // A final full sync after the directory barrier flushes the renamed
         // entry's metadata through the drive cache on macOS too.
@@ -470,9 +477,11 @@ fn mergePass(store: *Store, older: Hash, newer: Hash, drop_tombstones: bool, lim
     return result;
 }
 
-fn verifyFile(dir: std.Io.Dir, io: std.Io, name: []const u8, expected: Hash, expected_size: u64) Error!void {
+/// Caller owns the returned verified handle. Hashing uses fixed stack scratch;
+/// neither putBlob's reuse path nor collision verification allocates blob size.
+fn openVerified(dir: std.Io.Dir, io: std.Io, name: []const u8, expected: Hash, expected_size: u64) Error!std.Io.File {
     const file = try openRegular(dir, io, name);
-    defer file.close(io);
+    errdefer file.close(io);
     if ((file.stat(io) catch return error.IoFailed).size != expected_size) return error.CorruptBlob;
     var buffer: [8192]u8 = undefined;
     var reader = file.reader(io, &.{});
@@ -493,6 +502,12 @@ fn verifyFile(dir: std.Io.Dir, io: std.Io, name: []const u8, expected: Hash, exp
         error.ReadFailed => return error.IoFailed,
     }
     if (!std.mem.eql(u8, &expected, &hash.finalResult())) return error.CorruptBlob;
+    return file;
+}
+
+fn verifyFile(dir: std.Io.Dir, io: std.Io, name: []const u8, expected: Hash, expected_size: u64) Error!void {
+    const file = try openVerified(dir, io, name, expected, expected_size);
+    file.close(io);
 }
 
 fn digest(bytes: []const u8) Hash {
@@ -635,6 +650,114 @@ test "immutable blobs verify hashes, exact limits, corruption, and truncation" {
     try testing.expectError(error.CorruptBlob, store.getBlob(testing.allocator, hash, 100));
 }
 
+test "large existing blob reuse creates no temporary copy or allocation and retains durability barriers" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    const bytes = try testing.allocator.alloc(u8, 1024 * 1024 + 17);
+    defer testing.allocator.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i *% 17);
+    const hash = try store.putBlob(bytes);
+    const name = std.fmt.bytesToHex(hash, .lower);
+
+    const Guard = struct {
+        var creates: usize = 0;
+        var syncs: usize = 0;
+        var fail_sync: ?usize = null;
+
+        fn create(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.CreateFileAtomicOptions) std.Io.Dir.CreateFileAtomicError!std.Io.File.Atomic {
+            creates += 1;
+            return error.AccessDenied;
+        }
+        fn sync(ctx: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            const index = syncs;
+            syncs += 1;
+            if (fail_sync == index) return error.InputOutput;
+            return testing.io.vtable.fileSync(ctx, file);
+        }
+    };
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    store.gpa = failing.allocator();
+    var vtable = testing.io.vtable.*;
+    vtable.dirCreateFileAtomic = Guard.create;
+    vtable.fileSync = Guard.sync;
+    store.io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    defer store.io = testing.io;
+    // The original implementation attempted the denied temp creation before
+    // discovering the existing file, then allocated the entire file to verify.
+    try testing.expectEqual(hash, try store.putBlob(bytes));
+    try testing.expectEqual(@as(usize, 0), Guard.creates);
+    try testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try testing.expect(!failing.has_induced_failure);
+    try testing.expectEqual(@as(usize, 3), Guard.syncs);
+    for (0..3) |failure| {
+        Guard.syncs = 0;
+        Guard.fail_sync = failure;
+        try testing.expectError(error.IoFailed, store.putBlob(bytes));
+        try testing.expectEqual(failure + 1, Guard.syncs);
+    }
+    Guard.fail_sync = null;
+    Guard.syncs = 0;
+    try testing.expectEqual(hash, try store.putBlob(bytes));
+    try testing.expectEqual(@as(usize, 3), Guard.syncs);
+    try testing.expectEqual(@as(usize, 0), Guard.creates);
+
+    const file = try store.blobs.createFile(testing.io, &name, .{ .truncate = false });
+    defer file.close(testing.io);
+    const wrong: [1]u8 = .{bytes[bytes.len - 1] ^ 0xff};
+    try file.writePositionalAll(testing.io, &wrong, bytes.len - 1);
+    try testing.expectError(error.CorruptBlob, store.putBlob(bytes));
+    try file.setLength(testing.io, bytes.len - 1);
+    try testing.expectError(error.CorruptBlob, store.putBlob(bytes));
+    try file.setLength(testing.io, bytes.len + 1);
+    try testing.expectError(error.CorruptBlob, store.putBlob(bytes));
+    try testing.expectEqual(@as(usize, 0), Guard.creates);
+    try testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try testing.expect(!failing.has_induced_failure);
+}
+
+test "putBlob verifies a race winner after initial absence with bounded memory" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    const bytes = try manyRecords(testing.allocator, 10000, 0);
+    defer testing.allocator.free(bytes);
+    const hash = try store.putBlob(bytes);
+    const name = std.fmt.bytesToHex(hash, .lower);
+    const Guard = struct {
+        var hidden = false;
+        fn statFile(ctx: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.StatFileOptions) std.Io.Dir.StatFileError!std.Io.File.Stat {
+            if (!hidden) {
+                hidden = true;
+                return error.FileNotFound;
+            }
+            return testing.io.vtable.dirStatFile(ctx, dir, path, options);
+        }
+    };
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    store.gpa = failing.allocator();
+    var vtable = testing.io.vtable.*;
+    vtable.dirStatFile = Guard.statFile;
+    store.io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    defer store.io = testing.io;
+    // Hide the first observation: by link time an immutable file is present,
+    // exercising PathAlreadyExists without a nondeterministic racing thread.
+    try testing.expectEqual(hash, try store.putBlob(bytes));
+    try testing.expect(Guard.hidden);
+    try testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    const file = try store.blobs.createFile(testing.io, &name, .{ .truncate = false });
+    defer file.close(testing.io);
+    try file.writePositionalAll(testing.io, "X", 0);
+    Guard.hidden = false;
+    try testing.expectError(error.CorruptBlob, store.putBlob(bytes));
+    try testing.expect(Guard.hidden);
+    try testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try testing.expectError(error.CorruptBlob, store.getBlob(testing.allocator, hash, bytes.len));
+    try testing.expect(!failing.has_induced_failure);
+}
+
 test "atomic manifest failure before replace preserves old frontier and reopen reads it" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -756,6 +879,7 @@ test "symlinked blobs and store directories are rejected" {
     const name = std.fmt.bytesToHex(digest("target"), .lower);
     try store.blobs.symLink(testing.io, "../manifest", &name, .{});
     try testing.expectError(error.IoFailed, store.getBlob(testing.allocator, digest("target"), 100));
+    try testing.expectError(error.IoFailed, store.putBlob("target"));
     try testing.expectEqual(@as(usize, 0), try store.collect(&.{}));
     try store.root.symLink(testing.io, "blobs", "alias", .{ .is_directory = true });
     var root_path: [std.fs.max_path_bytes]u8 = undefined;
@@ -976,4 +1100,5 @@ test "FIFO reads reject before opening with a timeout-safe regression guard" {
     const name = std.fmt.bytesToHex(hash, .lower);
     try makeTestFifo(store.blobs, &name);
     try testing.expectError(error.NotRegularFile, store.getBlob(testing.allocator, hash, 100));
+    try testing.expectError(error.NotRegularFile, store.putBlob("FIFO blob"));
 }

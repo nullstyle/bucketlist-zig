@@ -18,8 +18,11 @@ The portable `bucketlist` module provides:
 
 The native `bucketlist-store` module provides durable content-addressed blobs,
 verified reads, atomic manifest publication, explicit reachability collection,
-and bounded-memory file merges. The database still operates in memory; the
-store is a separate building block for host-controlled persistence.
+and bounded-memory file merges. The `bucketlist-checkpoints` module builds on
+that store: it publishes typed read views with application recovery metadata,
+shares unchanged bucket files, restores exact database state, and collects
+unreferenced files while retaining selected historical checkpoints. The
+database engine still operates in memory.
 
 ## Use
 
@@ -50,6 +53,12 @@ A standalone consumer [build](examples/directory/build.zig) imports
 For native storage, also import `dependency.module("bucketlist-store")` and
 provide `std.Io` explicitly.
 
+For checkpoint management, import `dependency.module("bucketlist-checkpoints")`
+and instantiate `Checkpoints(Directory)`. The
+[persistent directory example](examples/persistent-directory/main.zig) shows
+publication, close/reopen, exact replay, and retention. See the
+[checkpoint contract](docs/checkpoints.md) for ownership and trust requirements.
+
 ## Development
 
 ```sh
@@ -72,6 +81,7 @@ Other checks:
 - `zig build bench -Doptimize=ReleaseFast` measures real updates and checkpoints.
 - `zig build check-api` checks the Experimental interface snapshot.
 - `just package-preflight` tests an extracted archive and standalone consumer.
+- `just persistent-example-smoke` exercises native checkpoint recovery.
 - `just slcp-smoke` runs the isolated companion integration; see its
   [instructions](examples/slcp-directory/README.md).
 - `just core-oracle` compares original pinned Core schedule functions with
@@ -112,6 +122,7 @@ or the existing registry's format.
 - [Canonical encoding and schemas](docs/encoding.md)
 - [Bucket structure and scheduling](docs/structure.md)
 - [Native storage](docs/storage.md)
+- [Native checkpoint management](docs/checkpoints.md)
 - [Stability policy](docs/stability.md)
 - [Validation results and limitations](docs/validation.md)
 - [Implementation plan](docs/plan.md)

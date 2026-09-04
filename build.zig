@@ -23,6 +23,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const checkpoints = b.addModule("bucketlist-checkpoints", .{
+        .root_source_file = b.path("src/checkpoints.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "bucketlist-store", .module = store }},
+    });
     const tests = b.addTest(.{ .root_module = lib });
     const test_step = b.step("test", "Run codec, schema, database, bucket, and native store tests");
     const check = b.step("check", "Compile all native tests and example without executing them");
@@ -42,6 +48,20 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(persistence).step);
     check.dependOn(&persistence.step);
+    const checkpoint_tests = b.addTest(.{
+        .filters = &.{"checkpoints:"},
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/checkpoints_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "bucketlist", .module = lib },
+                .{ .name = "bucketlist-store", .module = store },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(checkpoint_tests).step);
+    check.dependOn(&checkpoint_tests.step);
 
     const example = b.addExecutable(.{
         .name = "directory",
@@ -57,6 +77,25 @@ pub fn build(b: *std.Build) void {
     const run = b.addRunArtifact(example);
     b.step("example-smoke", "Run the two-table database example").dependOn(&run.step);
     test_step.dependOn(&run.step);
+
+    const persistent_example = b.addExecutable(.{
+        .name = "persistent-directory",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/persistent-directory/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "bucketlist", .module = lib },
+                .{ .name = "bucketlist-checkpoints", .module = checkpoints },
+            },
+        }),
+    });
+    b.installArtifact(persistent_example);
+    check.dependOn(&persistent_example.step);
+    const persistent_run = b.addRunArtifact(persistent_example);
+    _ = persistent_run.addOutputDirectoryArg("store");
+    b.step("persistent-example-smoke", "Run native checkpoint publication and recovery").dependOn(&persistent_run.step);
+    test_step.dependOn(&persistent_run.step);
 
     const bench = b.addExecutable(.{
         .name = "bucketlist-bench",
@@ -74,7 +113,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tools/api.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "bucketlist", .module = lib }},
+            .imports = &.{
+                .{ .name = "bucketlist", .module = lib },
+                .{ .name = "bucketlist-checkpoints", .module = checkpoints },
+            },
         }),
     });
     const api_update = b.addSystemCommand(&.{ "python3", "tools/check-api.py" });

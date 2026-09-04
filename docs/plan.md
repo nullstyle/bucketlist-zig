@@ -412,8 +412,11 @@ before a disk-backed SLCP integration is advertised.
 
 The format documents now resolve M1/M3's encoding and continuation choices.
 The bounded SLCP example establishes M4's integration and recovery behavior.
-Production disk-backed database orchestration, resource policy, and publication
-remain application/host work beyond the native primitives; see the current
-validation report. The product scope remains generic typed databases,
+The native checkpoint manager now handles shared bucket files, publication,
+authenticated restoration, and explicit historical retention; see
+[its contract](checkpoints.md). The database engine remains in memory.
+Production disk-backed engine orchestration, background resource policy, and
+application journal retention remain future work; see the current validation
+report. The product scope remains generic typed databases,
 independent encoding, deterministic commitments, and a compatible development
 experience with SLCP.

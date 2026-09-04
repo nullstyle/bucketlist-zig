@@ -12,7 +12,9 @@ path_block = re.search(r"\.paths\s*=\s*\.\{([^}]+)\}", manifest).group(1)
 paths = re.findall(r'"([^"]+)"', path_block)
 ignored = shutil.ignore_patterns(".zig-cache", "zig-out", "zig-pkg", "__pycache__")
 with tempfile.TemporaryDirectory(prefix="bucketlist-package-") as scratch:
-    scratch = pathlib.Path(scratch)
+    # Native stores deliberately reject symlinked path components. macOS's
+    # temporary path commonly starts with /var, a symlink to /private/var.
+    scratch = pathlib.Path(scratch).resolve()
     staging = scratch / "staging"
     staging.mkdir()
     for name in paths:
@@ -31,5 +33,9 @@ with tempfile.TemporaryDirectory(prefix="bucketlist-package-") as scratch:
         tar.extractall(extracted, filter="data")
     subprocess.run(["zig", "build", "test", "-Doptimize=ReleaseSafe", "--summary", "all"], cwd=extracted, check=True)
     subprocess.run(["zig", "build", "run", "--build-file", "examples/directory/build.zig"], cwd=extracted, check=True)
+    subprocess.run(
+        ["zig", "build", "run", "--build-file", "examples/persistent-directory/build.zig", "--", str(scratch / "native-store")],
+        cwd=extracted, check=True,
+    )
     package_hash = subprocess.check_output(["zig", "fetch", str(archive)], cwd=scratch, text=True).strip()
     print(f"[package-preflight] clean extracted tests + standalone consumer passed; {package_hash}")

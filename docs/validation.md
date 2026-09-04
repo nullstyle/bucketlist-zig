@@ -11,9 +11,10 @@ ordered iteration, and exact authenticated checkpoint continuation.
 
 The native module implements verified content-addressed blobs, exclusive store
 locking, atomic manifests, explicit reachability collection, and bounded-memory
-streaming bucket merges. The typed database is still an in-memory database;
-native persistence is an explicit host building block, not a transparent
-disk-backed replacement for its engine.
+streaming bucket merges. The native checkpoint manager publishes pinned typed
+views with application metadata, shares bucket files, verifies exact restoration,
+and calculates reachability for current and retained historical checkpoints.
+The typed database engine still operates in memory.
 
 The SLCP consumer demonstrates two tables, allocation-free validation and
 combination, owned observations, journal replay, checkpoint publication outside
@@ -21,7 +22,7 @@ apply, network catch-up, and participation in quorum after process restart.
 
 ## Reproducible checks
 
-Final local runs passed all 38 native tests on macOS ARM64 and Linux ARM64 in
+Final local runs passed all 51 native tests on macOS ARM64 and Linux ARM64 in
 Debug and ReleaseSafe, plus the checks below. Linux runs in a disposable native
 ARM container; x86_64 Linux is separately cross-compiled. The first emulated
 x86 container could not run this Zig toolchain under Rosetta and is not counted
@@ -30,12 +31,14 @@ as runtime validation.
 | Check | Evidence |
 | --- | --- |
 | `just test` | Codec/schema negatives, literal encodings/hashes, map properties, schedule boundaries, OOM atomicity/cleanup, strict restore, native storage, core/file merge parity, and the two-table consumer. |
+| Native checkpoint tests | Eleven checks cover spill-boundary continuation, metadata authentication, retained/current reachability, hash-valid malformed manifests, inclusive limits, all save/restore allocation failures, and both pre-replacement and ambiguous publication errors. Imported-module tests are explicitly included through the dedicated test root. |
+| `just persistent-example-smoke` | A pinned advance-1 snapshot survives close/reopen, replays identically through advance 3, and remains loadable alongside current advance 3 after obsolete blobs are collected. |
 | `zig build test -Doptimize=ReleaseSafe` | Same semantic gates with runtime safety and optimization. |
 | `just vectors-check` | Independent Python model reproduces 274 unique bucket frames, four profiles, and 128 advances per profile. |
 | `just wasm-diff` | Native and wasm32-freestanding execute the same typed update/recovery trace and match the independent aggregate `53aee56398b68769c20d6725239f1fdbb3a739561682db9fd08da16e040ece0e`. |
 | `just core-oracle` | Eight original pinned Stellar Core function definitions, adapted only through symbolic shims, match 153 geometry cases and 6,579 exact bucket maps. No claim of Stellar hash compatibility. |
 | `just slcp-smoke` | Three real processes: checkpoint at 7, journal through 9, confirmed SIGKILL/exit 137, restart/replay, peer catch-up through 11, then restarted voter required for quorum at 12. Exact commands, database digests and application headers match. Also passed in ReleaseSafe. |
-| `just package-preflight` | Builds/tests a fresh extracted archive and runs its standalone consumer without any sibling checkout. |
+| `just package-preflight` | Builds/tests a fresh extracted archive and runs both portable and persistent standalone consumers without any sibling checkout. Temporary paths are resolved so macOS's `/var` symlink does not violate native store path requirements. |
 | `zig build check -Dtarget=x86_64-linux` | All native tests and directory example cross-compile. |
 | `just linux-check` | Native Linux runtime gate in a disposable container using repo-pinned mise tools. |
 | `just preflight` | Formatting, workflow lint, fixtures, ordinary tests, WASM, ReleaseSafe, Linux cross-compile, and clean packaging. |

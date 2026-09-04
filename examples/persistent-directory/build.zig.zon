@@ -1,0 +1,10 @@
+.{
+    .name = .bucketlist_persistent_directory,
+    .version = "0.1.0-dev",
+    .fingerprint = 0xc5fe41dda5483d3e,
+    .minimum_zig_version = "0.17.0-dev.1786",
+    .dependencies = .{
+        .bucketlist = .{ .path = "../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "main.zig" },
+}

@@ -1,5 +1,6 @@
 const std = @import("std");
 const lib = @import("bucketlist");
+const checkpoints = @import("bucketlist-checkpoints");
 const Schema = struct {
     pub const namespace = "api";
     pub const version: u32 = 1;
@@ -17,6 +18,17 @@ pub fn main() void {
     describe("ReadView", Db.ReadView);
     describe("Codec(u64)", lib.Codec(u64));
     describe("Bytes(32)", lib.Bytes(32));
+    describe("Checkpoints(Database)", checkpoints.Checkpoints(Db));
+    describe("Restored", checkpoints.Checkpoints(Db).Restored);
+    describeFields("Reference", checkpoints.Reference);
+    describeFields("CheckpointLimits", checkpoints.Limits);
+}
+
+fn describeFields(comptime label: []const u8, comptime Container: type) void {
+    const info = @typeInfo(Container).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| {
+        std.debug.print("{s}.{s}: {s}\n", .{ label, name, @typeName(T) });
+    }
 }
 
 fn describe(comptime label: []const u8, comptime Container: type) void {
