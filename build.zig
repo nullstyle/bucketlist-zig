@@ -107,6 +107,22 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.step("bench", "Measure update and checkpoint costs").dependOn(&b.addRunArtifact(bench).step);
+    const scalability = b.addExecutable(.{
+        .name = "bucketlist-scalability",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/scalability.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "bucketlist", .module = lib },
+                .{ .name = "bucketlist-checkpoints", .module = checkpoints },
+            },
+        }),
+    });
+    const scalability_run = b.addRunArtifact(scalability);
+    check.dependOn(&scalability.step);
+    scalability_run.addPassthruArgs();
+    b.step("scalability", "Measure large-batch staging and native checkpoint allocations (requires a fresh store path)").dependOn(&scalability_run.step);
     const api = b.addExecutable(.{
         .name = "bucketlist-api",
         .root_module = b.createModule(.{

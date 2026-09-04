@@ -12,5 +12,6 @@ test {
     _ = @import("bucket.zig");
     _ = @import("list.zig");
     _ = @import("database.zig");
+    _ = @import("checkpoint_stream_test.zig");
     _ = @import("vectors_test.zig");
 }

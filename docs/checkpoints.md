@@ -37,7 +37,9 @@ perform full checkpoint restoration; `load` verifies the referenced contents.
 Malformed storage is an error rather than an empty database.
 
 `save(view, metadata)` takes a borrowed immutable database read view and opaque
-application recovery bytes. It stores each canonical bucket under its SHA-256
+application recovery bytes. It obtains an allocation-free layout of borrowed
+canonical frames and checks the aggregate encoded size before staging files.
+It stores each canonical bucket under its SHA-256
 hash, including pending merge outputs, then stores an immutable manifest with
 the checkpoint structure and metadata. Only after those writes are durable does
 it atomically replace the catalog with the new reference. Identical bucket
@@ -64,8 +66,9 @@ contents and remain usable after closing or collecting the on-disk store.
 ## Recovery and trust
 
 `load(gpa, reference)` verifies the immutable manifest's hash and declared
-database digest, checks all lengths and bucket hashes, reconstructs the portable
-checkpoint, and invokes the typed database's strict restore. That validates
+database digest, parses all references and validates their aggregate lengths
+before reading any bucket, then supplies hash-verified frames one at a time to
+the typed database's `restoreFrom`. That validates
 schema/profile identity, canonical records, level topology, pending outputs,
 and the complete database commitment. Trailing or truncated input is rejected.
 
@@ -111,14 +114,18 @@ database's limit. `max_metadata_bytes` defaults to 64 KiB; zero permits only
 empty metadata. Limits are inclusive and local resource policies. They do not
 change the database encoding or commitments.
 
-Save serializes a full portable checkpoint before splitting it into bucket
-files; a smaller manager checkpoint limit is checked after this serialization.
-Load enforces its checkpoint limit before fetching oversized bucket contents,
-then reconstructs a full portable checkpoint and its in-memory database.
-Collection restores retained checkpoints one at a time before deletion.
-Checkpoint-sized allocations and merge-validation allocations remain necessary;
-this manager is not an engine for databases larger than memory. Limits on encoded
-input bytes are not exact bounds on total process memory.
+Save borrows immutable bucket bytes directly. Its temporary heap allocations
+scale with metadata and level descriptors, not total checkpoint size. A test
+saves a database larger than 4 MiB using a 32 KiB manager allocator.
+
+Load creates the owned in-memory database and keeps at most one input bucket
+buffer at a time. It does not assemble an additional complete serialized
+checkpoint. Bucket decoding and pending-merge validation still require temporary
+allocations; the final input buffer can remain alive during that validation.
+Collection restores retained checkpoints one at a time before deletion. This
+manager is not an engine for databases larger than memory. Limits on encoded
+input bytes are not exact bounds on total process memory. See the measured
+[scalability comparison](performance.md).
 
 The low-level store's Linux/macOS filesystem, synchronization, advisory-lock,
 and trusted-directory requirements apply. See [storage.md](storage.md). The

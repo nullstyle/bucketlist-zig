@@ -16,6 +16,9 @@ pub fn main() void {
     describe("Batch", Db.Batch);
     describe("Prepared", Db.Prepared);
     describe("ReadView", Db.ReadView);
+    describe("CheckpointLayout", Db.CheckpointLayout);
+    describeFields("CheckpointLayout", Db.CheckpointLayout);
+    describeFields("CheckpointLevel", Db.CheckpointLayout.Level);
     describe("Codec(u64)", lib.Codec(u64));
     describe("Bytes(32)", lib.Bytes(32));
     describe("Checkpoints(Database)", checkpoints.Checkpoints(Db));

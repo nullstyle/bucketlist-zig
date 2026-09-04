@@ -16,6 +16,7 @@ Database.readView: fn (*const database.DatabaseWithDepth(api.Schema,11)) databas
 Database.Iterator: fn (comptime meta.FieldEnum(api.Schema.tables__struct_ANON)) type
 Database.checkpoint: fn (*const database.DatabaseWithDepth(api.Schema,11), mem.Allocator) @typeInfo(@typeInfo(@TypeOf(database.DatabaseWithDepth(api.Schema,11).checkpoint)).@"fn".return_type.?).error_union.error_set![]u8
 Database.restore: fn (mem.Allocator, []const u8, [32]u8) @typeInfo(@typeInfo(@TypeOf(database.DatabaseWithDepth(api.Schema,11).restore)).@"fn".return_type.?).error_union.error_set!database.DatabaseWithDepth(api.Schema,11)
+Database.restoreFrom: fn (mem.Allocator, []const u8, anytype, [32]u8) @typeInfo(@typeInfo(@TypeOf(database.DatabaseWithDepth(api.Schema,11).restoreFrom)).@"fn".return_type.?).error_union.error_set!database.DatabaseWithDepth(api.Schema,11)
 Batch.deinit: fn (*database.DatabaseWithDepth(api.Schema,11).Batch) void
 Batch.put: fn (*database.DatabaseWithDepth(api.Schema,11).Batch, comptime meta.FieldEnum(api.Schema.tables__struct_ANON), anytype, anytype) error{BatchActive,ClosedBatch,CommitmentMismatch,InvalidCheckpoint,NoSpace,NonCanonical,OutOfMemory,SequenceExhausted,StaleBase,WrongAdvance}!void
 Batch.delete: fn (*database.DatabaseWithDepth(api.Schema,11).Batch, comptime meta.FieldEnum(api.Schema.tables__struct_ANON), anytype) error{BatchActive,ClosedBatch,CommitmentMismatch,InvalidCheckpoint,NoSpace,NonCanonical,OutOfMemory,SequenceExhausted,StaleBase,WrongAdvance}!void
@@ -25,7 +26,14 @@ ReadView.deinit: fn (*database.DatabaseWithDepth(api.Schema,11).ReadView) void
 ReadView.get: fn (*const database.DatabaseWithDepth(api.Schema,11).ReadView, comptime meta.FieldEnum(api.Schema.tables__struct_ANON), anytype) anytype
 ReadView.commitment: fn (*const database.DatabaseWithDepth(api.Schema,11).ReadView) database.Commitment
 ReadView.checkpoint: fn (*const database.DatabaseWithDepth(api.Schema,11).ReadView, mem.Allocator) @typeInfo(@typeInfo(@TypeOf(database.DatabaseWithDepth(api.Schema,11).ReadView.checkpoint)).@"fn".return_type.?).error_union.error_set![]u8
+ReadView.checkpointLayout: fn (*const database.DatabaseWithDepth(api.Schema,11).ReadView) database.DatabaseWithDepth(api.Schema,11).CheckpointLayout
 ReadView.iterator: fn (*const database.DatabaseWithDepth(api.Schema,11).ReadView, comptime meta.FieldEnum(api.Schema.tables__struct_ANON)) anytype
+CheckpointLayout.encodedSize: fn (*const database.DatabaseWithDepth(api.Schema,11).CheckpointLayout) error{InvalidCheckpoint}!usize
+CheckpointLayout.header: [97]u8
+CheckpointLayout.levels: [11]database.DatabaseWithDepth(api.Schema,11).CheckpointLayout.Level
+CheckpointLevel.curr: []const u8
+CheckpointLevel.snap: []const u8
+CheckpointLevel.next: ?[]const u8
 Codec(u64).encode: fn (u64, []u8) error{NoSpace,NonCanonical}![]const u8
 Codec(u64).decode: fn ([]const u8) error{InvalidEncoding}!u64
 Bytes(32).init: fn ([]const u8) error{TooLong}!codec.Bytes(32)

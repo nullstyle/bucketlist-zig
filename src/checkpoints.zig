@@ -77,9 +77,9 @@ pub fn Checkpoints(comptime Db: type) type {
             };
         }
 
-        /// The view remains caller-owned throughout. This convenience path
-        /// allocates its full portable checkpoint, then stores each bucket by
-        /// hash and publishes a small immutable manifest reference.
+        /// The view remains caller-owned throughout. Borrow canonical frames
+        /// directly, check the complete encoded size, then durably store each
+        /// bucket and publish a small immutable manifest reference.
         pub fn save(self: *Self, view: *const Db.ReadView, metadata: []const u8) Error!Reference {
             return self.saveImpl(view, metadata, false);
         }
@@ -87,12 +87,9 @@ pub fn Checkpoints(comptime Db: type) type {
         fn saveImpl(self: *Self, view: *const Db.ReadView, metadata: []const u8, fail_after_publish: bool) Error!Reference {
             try self.check();
             if (metadata.len > self.limits.max_metadata_bytes) return error.TooLarge;
-            const portable = view.checkpoint(self.gpa) catch |err| return mapCheckpointError(err);
-            defer self.gpa.free(portable);
-            if (portable.len > self.limits.max_checkpoint_bytes) return error.TooLarge;
-            var cursor: Cursor = .{ .bytes = portable };
-            const header = try cursor.take(portable_header_len);
-            if (!std.mem.eql(u8, header[0..portable_magic.len], portable_magic)) return error.InvalidCheckpoint;
+            const layout = view.checkpointLayout();
+            const encoded_size = layout.encodedSize() catch |err| return mapCheckpointError(err);
+            if (encoded_size > self.limits.max_checkpoint_bytes) return error.TooLarge;
             const database_digest = view.commitment().digest;
             var manifest: std.ArrayList(u8) = .empty;
             defer manifest.deinit(self.gpa);
@@ -100,22 +97,14 @@ pub fn Checkpoints(comptime Db: type) type {
             try manifest.appendSlice(self.gpa, &database_digest);
             try appendU64(self.gpa, &manifest, metadata.len);
             try manifest.appendSlice(self.gpa, metadata);
-            try manifest.appendSlice(self.gpa, header);
-            const levels_at = manifest.items.len;
-            try manifest.append(self.gpa, 0);
-            var levels: u8 = 0;
-            while (cursor.pos != portable.len) {
-                if (levels == max_levels) return error.InvalidCheckpoint;
-                try self.saveBucket(&cursor, &manifest);
-                try self.saveBucket(&cursor, &manifest);
-                const present = (try cursor.take(1))[0];
-                if (present > 1) return error.InvalidCheckpoint;
-                try manifest.append(self.gpa, present);
-                if (present == 1) try self.saveBucket(&cursor, &manifest);
-                levels += 1;
+            try manifest.appendSlice(self.gpa, &layout.header);
+            try manifest.append(self.gpa, @intCast(layout.levels.len));
+            for (layout.levels) |level| {
+                try self.saveBucket(level.curr, &manifest);
+                try self.saveBucket(level.snap, &manifest);
+                try manifest.append(self.gpa, @intFromBool(level.next != null));
+                if (level.next) |bytes| try self.saveBucket(bytes, &manifest);
             }
-            if (levels == 0) return error.InvalidCheckpoint;
-            manifest.items[levels_at] = levels;
             const reference: Reference = .{
                 .manifest_hash = try self.store.putBlob(manifest.items),
                 .database_digest = database_digest,
@@ -137,12 +126,9 @@ pub fn Checkpoints(comptime Db: type) type {
             return reference;
         }
 
-        fn saveBucket(self: *Self, cursor: *Cursor, manifest: *std.ArrayList(u8)) Error!void {
-            const len = try cursor.integer(u64);
-            if (len > cursor.bytes.len - cursor.pos) return error.InvalidCheckpoint;
-            const bytes = try cursor.take(@intCast(len));
+        fn saveBucket(self: *Self, bytes: []const u8, manifest: *std.ArrayList(u8)) Error!void {
             const hash = try self.store.putBlob(bytes);
-            try appendU64(self.gpa, manifest, len);
+            try appendU64(self.gpa, manifest, bytes.len);
             try manifest.appendSlice(self.gpa, &hash);
         }
 
@@ -159,7 +145,8 @@ pub fn Checkpoints(comptime Db: type) type {
         };
 
         /// Trust the whole reference independently for external checkpoints.
-        /// Every blob is verified, then portable Db.restore checks schema,
+        /// All references and aggregate lengths are checked before loading
+        /// buckets one at a time. Portable Db.restoreFrom checks schema,
         /// schedule, typed canonicality and the trusted database digest.
         pub fn load(self: *Self, gpa: Allocator, reference: Reference) Error!Restored {
             try self.check();
@@ -175,47 +162,81 @@ pub fn Checkpoints(comptime Db: type) type {
             const metadata_len = try cursor.integer(u64);
             if (metadata_len > self.limits.max_metadata_bytes) return error.TooLarge;
             const metadata = try cursor.take(@intCast(metadata_len));
-            const header = try cursor.take(portable_header_len);
+            const header = try cursor.take(Db.CheckpointLayout.header_len);
             if (!std.mem.eql(u8, header[0..portable_magic.len], portable_magic)) return error.InvalidCheckpoint;
             const levels = (try cursor.take(1))[0];
-            if (levels == 0 or levels > max_levels) return error.InvalidCheckpoint;
-            var portable: std.ArrayList(u8) = .empty;
-            defer portable.deinit(gpa);
-            try self.appendPortable(gpa, &portable, header);
-            for (0..levels) |_| {
-                try self.loadBucket(gpa, &cursor, &portable, reachable);
-                try self.loadBucket(gpa, &cursor, &portable, reachable);
+            if (levels != Db.CheckpointLayout.level_count) return error.InvalidCheckpoint;
+            var references: [Db.CheckpointLayout.level_count]LevelReferences = undefined;
+            var encoded_size = header.len;
+            if (encoded_size > self.limits.max_checkpoint_bytes) return error.TooLarge;
+            for (&references) |*level| {
+                level.curr = try self.readBucketReference(&cursor, &encoded_size);
+                level.snap = try self.readBucketReference(&cursor, &encoded_size);
                 const present = (try cursor.take(1))[0];
                 if (present > 1) return error.InvalidCheckpoint;
-                try self.appendPortable(gpa, &portable, &.{present});
-                if (present == 1) try self.loadBucket(gpa, &cursor, &portable, reachable);
+                if (encoded_size == self.limits.max_checkpoint_bytes) return error.TooLarge;
+                encoded_size += 1;
+                level.next = if (present == 1) try self.readBucketReference(&cursor, &encoded_size) else null;
             }
             if (cursor.pos != manifest.len) return error.InvalidCheckpoint;
-            var database = Db.restore(gpa, portable.items, reference.database_digest) catch |err| return mapCheckpointError(err);
+            var source: BucketSource = .{ .manager = self, .gpa = gpa, .levels = &references };
+            defer source.deinit();
+            var database = Db.restoreFrom(gpa, header, &source, reference.database_digest) catch |err| return mapCheckpointError(err);
             errdefer database.deinit();
             const owned_metadata = try gpa.dupe(u8, metadata);
             errdefer gpa.free(owned_metadata);
-            if (reachable) |list| try appendUnique(gpa, list, reference.manifest_hash);
+            if (reachable) |list| {
+                try appendUnique(gpa, list, reference.manifest_hash);
+                for (references) |level| {
+                    try appendUnique(gpa, list, level.curr.hash);
+                    try appendUnique(gpa, list, level.snap.hash);
+                    if (level.next) |pending| try appendUnique(gpa, list, pending.hash);
+                }
+            }
             return .{ .database = database, .metadata = owned_metadata, .gpa = gpa };
         }
 
-        fn appendPortable(self: *Self, gpa: Allocator, portable: *std.ArrayList(u8), bytes: []const u8) Error!void {
-            if (bytes.len > self.limits.max_checkpoint_bytes - portable.items.len) return error.TooLarge;
-            try portable.appendSlice(gpa, bytes);
-        }
+        const BucketReference = struct { length: usize, hash: Hash };
+        const LevelReferences = struct { curr: BucketReference, snap: BucketReference, next: ?BucketReference };
 
-        fn loadBucket(self: *Self, gpa: Allocator, cursor: *Cursor, portable: *std.ArrayList(u8), reachable: ?*std.ArrayList(Hash)) Error!void {
+        fn readBucketReference(self: *Self, cursor: *Cursor, encoded_size: *usize) Error!BucketReference {
             const len = try cursor.integer(u64);
             const hash = (try cursor.take(32))[0..32].*;
-            const available = self.limits.max_checkpoint_bytes - portable.items.len;
+            const available = self.limits.max_checkpoint_bytes - encoded_size.*;
             if (available < 8 or len > available - 8) return error.TooLarge;
-            const bytes = try self.store.getBlob(gpa, hash, @intCast(len));
-            defer gpa.free(bytes);
-            if (bytes.len != len) return error.InvalidCheckpoint;
-            try appendU64(gpa, portable, len);
-            try self.appendPortable(gpa, portable, bytes);
-            if (reachable) |list| try appendUnique(gpa, list, hash);
+            const length: usize = @intCast(len);
+            encoded_size.* += 8 + length;
+            return .{ .length = length, .hash = hash };
         }
+
+        const BucketSource = struct {
+            manager: *Self,
+            gpa: Allocator,
+            levels: *const [Db.CheckpointLayout.level_count]LevelReferences,
+            owned: ?[]u8 = null,
+
+            fn deinit(self: *BucketSource) void {
+                if (self.owned) |bytes| self.gpa.free(bytes);
+                self.owned = null;
+            }
+
+            // Core consumes/copies a borrowed frame before asking for another.
+            // The caller also releases the final frame on success or failure.
+            pub fn bucket(self: *BucketSource, level: usize, slot: Db.CheckpointSlot) Error!?[]const u8 {
+                self.deinit();
+                if (level >= self.levels.len) return error.InvalidCheckpoint;
+                const reference = switch (slot) {
+                    .current => self.levels[level].curr,
+                    .snapshot => self.levels[level].snap,
+                    .pending => self.levels[level].next orelse return null,
+                };
+                const bytes = try self.manager.store.getBlob(self.gpa, reference.hash, reference.length);
+                errdefer self.gpa.free(bytes);
+                if (bytes.len != reference.length) return error.InvalidCheckpoint;
+                self.owned = bytes;
+                return bytes;
+            }
+        };
 
         /// Preserves the selected current checkpoint automatically, plus every
         /// caller-retained reference. Fully validates ALL roots before deleting
@@ -355,7 +376,83 @@ pub fn Checkpoints(comptime Db: type) type {
             const old = try manager.save(&view, "old");
             try std.testing.checkAllAllocationFailures(gpa, saveUnderAllocationFailure, .{ &manager, &view, old });
         }
+
+        test "checkpoints: all manifest framing and lengths precede bucket reads" {
+            const gpa = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+            var manager = try Self.open(gpa, std.testing.io, path_buf[0..path_len], .{});
+            defer manager.deinit();
+            var db = Db.init(gpa);
+            defer db.deinit();
+            var view = db.readView();
+            defer view.deinit();
+            const old = try manager.save(&view, "m");
+            const manifest = try manager.store.getBlob(gpa, old.manifest_hash, 4096);
+            defer gpa.free(manifest);
+            const first_frame = manifest_magic.len + 32 + 8 + 1 + Db.CheckpointLayout.header_len + 1;
+            // A valid reference to a missing first bucket proves later framing
+            // and length failures win before a single referenced bucket read.
+            @memset(manifest[first_frame + 8 ..][0..32], 0);
+            const missing: Reference = .{ .manifest_hash = try manager.store.putBlob(manifest), .database_digest = old.database_digest };
+            try std.testing.expectError(error.NotFound, manager.load(gpa, missing));
+            const trailing = try std.mem.concat(gpa, u8, &.{ manifest, "\x00" });
+            defer gpa.free(trailing);
+            const malformed: Reference = .{ .manifest_hash = try manager.store.putBlob(trailing), .database_digest = old.database_digest };
+            try std.testing.expectError(error.InvalidCheckpoint, manager.load(gpa, malformed));
+            @memset(manifest[first_frame + 40 ..][0..8], 255);
+            const oversized: Reference = .{ .manifest_hash = try manager.store.putBlob(manifest), .database_digest = old.database_digest };
+            try std.testing.expectError(error.TooLarge, manager.load(gpa, oversized));
+            try std.testing.expectEqual(old, (try manager.current()).?);
+        }
     };
+}
+
+test "checkpoints: multi-megabyte database saves with 32 KiB of manager allocation" {
+    const lib = @import("bucketlist");
+    const Payload = lib.Bytes(128 * 1024);
+    const LargeSchema = struct {
+        pub const namespace = "checkpoint.bounded-save";
+        pub const version: u32 = 1;
+        pub const tables = .{ .values = lib.Table(1, u64, Payload) };
+    };
+    const LargeDb = lib.Database(LargeSchema);
+    const Manager = Checkpoints(LargeDb);
+    const gpa = std.testing.allocator;
+    var db = LargeDb.init(gpa);
+    defer db.deinit();
+    var payload: Payload = .{ .len = 128 * 1024, .data = @splat(0x5a) };
+    {
+        var batch = try db.batch(gpa);
+        defer batch.deinit();
+        for (0..32) |key| {
+            payload.data[0] = @intCast(key);
+            try batch.put(.values, key, payload);
+        }
+        var prepared = try db.prepareAdvance(gpa, 1, &batch);
+        defer prepared.deinit();
+        try db.commit(&prepared);
+    }
+    var view = db.readView();
+    defer view.deinit();
+    try std.testing.expect(try view.checkpointLayout().encodedSize() > 4 * 1024 * 1024);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var scratch: [32 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+    var manager = try Manager.open(fixed.allocator(), std.testing.io, path_buf[0..path_len], .{});
+    defer manager.deinit();
+    const reference = try manager.save(&view, "bounded save");
+    try std.testing.expectEqual(reference, try manager.save(&view, "bounded save"));
+    var loaded = try manager.load(gpa, reference);
+    defer loaded.deinit();
+    try std.testing.expectEqual(db.commitment(), loaded.database.commitment());
+    try std.testing.expectEqualStrings("bounded save", loaded.metadata);
+    try std.testing.expectEqual(@as(u8, 31), loaded.database.get(.values, 31).?.data[0]);
 }
 
 const Cursor = struct {
@@ -386,8 +483,18 @@ fn appendUnique(gpa: Allocator, hashes: *std.ArrayList(Hash), hash: Hash) Alloca
 
 fn mapCheckpointError(err: anyerror) Error {
     return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.CommitmentMismatch => error.CommitmentMismatch,
+        error.OutOfMemory,
+        error.CommitmentMismatch,
+        error.IoFailed,
+        error.NotFound,
+        error.TooLarge,
+        error.CorruptBlob,
+        error.CorruptManifest,
+        error.NotRegularFile,
+        error.UnsupportedPlatform,
+        error.StoreBusy,
+        error.InvalidPath,
+        => @errorCast(err),
         else => error.InvalidCheckpoint,
     };
 }

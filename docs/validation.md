@@ -22,7 +22,7 @@ apply, network catch-up, and participation in quorum after process restart.
 
 ## Reproducible checks
 
-Final local runs passed all 51 native tests on macOS ARM64 and Linux ARM64 in
+Final local runs passed all 63 native tests on macOS ARM64 and Linux ARM64 in
 Debug and ReleaseSafe, plus the checks below. Linux runs in a disposable native
 ARM container; x86_64 Linux is separately cross-compiled. The first emulated
 x86 container could not run this Zig toolchain under Rosetta and is not counted
@@ -31,7 +31,8 @@ as runtime validation.
 | Check | Evidence |
 | --- | --- |
 | `just test` | Codec/schema negatives, literal encodings/hashes, map properties, schedule boundaries, OOM atomicity/cleanup, strict restore, native storage, core/file merge parity, and the two-table consumer. |
-| Native checkpoint tests | Eleven checks cover spill-boundary continuation, metadata authentication, retained/current reachability, hash-valid malformed manifests, inclusive limits, all save/restore allocation failures, and both pre-replacement and ambiguous publication errors. Imported-module tests are explicitly included through the dedicated test root. |
+| Native checkpoint tests | Seventeen checks cover spill-boundary continuation, metadata authentication, retained/current reachability, hash-valid malformed manifests, inclusive limits, all save/restore allocation failures, and both pre-replacement and ambiguous publication errors. They also require full manifest checks before bucket reads and save a database over 4 MiB with a 32 KiB manager allocator. Imported-module tests are explicitly included through the dedicated test root. |
+| Portable checkpoint and staging tests | Borrowed-frame restoration survives reused input buffers, source failures, and all allocator failures; malformed headers fail before callbacks. Large repeated batches match final-only canonical effects, and every staging allocation failure permits a correct retry on the same batch. |
 | `just persistent-example-smoke` | A pinned advance-1 snapshot survives close/reopen, replays identically through advance 3, and remains loadable alongside current advance 3 after obsolete blobs are collected. |
 | `zig build test -Doptimize=ReleaseSafe` | Same semantic gates with runtime safety and optimization. |
 | `just vectors-check` | Independent Python model reproduces 274 unique bucket frames, four profiles, and 128 advances per profile. |
@@ -70,6 +71,16 @@ Run `zig build bench -Doptimize=ReleaseFast` to reproduce the workload.
 The file merger separately passes a 20,000-record / roughly 420 KB output test
 using a 17,000-byte fixed allocator, including deduplication of an existing
 output. Its workspace depends on per-record limits, not total bucket size.
+
+The [scalability comparison](performance.md) uses identical benchmark source
+against commit `55d94cb` and the current implementation. At 16,384 staged keys,
+unique and replacement puts improved about 8.8 times, with more memory used by
+the staging index. For a 21,937,636-byte checkpoint, peak requested save
+allocations fell from 32,905,682 to 1,370 bytes; load peak fell from 64,900,131 to
+31,994,449 bytes. Native elapsed times were essentially unchanged. Raw results,
+allocator accounting limits, and reproduction commands are in that report.
+All measured database digests, native manifest hashes, checkpoint sizes, and
+returned owned allocations were identical before and after.
 
 ## Review outcomes and limits
 

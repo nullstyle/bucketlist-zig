@@ -96,14 +96,32 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
         }
 
         pub const Batch = struct {
+            const Identity = struct { table: u32, key: []const u8 };
+            const IdentityContext = struct {
+                pub fn hash(_: @This(), identity: Identity) u64 {
+                    return std.hash.Wyhash.hash(identity.table, identity.key);
+                }
+                pub fn eql(_: @This(), a: Identity, b: Identity) bool {
+                    return a.table == b.table and std.mem.eql(u8, a.key, b.key);
+                }
+            };
+            const IdentityIndex = std.HashMapUnmanaged(Identity, usize, IdentityContext, std.hash_map.default_max_load_percentage);
+            // HashMap capacities are u32 powers of two. Refuse an impossible
+            // next growth before its internal capacity arithmetic can overflow.
+            const max_index_entries = (((@as(u64, 1) << 31) - 1) * std.hash_map.default_max_load_percentage) / 100;
+
             owner: *Self,
             gpa: Allocator,
             token: u64,
             base: Hash,
             changes: std.ArrayList(bucket.Record) = .empty,
+            // Keys borrow the independently owned allocations in changes;
+            // growing the records array cannot invalidate these slices.
+            index: IdentityIndex = .empty,
             sealed: bool = false,
 
             pub fn deinit(self: *Batch) void {
+                self.index.deinit(self.gpa);
                 for (self.changes.items) |record| freeRecord(self.gpa, record);
                 self.changes.deinit(self.gpa);
                 if (self.owner.batch_token == self.token) self.owner.batch_open = false;
@@ -134,14 +152,23 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             }
 
             fn replace(self: *Batch, record: bucket.Record) Allocator.Error!void {
-                for (self.changes.items) |*old| {
-                    if (old.table == record.table and std.mem.eql(u8, old.key, record.key)) {
-                        freeRecord(self.gpa, old.*);
-                        old.* = record;
-                        return;
-                    }
+                const identity: Identity = .{ .table = record.table, .key = record.key };
+                if (self.index.get(identity)) |position| {
+                    const old = &self.changes.items[position];
+                    // Retain the original key allocation, which the index
+                    // borrows. Only the final value or deletion changes.
+                    self.gpa.free(record.key);
+                    if (old.value) |value| self.gpa.free(value);
+                    old.value = record.value;
+                    return;
                 }
-                try self.changes.append(self.gpa, record);
+                if (self.index.count() >= max_index_entries) return error.OutOfMemory;
+                // All fallible reservations precede the logical insertion.
+                // OOM may grow capacity but leaves every staged record intact.
+                try self.changes.ensureUnusedCapacity(self.gpa, 1);
+                try self.index.ensureUnusedCapacity(self.gpa, 1);
+                self.index.putAssumeCapacityNoClobber(identity, self.changes.items.len);
+                self.changes.appendAssumeCapacity(record);
             }
         };
 
@@ -232,6 +259,11 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             pub fn checkpoint(self: *const ReadView, gpa: Allocator) ![]u8 {
                 return encodeCheckpoint(&self.engine, gpa);
             }
+            /// Allocation-free serialization layout. Frame slices borrow this
+            /// pinned view and become invalid when it is deinitialized.
+            pub fn checkpointLayout(self: *const ReadView) CheckpointLayout {
+                return layoutFrom(&self.engine);
+            }
             pub fn iterator(self: *const ReadView, comptime name: Name) Iterator(name) {
                 return .{ .view = self };
             }
@@ -275,69 +307,148 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
         }
 
         const checkpoint_magic = "bucketlist.checkpoint.v1\x00";
+        const checkpoint_header_len = checkpoint_magic.len + 32 + 32 + 8;
+        pub const CheckpointSlot = enum { current, snapshot, pending };
+
+        /// Advanced serialization interface. The fixed header is owned by
+        /// value; canonical frame slices borrow the ReadView that supplied it.
+        pub const CheckpointLayout = struct {
+            pub const level_count = depth;
+            pub const header_len = checkpoint_header_len;
+            pub const Level = struct {
+                curr: []const u8,
+                snap: []const u8,
+                next: ?[]const u8,
+            };
+            header: [header_len]u8,
+            levels: [depth]Level,
+
+            pub fn encodedSize(self: *const CheckpointLayout) error{InvalidCheckpoint}!usize {
+                var total: usize = header_len;
+                for (self.levels) |level| {
+                    try accountFrame(&total, level.curr.len);
+                    try accountFrame(&total, level.snap.len);
+                    try accountBytes(&total, 1);
+                    if (level.next) |bytes| try accountFrame(&total, bytes.len);
+                }
+                return total;
+            }
+        };
+
+        fn layoutFrom(engine: *const Engine) CheckpointLayout {
+            var layout: CheckpointLayout = undefined;
+            @memcpy(layout.header[0..checkpoint_magic.len], checkpoint_magic);
+            @memcpy(layout.header[checkpoint_magic.len..][0..32], &schema_hash);
+            @memcpy(layout.header[checkpoint_magic.len + 32 ..][0..32], &Engine.profileHash());
+            std.mem.writeInt(u64, layout.header[checkpoint_magic.len + 64 ..][0..8], engine.seq, .big);
+            for (engine.levels, &layout.levels) |level, *dest| dest.* = .{
+                .curr = level.curr.bytes(),
+                .snap = level.snap.bytes(),
+                .next = if (level.next) |pending| pending.bytes() else null,
+            };
+            return layout;
+        }
+
+        fn accountBytes(total: *usize, count: usize) error{InvalidCheckpoint}!void {
+            if (count > max_checkpoint_bytes - total.*) return error.InvalidCheckpoint;
+            total.* += count;
+        }
+
+        fn accountFrame(total: *usize, count: usize) error{InvalidCheckpoint}!void {
+            try accountBytes(total, 8);
+            try accountBytes(total, count);
+        }
+
         pub fn checkpoint(self: *const Self, gpa: Allocator) ![]u8 {
             return encodeCheckpoint(&self.engine, gpa);
         }
 
         fn encodeCheckpoint(engine: *const Engine, gpa: Allocator) ![]u8 {
-            var out: std.ArrayList(u8) = .empty;
-            errdefer out.deinit(gpa);
-            try out.appendSlice(gpa, checkpoint_magic);
-            try out.appendSlice(gpa, &schema_hash);
-            try out.appendSlice(gpa, &Engine.profileHash());
-            var seq: [8]u8 = undefined;
-            std.mem.writeInt(u64, &seq, engine.seq, .big);
-            try out.appendSlice(gpa, &seq);
-            for (engine.levels) |level| {
-                try appendBucket(gpa, &out, level.curr);
-                try appendBucket(gpa, &out, level.snap);
-                if (out.items.len >= max_checkpoint_bytes) return error.InvalidCheckpoint;
-                try out.append(gpa, @intFromBool(level.next != null));
-                if (level.next) |b| try appendBucket(gpa, &out, b);
+            const layout = layoutFrom(engine);
+            const out = try gpa.alloc(u8, try layout.encodedSize());
+            @memcpy(out[0..checkpoint_header_len], &layout.header);
+            var pos: usize = checkpoint_header_len;
+            for (layout.levels) |level| {
+                writeFrame(out, &pos, level.curr);
+                writeFrame(out, &pos, level.snap);
+                out[pos] = @intFromBool(level.next != null);
+                pos += 1;
+                if (level.next) |bytes| writeFrame(out, &pos, bytes);
             }
-            return out.toOwnedSlice(gpa);
+            std.debug.assert(pos == out.len);
+            return out;
         }
 
-        fn appendBucket(gpa: Allocator, out: *std.ArrayList(u8), b: bucket.Bucket) !void {
-            const bytes = b.bytes();
-            if (out.items.len > max_checkpoint_bytes or bytes.len > max_checkpoint_bytes - out.items.len or
-                8 > max_checkpoint_bytes - out.items.len - bytes.len) return error.InvalidCheckpoint;
-            var size: [8]u8 = undefined;
-            std.mem.writeInt(u64, &size, bytes.len, .big);
-            try out.appendSlice(gpa, &size);
-            try out.appendSlice(gpa, bytes);
+        fn writeFrame(out: []u8, pos: *usize, bytes: []const u8) void {
+            std.mem.writeInt(u64, out[pos.*..][0..8], bytes.len, .big);
+            pos.* += 8;
+            @memcpy(out[pos.*..][0..bytes.len], bytes);
+            pos.* += bytes.len;
         }
 
         /// `expected` must come from a trusted local frontier or application
         /// certificate. A digest read from the same untrusted file is not trust.
         pub fn restore(gpa: Allocator, bytes: []const u8, expected: Hash) !Self {
             if (bytes.len > max_checkpoint_bytes) return error.InvalidCheckpoint;
-            var cursor = Cursor{ .bytes = bytes };
+            var source: SliceSource = .{ .cursor = .{ .bytes = bytes } };
+            const header = try source.cursor.take(checkpoint_header_len);
+            var self = try restoreFrom(gpa, header, &source, expected);
+            errdefer self.deinit();
+            if (source.cursor.pos != bytes.len) return error.InvalidCheckpoint;
+            return self;
+        }
+
+        /// Restore from borrowed frames, requested youngest level first in
+        /// current/snapshot/pending order. source.bucket(level, slot) returns
+        /// !?[]const u8 valid until the next call. Only pending may be null.
+        /// The source owns its buffers and cleanup, including on error. This
+        /// method copies each frame before asking for another, checks the exact
+        /// header, canonical schema, size, topology and complete trusted digest.
+        /// Source errors propagate; no partial Database is returned.
+        pub fn restoreFrom(gpa: Allocator, header: []const u8, source: anytype, expected: Hash) !Self {
+            if (header.len != checkpoint_header_len) return error.InvalidCheckpoint;
+            var cursor: Cursor = .{ .bytes = header };
             if (!std.mem.eql(u8, try cursor.take(checkpoint_magic.len), checkpoint_magic) or
                 !std.mem.eql(u8, try cursor.take(32), &schema_hash) or
                 !std.mem.eql(u8, try cursor.take(32), &Engine.profileHash())) return error.InvalidCheckpoint;
             var self = Self.init(gpa);
             errdefer self.deinit();
             self.engine.seq = std.mem.readInt(u64, (try cursor.take(8))[0..8], .big);
-            for (&self.engine.levels) |*level| {
-                level.curr = try readBucket(gpa, &cursor);
-                level.snap = try readBucket(gpa, &cursor);
-                switch ((try cursor.take(1))[0]) {
-                    0 => {},
-                    1 => level.next = try readBucket(gpa, &cursor),
-                    else => return error.InvalidCheckpoint,
+            var total: usize = checkpoint_header_len;
+            for (&self.engine.levels, 0..) |*level, i| {
+                const curr = (try source.bucket(i, .current)) orelse return error.InvalidCheckpoint;
+                try accountFrame(&total, curr.len);
+                level.curr = try decodeTypedBucket(gpa, curr);
+                const snap = (try source.bucket(i, .snapshot)) orelse return error.InvalidCheckpoint;
+                try accountFrame(&total, snap.len);
+                level.snap = try decodeTypedBucket(gpa, snap);
+                try accountBytes(&total, 1);
+                if (try source.bucket(i, .pending)) |pending| {
+                    try accountFrame(&total, pending.len);
+                    level.next = try decodeTypedBucket(gpa, pending);
                 }
             }
-            if (cursor.pos != bytes.len) return error.InvalidCheckpoint;
             try self.engine.validate();
             if (!std.mem.eql(u8, &self.commitment().digest, &expected)) return error.CommitmentMismatch;
             return self;
         }
 
-        fn readBucket(gpa: Allocator, cursor: *Cursor) !bucket.Bucket {
-            const n = std.mem.readInt(u64, (try cursor.take(8))[0..8], .big);
-            if (n > cursor.bytes.len - cursor.pos) return error.InvalidCheckpoint;
-            var b = try bucket.Bucket.decode(gpa, try cursor.take(@intCast(n)));
+        const SliceSource = struct {
+            cursor: Cursor,
+            pub fn bucket(self: *@This(), _: usize, slot: CheckpointSlot) !?[]const u8 {
+                if (slot == .pending) switch ((try self.cursor.take(1))[0]) {
+                    0 => return null,
+                    1 => {},
+                    else => return error.InvalidCheckpoint,
+                };
+                const n = std.mem.readInt(u64, (try self.cursor.take(8))[0..8], .big);
+                if (n > self.cursor.bytes.len - self.cursor.pos) return error.InvalidCheckpoint;
+                return try self.cursor.take(@intCast(n));
+            }
+        };
+
+        fn decodeTypedBucket(gpa: Allocator, bytes: []const u8) !bucket.Bucket {
+            var b = try bucket.Bucket.decode(gpa, bytes);
             errdefer b.release();
             for (b.records()) |record| {
                 var found = false;
@@ -492,4 +603,137 @@ fn oomScenario(gpa: Allocator) !void {
 
 test "allocation failures leave publication atomic and restore leak-free" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, oomScenario, .{});
+}
+
+const StagingSchema = struct {
+    pub const namespace = "test.staging";
+    pub const version: u32 = 1;
+    pub const tables = .{
+        .left = schema.Table(1, u64, u64),
+        .right = schema.Table(2, u64, u64),
+    };
+};
+const StagingDb = Database(StagingSchema);
+
+test "large indexed batches preserve final calls and table identity across input orders" {
+    const gpa = std.testing.allocator;
+    const count = 2048;
+    var actual = StagingDb.init(gpa);
+    defer actual.deinit();
+    var expected = StagingDb.init(gpa);
+    defer expected.deinit();
+    var changes = try actual.batch(gpa);
+    defer changes.deinit();
+    var final_only = try expected.batch(gpa);
+    defer final_only.deinit();
+    for (0..count) |i| {
+        try changes.put(.left, i, i);
+        try changes.put(.right, i, 10000 + i);
+    }
+    for (0..count) |j| {
+        const i = count - j - 1;
+        try changes.delete(.left, i);
+        if (i % 3 != 0) try changes.put(.left, i, 30000 + i);
+        try changes.put(.right, i, 40000 + i);
+        if (i % 5 == 0) try changes.delete(.right, i) else try changes.put(.right, i, 50000 + i);
+    }
+    try std.testing.expectEqual(@as(usize, count * 2), changes.changes.items.len);
+    for (0..count) |i| {
+        if (i % 3 != 0) try final_only.put(.left, i, 30000 + i);
+        if (i % 5 != 0) try final_only.put(.right, i, 50000 + i);
+    }
+    var prepared = try actual.prepareAdvance(gpa, 1, &changes);
+    defer prepared.deinit();
+    var reference = try expected.prepareAdvance(gpa, 1, &final_only);
+    defer reference.deinit();
+    try std.testing.expectEqual(reference.commitment(), prepared.commitment());
+    try actual.commit(&prepared);
+    for (0..count) |i| {
+        const left: ?u64 = if (i % 3 == 0) null else 30000 + i;
+        const right: ?u64 = if (i % 5 == 0) null else 50000 + i;
+        try std.testing.expectEqual(left, actual.get(.left, i));
+        try std.testing.expectEqual(right, actual.get(.right, i));
+    }
+}
+
+const StagingOperation = struct { table: enum { left, right }, key: u64, value: ?u64 };
+
+fn stageOperation(batch: *StagingDb.Batch, op: StagingOperation) !void {
+    switch (op.table) {
+        .left => if (op.value) |value| try batch.put(.left, op.key, value) else try batch.delete(.left, op.key),
+        .right => if (op.value) |value| try batch.put(.right, op.key, value) else try batch.delete(.right, op.key),
+    }
+}
+
+fn expectStagedRecords(expected: []const bucket.Record, actual: []const bucket.Record) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |a, b| {
+        try std.testing.expectEqual(a.table, b.table);
+        try std.testing.expectEqualSlices(u8, a.key, b.key);
+        if (a.value) |value| {
+            try std.testing.expect(b.value != null);
+            try std.testing.expectEqualSlices(u8, value, b.value.?);
+        } else try std.testing.expect(b.value == null);
+    }
+}
+
+fn stagingFailureScenario(fail_index: usize) !struct { allocations: usize, failed: bool } {
+    const gpa = std.testing.allocator;
+    // Force growth to allocate: whether a backing allocator can remap in place
+    // depends on its prior layout and must not change the failure-site census.
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index, .resize_fail_index = 0 });
+    {
+        var actual = StagingDb.init(gpa);
+        defer actual.deinit();
+        var expected = StagingDb.init(gpa);
+        defer expected.deinit();
+        var changes = try actual.batch(failing.allocator());
+        defer changes.deinit();
+        var reference = try expected.batch(gpa);
+        defer reference.deinit();
+        const initial = actual.commitment();
+        // Twenty-eight distinct identities force four index capacities, then
+        // overwrite, delete, and recreate a subset with the same encoded keys.
+        var operations: [48]StagingOperation = undefined;
+        for (0..14) |i| {
+            operations[2 * i] = .{ .table = .left, .key = i, .value = 100 + i };
+            operations[2 * i + 1] = .{ .table = .right, .key = i, .value = 200 + i };
+        }
+        for (0..5) |i| {
+            operations[28 + 4 * i] = .{ .table = .left, .key = i, .value = 300 + i };
+            operations[28 + 4 * i + 1] = .{ .table = .left, .key = i, .value = null };
+            operations[28 + 4 * i + 2] = .{ .table = .left, .key = i, .value = 500 + i };
+            operations[28 + 4 * i + 3] = .{ .table = .right, .key = i, .value = null };
+        }
+        for (operations) |op| {
+            stageOperation(&changes, op) catch |err| {
+                if (err != error.OutOfMemory) return err;
+                try std.testing.expectEqual(initial, actual.commitment());
+                try expectStagedRecords(reference.changes.items, changes.changes.items);
+                // Restore allocator availability and retry on the SAME batch.
+                // This catches partially inserted indexes and dangling borrowed
+                // keys that cleanup-only allocation-failure tests cannot see.
+                failing.fail_index = std.math.maxInt(usize);
+                try stageOperation(&changes, op);
+            };
+            try stageOperation(&reference, op);
+        }
+        try expectStagedRecords(reference.changes.items, changes.changes.items);
+        var prepared = try actual.prepareAdvance(gpa, 1, &changes);
+        defer prepared.deinit();
+        var baseline = try expected.prepareAdvance(gpa, 1, &reference);
+        defer baseline.deinit();
+        try std.testing.expectEqual(baseline.commitment(), prepared.commitment());
+    }
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    return .{ .allocations = failing.alloc_index, .failed = failing.has_induced_failure };
+}
+
+test "every staging allocation failure preserves records and permits retry" {
+    const baseline = try stagingFailureScenario(std.math.maxInt(usize));
+    try std.testing.expect(!baseline.failed);
+    for (0..baseline.allocations) |failure| {
+        const result = try stagingFailureScenario(failure);
+        try std.testing.expect(result.failed);
+    }
 }

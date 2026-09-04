@@ -101,6 +101,39 @@ history's bucket layout. Restore the exact checkpoint when continuing a
 previous history. SLCP applications also retain the exact preceding consensus
 value, not merely its digest.
 
+## Checkpoint sources
+
+Advanced storage implementations can use `ReadView.checkpointLayout()` instead
+of allocating a complete serialized checkpoint. `CheckpointLayout` owns its
+fixed header by value and borrows each level's canonical `.curr`, `.snap`, and
+optional `.next` frame from the pinned read view. Keep that view alive for every
+use of those slices. `encodedSize()` checks the total portable checkpoint size,
+including lengths and presence bytes. Ordinary `checkpoint(gpa)` encodes the
+same layout into one exactly sized allocation; its bytes are unchanged.
+
+`Database.restoreFrom(gpa, header, source, expected_digest)` accepts a source
+with this method:
+
+```zig
+pub fn bucket(self: *Source, level: usize, slot: Database.CheckpointSlot) !?[]const u8
+```
+
+The core requests every level in ascending order, with `.current`, `.snapshot`,
+and `.pending` for each level. Only `.pending` may return `null`; an empty bucket
+is its complete canonical frame. Returned bytes must remain valid until the
+next callback. The core copies and validates each frame before requesting the
+next, allowing one reusable input buffer. The source owns and must release its
+buffers on both success and failure; the returned database owns independent
+storage. Source errors propagate without returning partial state.
+
+The exact header is checked before any callback. Typed canonicality, aggregate
+size, topology, pending outputs, and the trusted complete digest receive the
+same checks as `restore`. The source controls any surrounding storage format,
+so it must reject surplus records/trailing bytes and bound input allocations
+before supplying frames. The native manager parses its whole reference manifest
+first; ordinary `restore` rejects trailing bytes in its slice. These interfaces
+do not change the trust requirements or encoding above.
+
 ## Ownership and concurrency
 
 Reads return decoded bounded values. `readView()` retains immutable buckets
