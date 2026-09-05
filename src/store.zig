@@ -19,6 +19,15 @@ pub const Error = error{
     MergeMismatch,
 };
 
+/// The bucket hash format an operation verifies or produces. v2 carries the
+/// profile's committed block target; see docs/format-v2.md. Traveling with
+/// MergeLimits as the per-call policy bundle, it is a consensus property,
+/// not a local resource limit.
+pub const BucketFormat = union(enum) {
+    v1,
+    v2: struct { target_block_bytes: u32 },
+};
+
 /// Per-record workspace and total-work limits for native bucket reads/merges.
 /// These are local resource policies, not part of the bucket hash encoding.
 pub const MergeLimits = struct {
@@ -26,6 +35,7 @@ pub const MergeLimits = struct {
     max_value_bytes: u32 = 1024 * 1024,
     max_records: u64 = 1 << 32,
     max_bucket_bytes: u64 = 1 << 40,
+    format: BucketFormat = .v1,
 };
 
 /// Slices borrow the cursor and are invalidated by its next/finish/deinit call.
@@ -444,6 +454,54 @@ pub const Store = struct {
         return hash;
     }
 
+    /// Install canonical bucket bytes under their v2 block-hash name
+    /// (docs/format-v2.md). Framing, order, counts, and length are validated
+    /// while hashing; an existing file is re-verified under v2. Durability
+    /// barriers match putBlob. The v2 target travels in limits.format.
+    pub fn putBucketV2(self: *Store, bytes: []const u8, limits: MergeLimits) Error!Hash {
+        const target = switch (limits.format) {
+            .v2 => |v2| v2.target_block_bytes,
+            .v1 => return error.InvalidBucket,
+        };
+        const hash = try v2BucketHash(bytes, target, limits);
+        const name = std.fmt.bytesToHex(hash, .lower);
+        if (try self.blobExists(&name)) {
+            const existing = try readBounded(self.blobs, self.io, &name, self.gpa, bytes.len);
+            defer self.gpa.free(existing);
+            if (existing.len != bytes.len or !std.mem.eql(u8, existing, bytes) or
+                !std.mem.eql(u8, &hash, &(try v2BucketHash(existing, target, limits)))) return error.CorruptBlob;
+            const file = try openRegular(self.blobs, self.io, &name);
+            defer file.close(self.io);
+            try fullSync(self.io, file);
+            return hash;
+        }
+        var atomic = self.blobs.createFileAtomic(self.io, &name, .{}) catch return error.IoFailed;
+        defer atomic.deinit(self.io);
+        try writeBytes(self.io, atomic.file, bytes);
+        try fullSync(self.io, atomic.file);
+        atomic.link(self.io) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                const existing = try readBounded(self.blobs, self.io, &name, self.gpa, bytes.len);
+                defer self.gpa.free(existing);
+                if (!std.mem.eql(u8, existing, bytes)) return error.CorruptBlob;
+            },
+            else => return error.IoFailed,
+        };
+        try syncDir(self.io, self.blobs);
+        const installed = try openRegular(self.blobs, self.io, &name);
+        defer installed.close(self.io);
+        try fullSync(self.io, installed);
+        return hash;
+    }
+
+    fn blobExists(self: *Store, name: []const u8) Error!bool {
+        _ = self.blobs.statFile(self.io, name, .{ .follow_symlinks = false }) catch |err| return switch (err) {
+            error.FileNotFound => false,
+            else => true,
+        };
+        return true;
+    }
+
     /// The caller owns the returned allocation. max_bytes is an inclusive
     /// bound, checked before allocation and again while reading.
     pub fn getBlob(self: *Store, gpa: std.mem.Allocator, hash: Hash, max_bytes: usize) Error![]u8 {
@@ -798,6 +856,155 @@ fn recordOrder(a: StreamRecord, b: StreamRecord) std.math.Order {
     return std.mem.order(u8, a.key, b.key);
 }
 
+// v2 block hashing (docs/format-v2.md), intentionally duplicated from the
+// core module so this store keeps no import edge; literal fixtures below pin
+// parity with tools/v2-vectors.py and thereby the core implementation.
+const v2_block_domain = "bucketlist.block.v2\x00";
+const v2_node_domain = "bucketlist.blocknode.v2\x00";
+const v2_empty_domain = "bucketlist.block.v2.empty\x00";
+const v2_bucket_domain = "bucketlist.bucket.v2\x00";
+
+const V2Tree = struct {
+    const Node = struct { span: u64, hash: Hash };
+    peaks: [64]Node = undefined,
+    count: usize = 0,
+    leaves: u64 = 0,
+
+    fn append(self: *V2Tree, leaf: Hash) void {
+        self.peaks[self.count] = .{ .span = 1, .hash = leaf };
+        self.count += 1;
+        self.leaves += 1;
+        while (self.count >= 2) {
+            const left = self.peaks[self.count - 2];
+            const right = self.peaks[self.count - 1];
+            if (left.span != right.span) break;
+            self.peaks[self.count - 2] = .{ .span = left.span * 2, .hash = v2Combine(left.hash, right.hash) };
+            self.count -= 1;
+        }
+    }
+    fn root(self: *const V2Tree) Hash {
+        var acc = self.peaks[0].hash;
+        for (self.peaks[1..self.count]) |peak| acc = v2Combine(acc, peak.hash);
+        return acc;
+    }
+};
+
+fn v2Combine(left: Hash, right: Hash) Hash {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(v2_node_domain);
+    h.update(&left);
+    h.update(&right);
+    return h.finalResult();
+}
+
+const V2Hasher = struct {
+    target: u32,
+    tree: V2Tree = .{},
+    block: std.crypto.hash.sha2.Sha256 = std.crypto.hash.sha2.Sha256.init(.{}),
+    block_index: u64 = 0,
+    block_bytes: u64 = 0,
+    record_count: u64 = 0,
+    block_open: bool = false,
+
+    fn init(target: u32) V2Hasher {
+        return .{ .target = target };
+    }
+    fn record(self: *V2Hasher, table: u32, key: []const u8, value: ?[]const u8) void {
+        if (!self.block_open) self.open();
+        var header: [8]u8 = undefined;
+        std.mem.writeInt(u32, header[0..4], table, .big);
+        std.mem.writeInt(u32, header[4..8], @intCast(key.len), .big);
+        self.block.update(&header);
+        self.block.update(key);
+        self.block.update(&[1]u8{if (value == null) 0 else 1});
+        if (value) |bytes| {
+            var length: [4]u8 = undefined;
+            std.mem.writeInt(u32, &length, @intCast(bytes.len), .big);
+            self.block.update(&length);
+            self.block.update(bytes);
+            self.block_bytes += 13 + key.len + bytes.len;
+        } else self.block_bytes += 9 + key.len;
+        self.record_count += 1;
+        if (self.block_bytes >= self.target) self.close();
+    }
+    fn open(self: *V2Hasher) void {
+        self.block = std.crypto.hash.sha2.Sha256.init(.{});
+        self.block.update(v2_block_domain);
+        var index: [8]u8 = undefined;
+        std.mem.writeInt(u64, &index, self.block_index, .big);
+        self.block.update(&index);
+        self.block_bytes = 0;
+        self.block_open = true;
+    }
+    fn close(self: *V2Hasher) void {
+        var leaf: Hash = undefined;
+        self.block.final(&leaf);
+        self.tree.append(leaf);
+        self.block_index += 1;
+        self.block_open = false;
+    }
+    fn final(self: *V2Hasher) Hash {
+        if (self.block_open) self.close();
+        const block_count = self.tree.leaves;
+        var root: Hash = undefined;
+        if (block_count == 0) {
+            std.crypto.hash.sha2.Sha256.hash(v2_empty_domain, &root, .{});
+        } else root = self.tree.root();
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update(v2_bucket_domain);
+        var counts: [8]u8 = undefined;
+        std.mem.writeInt(u64, &counts, self.record_count, .big);
+        h.update(&counts);
+        std.mem.writeInt(u64, &counts, block_count, .big);
+        h.update(&counts);
+        h.update(&root);
+        return h.finalResult();
+    }
+};
+
+/// Hash the canonical bucket bytes under v2 without trusting them: the
+/// memory walk enforces framing, order, count, and exact length.
+fn v2BucketHash(bytes: []const u8, target: u32, limits: MergeLimits) Error!Hash {
+    if (bytes.len < empty_bucket.len or !std.mem.eql(u8, bytes[0..bucket_domain.len], bucket_domain)) return error.InvalidBucket;
+    const count = std.mem.readInt(u64, bytes[bucket_domain.len..][0..8], .big);
+    if (count > limits.max_records) return error.TooLarge;
+    var hasher = V2Hasher.init(target);
+    var position: usize = empty_bucket.len;
+    var previous: ?StreamRecord = null;
+    for (0..count) |_| {
+        if (position + 9 > bytes.len) return error.InvalidBucket;
+        const table = std.mem.readInt(u32, bytes[position..][0..4], .big);
+        const key_len = std.mem.readInt(u32, bytes[position + 4 ..][0..4], .big);
+        if (key_len > limits.max_key_bytes) return error.TooLarge;
+        position += 8;
+        if (position + key_len + 1 > bytes.len) return error.InvalidBucket;
+        const key = bytes[position..][0..key_len];
+        position += key_len;
+        const tag = bytes[position];
+        position += 1;
+        const value: ?[]const u8 = switch (tag) {
+            0 => null,
+            1 => value: {
+                if (position + 4 > bytes.len) return error.InvalidBucket;
+                const value_len = std.mem.readInt(u32, bytes[position..][0..4], .big);
+                if (value_len > limits.max_value_bytes) return error.TooLarge;
+                position += 4;
+                if (position + value_len > bytes.len) return error.InvalidBucket;
+                const out = bytes[position..][0..value_len];
+                position += value_len;
+                break :value out;
+            },
+            else => return error.InvalidBucket,
+        };
+        const row: StreamRecord = .{ .table = table, .key = key, .value = value };
+        if (previous) |p| if (recordOrder(p, row) != .lt) return error.InvalidBucket;
+        previous = row;
+        hasher.record(table, key, value);
+    }
+    if (position != bytes.len) return error.InvalidBucket;
+    return hasher.final();
+}
+
 const BucketReader = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -808,6 +1015,7 @@ const BucketReader = struct {
     previous_key: []u8,
     value_buffer: []u8,
     hash: std.crypto.hash.sha2.Sha256 = .init(.{}),
+    v2: ?V2Hasher = null,
     expected: Hash,
     size: u64,
     consumed: u64 = 0,
@@ -847,6 +1055,10 @@ const BucketReader = struct {
         self.remaining = std.mem.readInt(u64, header[bucket_domain.len..][0..8], .big);
         if (self.remaining > limits.max_records) return error.TooLarge;
         if (self.remaining > (size - empty_bucket.len) / 9) return error.InvalidBucket;
+        switch (limits.format) {
+            .v1 => {},
+            .v2 => |v2| self.v2 = V2Hasher.init(v2.target_block_bytes),
+        }
         return self;
     }
 
@@ -883,7 +1095,8 @@ const BucketReader = struct {
                 error.EndOfStream => {},
                 error.ReadFailed => return error.IoFailed,
             }
-            if (!std.mem.eql(u8, &self.expected, &self.hash.finalResult())) return error.CorruptBlob;
+            const actual = if (self.v2) |*v2| v2.final() else self.hash.finalResult();
+            if (!std.mem.eql(u8, &self.expected, &actual)) return error.CorruptBlob;
             self.finished = true;
             return;
         }
@@ -911,6 +1124,7 @@ const BucketReader = struct {
         };
         const record: StreamRecord = .{ .table = table, .key = key, .value = value };
         if (previous) |p| if (recordOrder(p, record) != .lt) return error.InvalidBucket;
+        if (self.v2 != null) self.v2.?.record(table, key, value);
         self.current = record;
         self.remaining -= 1;
     }
@@ -1814,6 +2028,64 @@ test "read index eviction re-verifies and allocation failure only skips sampling
     var restored = try store.lookupBucketIndexed(testing.allocator, a, 1, &key, limits);
     defer restored.deinit(testing.allocator);
     try testing.expectEqualStrings(&key, restored.value);
+}
+
+test "v2 buckets verify under the block format and match the independent model" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    try store.enableReadIndex(.{ .min_span_bytes = 128 });
+    const bytes = try manyRecords(testing.allocator, 100, 0);
+    defer testing.allocator.free(bytes);
+    const limits: MergeLimits = .{
+        .max_key_bytes = 4,
+        .max_value_bytes = 4,
+        .format = .{ .v2 = .{ .target_block_bytes = 128 } },
+    };
+    // Literal from tools/v2-vectors.py over the manyRecords fixture shape
+    // (table 1, key u32be(2i), value u32be(2i)) at target 128, plus the
+    // empty-bucket constant.
+    const hash = try store.putBucketV2(bytes, limits);
+    var expected: Hash = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "11b18af417064d1f7ea26dc9d462b2d80696b76be501cb92cbeb5b3b4c6a926a");
+    try testing.expectEqualSlices(u8, &expected, &hash);
+    try testing.expectEqual(hash, try store.putBucketV2(bytes, limits));
+    const empty = try store.putBucketV2(empty_bucket, limits);
+    _ = try std.fmt.hexToBytes(&expected, "013dce769819e34e82bcbccd3d2d3f24dfbddd1d99f3f2647a99465105d78952");
+    try testing.expectEqualSlices(u8, &expected, &empty);
+
+    // Streaming scans, verified lookups, and the read index all operate on
+    // the v2-named blob; the flat v1 interpretation of the same name fails.
+    var cursor = try store.scanBucket(hash, limits);
+    defer cursor.deinit();
+    try cursor.finish();
+    try testing.expectEqual(@as(u64, 100), cursor.recordCount());
+    var key: [4]u8 = undefined;
+    std.mem.writeInt(u32, &key, 198, .big);
+    var found = try store.lookupBucketIndexed(testing.allocator, hash, 1, &key, limits);
+    defer found.deinit(testing.allocator);
+    try testing.expectEqualStrings(&key, found.value);
+    std.mem.writeInt(u32, &key, 199, .big);
+    var absent = try store.lookupBucketIndexed(testing.allocator, hash, 1, &key, limits);
+    defer absent.deinit(testing.allocator);
+    try testing.expect(absent == .absent);
+    {
+        var flat = try store.scanBucket(hash, .{ .max_key_bytes = 4, .max_value_bytes = 4 });
+        defer flat.deinit();
+        try testing.expectError(error.CorruptBlob, flat.finish());
+    }
+
+    // A value-byte flip (framing and order intact) breaks the block digest.
+    const name = std.fmt.bytesToHex(hash, .lower);
+    const file = try store.blobs.openFile(testing.io, &name, .{ .mode = .read_write });
+    defer file.close(testing.io);
+    try file.writePositionalAll(testing.io, "X", bytes.len - 1);
+    {
+        var flipped = try store.scanBucket(hash, limits);
+        defer flipped.deinit();
+        try testing.expectError(error.CorruptBlob, flipped.finish());
+    }
 }
 
 test "one store supports concurrent immutable puts merges and independent cursors" {
