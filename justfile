@@ -27,6 +27,20 @@ vectors-check:
 wasm-diff:
     mise exec -- zig build wasm-diff
 
+# Fast seeded cases are also part of the ordinary test target.
+fuzz-smoke:
+    mise exec -- zig build fuzz-smoke
+
+# Explicit sustained runs. Replay with the same seed and failing case prefix.
+fuzz-portable iterations="100000" seed="1":
+    mise exec -- zig build fuzz-portable -Doptimize=ReleaseSafe -- --iterations {{iterations}} --seed {{seed}}
+
+fuzz-native iterations="10000" seed="1":
+    mise exec -- zig build fuzz-native -Doptimize=ReleaseSafe -- {{iterations}} {{seed}}
+
+disk-bench path mib="64" batch_rows="64" read_samples="32" trials="1":
+    mise exec -- zig build disk-bench -Doptimize=ReleaseFast -- {{quote(path)}} {{mib}} {{batch_rows}} {{read_samples}} {{trials}}
+
 example-smoke:
     mise exec -- zig build example-smoke
 

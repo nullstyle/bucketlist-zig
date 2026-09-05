@@ -428,9 +428,11 @@ in [ADR 0001](adr/0001-disk-engine-and-bounded-delivery.md), with completed
 resource, failure/recovery, platform, and real-process integration evidence in
 [validation.md](validation.md).
 
-M6 still needs release review, sustained malformed-input/fuzz coverage,
-realistic larger-than-memory performance evidence, and an accessible immutable
-SLCP dependency before a standalone integration release. Local gates and API
+M6 now includes deterministic portable/native malformed-input campaigns, fast
+seeded CI cases, larger disk workload measurements, and sorted streaming batch
+normalization. It still needs release review, coverage-guided and longer soak
+testing, production workload qualification, and an accessible immutable SLCP
+dependency before a standalone integration release. Local gates and API
 snapshots are necessary evidence, not a stability promise. The initial disk
 point lookup deliberately scans and authenticates complete buckets; indexes and
 caches are later optimizations that must preserve exact v1 bytes and hashes.

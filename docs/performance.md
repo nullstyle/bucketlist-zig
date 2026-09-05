@@ -110,6 +110,141 @@ This measures allocations requested through the disk engine's allocator. It
 excludes fixture construction, the portable reference computation, stack space,
 filesystem cache, and the `std.Io` backend. It establishes bounded execution of a
 database larger than the allocator budget; it is not an RSS measurement or a
-production throughput benchmark. Linear authenticated point reads and batch
-normalization still scale with the bytes scanned. See
+production throughput benchmark. Linear authenticated point reads and sorted
+batch normalization still scale with the bytes scanned. See
 `src/disk_adversarial_test.zig` for the repeatable gate.
+
+## Disk batch normalization
+
+Commit `09fcc4f` replaces one authenticated point lookup per staged identity
+with a sorted merge-join against each visible bucket. The first occurrence of
+an identity decides its current value, including tombstones hiding older
+records. Preparation omits unchanged puts and absent deletes, then encodes the
+same canonical fresh bucket as before. It fully authenticates each touched
+file before returning a prepared result.
+
+For a batch with many keys, normalization reads each relevant frontier bucket
+once rather than rereading it for every key. Sorting and decision storage scale
+with the batch; record buffers remain bounded by the schema. Later scheduled
+merges, deduplication, and manifest publication have their own costs. Point reads
+and recovery validation retain their existing scan behavior.
+
+The regression gate stages 128 existing 128-byte values unchanged, then prepares
+the next advance with a measured file-read allowance. It fails on `a7741e5` and
+passes after the change. Separate tests require dense multi-table histories to
+match the portable engine, reject a corrupt tail even when all requested keys
+match earlier, and allow retry on the same database and batch after every
+preparation allocation failure.
+
+## Recorded disk workload
+
+The comparison uses immutable source archives of `a7741e5` and `09fcc4f`, the
+same benchmark source, and the pinned compiler with **ReleaseFast for every
+module**. The host is an Apple M5 Max running macOS 26.6.2 with 128 GiB RAM.
+Final measurements run sequentially after the mutation campaigns and other
+heavy checks finish. Operating-system caches are not evicted.
+
+The 16 MiB workload has 1,024 records with 16 KiB values. Each batch contains
+at most 64 records (1 MiB of values). It loads all records, updates a quarter,
+repeats those updates unchanged, deletes another quarter, and inserts new
+identities to replace the deleted quarter. It then verifies sampled reads,
+closes/reopens against the trusted reference, verifies reads again, collects
+unreachable files, and verifies reads once more. Each read phase samples 32
+requests across updated, unchanged, deleted, newly inserted, and absent keys.
+Record counts follow that deterministic model; these are sampled checks, not a
+full independently materialized database oracle.
+
+Each worker configuration executes 32 advances per trial, with three trials.
+All **192 compared advances have identical database digests and native manifest
+references before and after**. One- and two-worker executions also compare
+every reference inside the benchmark. Raw
+[baseline](benchmarks/disk-baseline-16m.jsonl) and
+[candidate](benchmarks/disk-candidate-16m.jsonl) JSONL include provenance and
+per-phase counters. Durations below are medians; allocation peaks are maxima
+across trials.
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| All measured phases, 1 worker | 11.484 s | 2.391 s |
+| All measured phases, 2 workers | 11.506 s | 2.389 s |
+| Preparation phases, 1 worker | 10.466 s | 1.361 s |
+| Preparation phases, 2 workers | 10.467 s | 1.354 s |
+| Returned positional read bytes, either configuration | 24,883,775,015 | 2,327,788,837 |
+| Peak requested allocation, 1 worker | 2,161,253 bytes | 2,161,253 bytes |
+| Peak requested allocation, 2 workers | 2,210,437 bytes | 2,210,437 bytes |
+
+The measured workload improves about **4.8 times** and returned read bytes fall
+about **10.7 times**. Preparation accounts for the improvement; sampled point
+reads, publication, and recovery costs are essentially unchanged. A second
+worker provides no meaningful total-time improvement on this workload.
+
+The candidate also completes larger workloads with the same batch size, value
+size, mutation pattern, and 32 reads per verification phase. These are **one
+trial per worker configuration**, not medians across repeated trials. Raw
+[64 MiB](benchmarks/disk-candidate-64m.jsonl) and
+[256 MiB](benchmarks/disk-candidate-256m.jsonl) results include every advance.
+
+| Live value bytes | Advances | Measured time, 1 worker | Measured time, 2 workers | Returned read bytes, each configuration |
+| --- | ---: | ---: | ---: | ---: |
+| 64 MiB | 128 | 11.531 s | 11.412 s | 14,378,028,315 |
+| 256 MiB | 512 | 75.460 s | 74.237 s | 130,519,419,904 |
+
+Every advance matches across worker configurations. Peak requested allocation
+remains **2,161,253 bytes with one worker** and **2,210,437 bytes with two** at
+both sizes, with zero live tracked allocations after close. The 256 MiB dataset
+exceeds the measured engine heap by over 120 times; it remains well below this
+host's 128 GiB RAM. This demonstrates allocation behavior, not execution beyond
+physical memory capacity.
+
+For the 256 MiB run, preparation latency is 109.5 ms median / 318.5 ms p99 /
+836.5 ms maximum with one worker, and 106.2 / 275.1 / 658.1 ms with two. The p99
+uses the nearest-rank value among 512 advances. Preparation includes scheduled
+merges and durable immutable-file writes. The roughly **121.6 GiB** returned
+read traffic per configuration shows that full-bucket scanning remains
+expensive as datasets grow. Bounded memory and nonblocking host admission do
+not guarantee a short publication latency.
+
+The measured total sums staging, preparation, publication, batch cleanup,
+reads, open/close, recovery, and collection. It excludes bounded fixture
+generation and JSON reporting. Requested-allocation peaks include staged batch
+data and active merge workspaces, but exclude fixture buffers (1,049,088 bytes),
+the 96-byte comparison record retained per advance per worker, stacks, allocator
+internals, and `std.Io` allocations. All tracked allocations are freed at close.
+These are not RSS measurements. Positional I/O counters count returned bytes
+through public callbacks, not physical disk traffic. `file_sync_ops` counts
+`Io.fileSync` callbacks, including directory syncs routed through them; the
+additional macOS `F_FULLFSYNC` operation is included in elapsed time but not in
+that callback count.
+
+### Reproduce and compare
+
+For a single current-source run, choose an empty root with resolved parent
+paths. Existing contents are rejected before any benchmark work.
+
+```sh
+mise exec -- just disk-bench /absolute/fresh/store/path 64
+```
+
+To capture provenance alongside every result, use the wrapper. For the baseline,
+first extract `git archive a7741e5` into an isolated source directory and write
+the full revision returned by `git rev-parse a7741e5` to that directory's
+`.baseline-revision` file. The wrapper compiles the current benchmark against
+that archive using the current repository's mise tools.
+
+```sh
+DISK_BENCH_SOURCE_DIR=/absolute/baseline/source \
+  mise exec -- bash tools/disk-bench.sh /absolute/fresh/before 16 64 32 3 > before.jsonl
+mise exec -- bash tools/disk-bench.sh /absolute/fresh/after 16 64 32 3 > after.jsonl
+mise exec -- python3 tools/compare-disk-bench.py before.jsonl after.jsonl
+```
+
+The comparison command requires matching benchmark source and workload settings,
+complete phase histories, consistent read/time totals and allocation peaks, and every committed digest
+and manifest reference before it reports median costs. Its checks also reject
+altered commitments, workload settings, phase records, missing cleanup, and
+inconsistent allocation summaries.
+
+Recorded benchmark SHA-256:
+`27a4ec874a139a48fe00e11a0033d7323b65fc8fec1edf202e478537385401af`.
+Results remain specific to this synthetic workload and machine; production
+workload qualification and cold-storage measurements remain open.

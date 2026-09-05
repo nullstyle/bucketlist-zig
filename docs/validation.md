@@ -31,8 +31,10 @@ nonblocking and ownership-moving; capacity includes active publication. Worker
 errors latch without publishing later advances. [ADR 0001](adr/0001-disk-engine-and-bounded-delivery.md)
 and the [disk contract](disk.md) describe those boundaries.
 
-The current suite has **93 tests**: 30 portable, 20 Store, two core/file parity,
-17 checkpoint, 19 disk/host, and five hash-frontier tests. Debug and ReleaseSafe
+The current suite has **99 tests**: 30 portable, 20 Store, two core/file parity,
+17 checkpoint, 23 disk/host, five hash-frontier, and two portable campaign tests.
+An additional 100 native mutation cases run as an executable smoke gate.
+Debug and ReleaseSafe
 pass on macOS ARM64 and native Linux ARM64. The disk/host tests cover exact
 portable parity, reduced terminal profiles, real active-publication backpressure,
 rejected-batch ownership, durable snapshots, shutdown, publication failures,
@@ -53,7 +55,9 @@ Actual SIGKILL exits 137. Restart restores 7, replays 8–10, catches up through
 11–12, and joins quorum at 71. Commands and database roots agree at the controlled
 barriers; compaction retains 49–70 (22 records), and applied publication
 watermarks finish at 71/70/71. Evidence lives in
-`.zig-cache/slcp-disk-process.SbxJuK`.
+`.zig-cache/slcp-disk-process.oNA2jh`; the ReleaseSafe fixture was rerun after
+the disk normalization change with the same outcomes. The sibling SLCP working
+tree is unchanged by this hardening slice.
 
 The companion change passes **113/113 build steps, 437 tests with one platform
 skip**, **8/8 real-socket E2E tests**, **436 docs checks / zero failures**, and the
@@ -62,13 +66,31 @@ negative test expects privileged ports; this macOS host permits an unprivileged
 bind to port 1. No oracle or differential check is skipped. The journal watermark
 is Experimental and does not change the peer answering-window policy.
 
-M6 release hardening remains open: sustained malformed-input/fuzz coverage,
-release review, production-scale throughput measurements, and an accessible
-immutable companion artifact for a distributable standalone SLCP consumer.
+M6 adds deterministic malformed-input campaigns and larger disk workload
+measurements. Release review, coverage-guided and longer soak testing,
+production workload qualification, and an accessible immutable companion
+artifact for a distributable standalone SLCP consumer remain open.
+
+The recorded ReleaseSafe campaigns execute **300,000 portable** and **30,000
+native** mutation/property cases across three seeds, without mismatches or
+leaks. Portable runs include 17,113 accepted checkpoint continuations and 6,885
+intentional allocation failures; native runs include hash-valid malformed
+buckets/manifests and preservation after rejected recovery/collection. Exact
+source/compiler provenance, counters, and replay commands are in
+[fuzzing.md](fuzzing.md). This is deterministic mutation testing; it does not
+claim coverage-guided exploration or exhaustive input coverage.
+
+The disk workload comparison against `a7741e5` validates 192 identical committed
+digests and manifest references. At 16 MiB, median measured time improves about
+4.8 times and returned read bytes fall 10.7 times. Additional 64/256 MiB traces
+match across one/two workers with peak requested engine allocation at most
+2,210,437 bytes. These are synthetic warm-cache measurements; physical memory,
+fixture buffers, per-advance comparison records, and other excluded costs are
+documented in [performance.md](performance.md). Large scans remain expensive.
 
 ## Reproducible checks
 
-Final local runs passed all 93 native tests on macOS ARM64 and Linux ARM64 in
+Local gates passed all 99 tests on macOS ARM64 and Linux ARM64 in
 Debug and ReleaseSafe, plus the checks below. Linux runs in a disposable native
 ARM container; x86_64 Linux is separately cross-compiled. The first emulated
 x86 container could not run this Zig toolchain under Rosetta and is not counted
@@ -76,7 +98,8 @@ as runtime validation.
 
 | Check | Evidence |
 | --- | --- |
-| `just test` | All 93 tests described above, API/schema diagnostics, and portable, checkpoint, and disk-host consumers. |
+| `just test` | All 99 tests described above, 100 native mutation cases, API/schema diagnostics, and portable, checkpoint, and disk-host consumers. |
+| `just fuzz-smoke` | A 1,000-case portable parser campaign, exhaustive checkpoint continuation allocation failures, and 100 native cases; included in ordinary tests. See [fuzzing.md](fuzzing.md) for coverage and replay. |
 | Native checkpoint tests | Seventeen checks cover spill-boundary continuation, metadata authentication, retained/current reachability, hash-valid malformed manifests, inclusive limits, all save/restore allocation failures, and both pre-replacement and ambiguous publication errors. They also require full manifest checks before bucket reads and save a database over 4 MiB with a 32 KiB manager allocator. Imported-module tests are explicitly included through the dedicated test root. |
 | Portable checkpoint and staging tests | Borrowed-frame restoration survives reused input buffers, source failures, and all allocator failures; malformed headers fail before callbacks. Large repeated batches match final-only canonical effects, and every staging allocation failure permits a correct retry on the same batch. |
 | `just disk-example-smoke` | Bounded queue admission, explicit backpressure, durable background publication, authenticated disk reopen, and typed two-table reads. |
@@ -153,8 +176,9 @@ The APIs and format remain Experimental. There is no automatic schema migration,
 SQL/query planner, secondary-index maintenance, succinct record proof, or
 application-independent checkpoint trust policy. Disk reads currently scan
 complete buckets, and recovery recomputes pending merges. The examples are bounded
-demonstrations, not production services. Sustained fuzzing, realistic throughput
-workloads, and release review remain necessary before promotion to Stable.
+demonstrations, not production services. Coverage-guided and longer soak testing,
+production workload qualification, and release review remain necessary before
+promotion to Stable.
 
 The SLCP revision used here is not publicly available as an immutable archive.
 The optional integration reads that exact Git object from a local source and

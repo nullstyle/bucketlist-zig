@@ -39,8 +39,8 @@ pub fn build(b: *std.Build) void {
         },
     });
     const tests = b.addTest(.{ .root_module = lib });
-    const test_step = b.step("test", "Run codec, schema, database, bucket, and native store tests");
-    const check = b.step("check", "Compile all native tests and example without executing them");
+    const test_step = b.step("test", "Run library tests, seeded parser cases, and consumer examples");
+    const check = b.step("check", "Compile native tests, examples, and validation tools without running them");
     check.dependOn(&tests.step);
     test_step.dependOn(&b.addRunArtifact(tests).step);
     const store_tests = b.addTest(.{ .root_module = store });
@@ -97,6 +97,42 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(frontier_tests).step);
     check.dependOn(&frontier_tests.step);
+
+    const fuzz_smoke = b.step("fuzz-smoke", "Run bounded deterministic portable and native parser cases");
+    const portable_fuzz_module = b.createModule(.{
+        .root_source_file = b.path("src/fuzz_portable.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const portable_fuzz_tests = b.addTest(.{ .root_module = portable_fuzz_module, .filters = &.{"portable fuzz:"} });
+    const portable_fuzz_smoke = b.addRunArtifact(portable_fuzz_tests);
+    fuzz_smoke.dependOn(&portable_fuzz_smoke.step);
+    check.dependOn(&portable_fuzz_tests.step);
+    const portable_fuzz = b.addExecutable(.{ .name = "fuzz-portable", .root_module = portable_fuzz_module });
+    const portable_fuzz_run = b.addRunArtifact(portable_fuzz);
+    portable_fuzz_run.addPassthruArgs();
+    b.step("fuzz-portable", "Exercise portable parsers; -- --iterations N --seed N").dependOn(&portable_fuzz_run.step);
+    check.dependOn(&portable_fuzz.step);
+    const native_fuzz = b.addExecutable(.{
+        .name = "fuzz-native",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz_native.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "bucketlist", .module = lib },
+                .{ .name = "bucketlist-store", .module = store },
+            },
+        }),
+    });
+    const native_fuzz_smoke = b.addRunArtifact(native_fuzz);
+    native_fuzz_smoke.addArgs(&.{ "100", "1" });
+    fuzz_smoke.dependOn(&native_fuzz_smoke.step);
+    const native_fuzz_run = b.addRunArtifact(native_fuzz);
+    native_fuzz_run.addPassthruArgs();
+    b.step("fuzz-native", "Exercise private synthetic stores; -- iterations seed [fresh-path]").dependOn(&native_fuzz_run.step);
+    check.dependOn(&native_fuzz.step);
+    test_step.dependOn(fuzz_smoke);
 
     const example = b.addExecutable(.{
         .name = "directory",
@@ -177,6 +213,22 @@ pub fn build(b: *std.Build) void {
     check.dependOn(&scalability.step);
     scalability_run.addPassthruArgs();
     b.step("scalability", "Measure large-batch staging and native checkpoint allocations (requires a fresh store path)").dependOn(&scalability_run.step);
+    const disk_bench = b.addExecutable(.{
+        .name = "disk-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/disk-bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "bucketlist", .module = lib },
+                .{ .name = "bucketlist-disk", .module = disk },
+            },
+        }),
+    });
+    const disk_bench_run = b.addRunArtifact(disk_bench);
+    disk_bench_run.addPassthruArgs();
+    b.step("disk-bench", "Measure file execution; -- fresh-path [MiB] [batch-rows] [read-samples] [trials]").dependOn(&disk_bench_run.step);
+    check.dependOn(&disk_bench.step);
     const api = b.addExecutable(.{
         .name = "bucketlist-api",
         .root_module = b.createModule(.{

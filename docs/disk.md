@@ -87,6 +87,16 @@ it reads, and distinguishes an absent identity from a tombstone and a live empty
 value. Finding a matching record early does not bypass verification of its tail.
 This bounds memory but can make reads and unchanged-write detection expensive.
 
+Batch preparation sorts staged identities and merge-joins them with each
+visible bucket in youngest-first order. A bucket scan resolves all matching
+changes together, including tombstones that hide older values. The scan still
+authenticates its complete tail before any result can be prepared. Unchanged
+puts and absent deletes disappear without a separate point lookup per key.
+Scratch memory scales with the bounded batch and one record cursor; point reads
+remain linear. Scheduled merges and file deduplication may read those files
+again. [Performance measurements](performance.md) distinguish that total file
+traffic from normalization alone.
+
 Opening a disk frontier validates its local framing, schema/profile, all unique
 referenced bucket files, typed canonical records, schedule shape, terminal
 tombstone rules, and recomputed pending outputs before accepting the database
@@ -165,7 +175,7 @@ contract is unchanged.
 
 ## Acceptance evidence
 
-- 93 native tests pass on macOS ARM64 and Linux ARM64, Debug and ReleaseSafe;
+- 99 tests pass on macOS ARM64 and Linux ARM64, Debug and ReleaseSafe;
   x86_64 Linux cross-compiles, and the independent native/WASM trace is unchanged.
 - Deterministic frontier planning matches the portable engine at depths 1, 2, 3,
   and 11 with varied job completion order. Native file execution, reopen, empty
@@ -184,6 +194,8 @@ contract is unchanged.
   at 71. The companion's full suite, strict Stable API gate, and eight socket
   E2E scenarios also pass.
 
-Authenticated point reads remain linear scans. M6 retains sustained fuzzing,
-production-scale performance work, release review, and distribution of an
-accessible immutable SLCP dependency. These interfaces remain Experimental.
+Authenticated point reads remain linear scans. M6 includes deterministic
+[malformed-input campaigns](fuzzing.md) and larger disk measurements; production
+workload qualification, coverage-guided fuzzing, release review, and distribution
+of an accessible immutable SLCP dependency remain open. These interfaces remain
+Experimental.
