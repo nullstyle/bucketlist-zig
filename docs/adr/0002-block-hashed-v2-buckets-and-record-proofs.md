@@ -62,9 +62,10 @@ companion pins are dictated by those pins and are not rewritten here.
   block target near the read-index span size (~64 KiB) keeps proofs small
   and the fast paths aligned.
 - Merges, GC, manifests, and the disk engine are format-agnostic in shape:
-  they stream records and rehash per profile. Fixed workspace limits
-  (`MergeLimits`) gain a block-size knob that is local policy for v2, never
-  consensus-visible.
+  they stream records and rehash per profile. `target_block_bytes` changes
+  block boundaries and therefore block hashes, so it is a profile parameter
+  committed through the profile hash — never a local knob. Workspace limits
+  (`MergeLimits`) remain local policy.
 - New evidence obligations: v2 format vectors with an independent verifier,
   proof fixtures across spill boundaries and retained checkpoints, a fuzz
   oracle that mutates every proof component and requires rejection, and
