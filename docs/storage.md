@@ -66,6 +66,32 @@ allocates `2 * max_key_bytes + max_value_bytes + 8192` scratch bytes. Limits
 apply to every parsed record, even one unrelated to the lookup target; a corrupt
 or oversized tail cannot be hidden by an early match.
 
+## Read index
+
+`enableReadIndex(options)` opts a Store into `lookupBucketIndexed`, the same
+verified lookup with a local index: the first lookup of a blob fully verifies it
+exactly as `lookupBucket` does and, along that single verified pass, records a
+sampled key/offset spine (a new sample at least `min_span_bytes` apart, bounded
+by `max_samples`, at most `max_buckets` blobs retained least-recently-used).
+Later lookups of an unchanged blob binary-search the spine and read only the one
+span that can contain the key, instead of rehashing the whole blob. The disk
+database enables this by default; `DiskOptions.read_index = null` restores
+per-read whole-bucket verification. The index is local policy: it stores keys,
+offsets, and the verified size only, and never changes any committed byte.
+
+Trust semantics: content-addressed immutable names make a verified entry sound
+across garbage collection and recreation — a recreated file with the same hash
+holds the same verified bytes. Each warm lookup reopens the blob as a regular
+non-symlink file and rechecks its size; any size change discards the entry and
+repeats the full verification. Framing or order anomalies inside a read span
+fail closed. The residual risk is explicit: same-size in-place corruption of a
+blob after its one verifying pass is not detected by warm point reads — scans,
+merges, `open` validation, and collection still detect it, and `read_index =
+null` restores detection on every read. Index bookkeeping allocation failures
+are caller-visible `OutOfMemory` errors, never silent degradation; entries are
+reference-counted so concurrent merges and lookups on one thread-safe Store
+remain safe. Warm spans allocate the same bounded key/value scratch as a scan.
+
 `mergeBuckets(older, newer, drop_tombstones, limits)` merges two stored canonical
 buckets without loading either whole bucket into memory. Records are ordered by
 numeric table ID then lexicographic encoded key. The newer input wins duplicate

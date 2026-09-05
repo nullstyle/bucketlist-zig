@@ -110,7 +110,19 @@ digests and manifest references. At 16 MiB, median measured time improves about
 match across one/two workers with peak requested engine allocation at most
 2,210,437 bytes. These are synthetic warm-cache measurements; physical memory,
 fixture buffers, per-advance comparison records, and other excluded costs are
-documented in [performance.md](performance.md). Large scans remain expensive.
+documented in [performance.md](performance.md).
+
+Point reads no longer rehash whole buckets: a verified local read index pays
+full bucket verification once per blob and then reads a single sampled span
+per lookup ([storage.md](storage.md) documents the trust semantics, size
+guard, fail-closed framing checks, observable allocation failures, and the
+`read_index = null` opt-out restoring per-read verification). Recorded
+per-read measurements show warm deep-level reads improving about 96x at
+16 MiB and 320x at 64 MiB, with logical read traffic per lookup falling from
+67.2 MB to 41 KB at 64 MiB; misses improve about 110x. The index changes no
+committed byte, and indexed and non-indexed opens agree across the test
+suite. Full-bucket scanning still governs merges, reopen validation, and
+retained-checkpoint verification by design.
 
 ## Reproducible checks
 

@@ -29,6 +29,44 @@ fn advance(db: *Disk, seq: u64) !void {
     try p.commit();
 }
 
+test "disk: point reads agree with and without the local read index" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try pathOf(&tmp, &buf);
+    const reference = blk: {
+        var db = try Disk.open(gpa, io, path, .{ .merge_workers = 1 });
+        defer db.deinit();
+        for (1..35) |seq| try advance(db, seq);
+        break :blk db.reference();
+    };
+    // Default options enable the read index; the null opt-out keeps
+    // whole-bucket verification on every lookup. Both must agree. The
+    // exclusive store lock means the two opens are sequential.
+    var results: [40]?u64 = undefined;
+    var flags: [40]?bool = undefined;
+    {
+        var indexed = try Disk.open(gpa, io, path, .{ .expected = reference, .merge_workers = 1 });
+        defer indexed.deinit();
+        for (0..40) |key| {
+            const k: u64 = @intCast(key * 13 % 43);
+            results[key] = try indexed.get(.accounts, k);
+            // A second get of the same key exercises the warm path.
+            try std.testing.expectEqual(results[key], try indexed.get(.accounts, k));
+        }
+        for (0..40) |key| flags[key] = try indexed.get(.flags, @intCast(key % 5));
+    }
+    {
+        var verified = try Disk.open(gpa, io, path, .{ .expected = reference, .merge_workers = 1, .read_index = null });
+        defer verified.deinit();
+        for (0..40) |key| {
+            const k: u64 = @intCast(key * 13 % 43);
+            try std.testing.expectEqual(results[key], try verified.get(.accounts, k));
+        }
+        for (0..40) |key| try std.testing.expectEqual(flags[key], try verified.get(.flags, @intCast(key % 5)));
+    }
+}
+
 test "disk: typed file execution matches portable commitments and durable reopen" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

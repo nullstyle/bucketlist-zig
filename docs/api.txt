@@ -78,6 +78,7 @@ DiskOptions.max_metadata_bytes: usize
 DiskOptions.max_bucket_bytes: u64
 DiskOptions.max_bucket_records: u64
 DiskOptions.max_read_views: usize
+DiskOptions.read_index: ?store.ReadIndexOptions
 DiskOptions.expected: ?disk.Reference
 DiskReference.manifest_hash: [32]u8
 DiskReference.database_digest: [32]u8

@@ -248,3 +248,40 @@ Recorded benchmark SHA-256:
 `27a4ec874a139a48fe00e11a0033d7323b65fc8fec1edf202e478537385401af`.
 Results remain specific to this synthetic workload and machine; production
 workload qualification and cold-storage measurements remain open.
+
+## Point-read latency and the verified read index
+
+`tools/read-bench.zig` measures one public `get` at a time against a
+deterministic 16 KiB-value workload (`deep` = oldest eighth of the key space,
+`shallow` = newest eighth, `miss` = beyond the range), reporting per-read
+latency and logical positional read traffic. The OS page cache stays warm —
+`open` authenticates every bucket — so costs isolate parse/hash work and
+logical I/O, not physical media. Recorded on the same machine as the workload
+above, ReleaseFast, 128 samples per class:
+
+| Dataset | Class | Before: median / bytes per read | After: median / bytes per read |
+| --- | --- | --- | --- |
+| 16 MiB / 1,024 records | deep, first touch | 6.50 ms / 16.8 MB | 0.078 ms / 172 KB |
+| 16 MiB | deep, warm | 6.52 ms / 16.8 MB | 0.068 ms / 41 KB |
+| 16 MiB | shallow, warm | 0.52 ms / 1.8 MB | 0.036 ms / 41 KB |
+| 16 MiB | miss, warm | 6.66 ms / 16.8 MB | 0.244 ms / 460 KB |
+| 64 MiB / 4,096 records | deep, first touch | 26.6 ms / 67.2 MB | 0.087 ms / 566 KB |
+| 64 MiB | deep, warm | 27.6 ms / 67.2 MB | 0.086 ms / 41 KB |
+| 64 MiB | shallow, warm | 2.26 ms / 7.2 MB | 0.054 ms / 41 KB |
+| 64 MiB | miss, warm | 28.5 ms / 67.2 MB | 0.258 ms / 591 KB |
+
+Before the change, every point read re-streamed and re-hashed each candidate
+bucket to verified EOF — a deep hit or miss hashed essentially the whole
+dataset, and warm repeats were byte-identical to first touches. The verified
+read index ([storage.md](storage.md)) pays that full verification once per
+blob, then reads one 64 KiB span per bucket: warm deep reads improve about
+**96x** at 16 MiB and **320x** at 64 MiB, with per-read traffic falling from
+67.2 MB to 41 KB at 64 MiB. First-touch medians include the amortized single
+verifying pass. A miss still probes every level, so it pays one span per
+bucket (~110x here); misses remain O(levels) rather than O(1). Reopen
+rebuilds indexes on first touch; earlier recorded workload numbers above
+predate the index and measured per-read full verification.
+
+```sh
+mise exec -- zig build read-bench -Doptimize=ReleaseFast -- /absolute/fresh/store 64 16 128
+```

@@ -34,6 +34,11 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             max_bucket_bytes: u64 = 1 << 40,
             max_bucket_records: u64 = 1 << 32,
             max_read_views: usize = 64,
+            /// Local read index for point reads: after one fully verified
+            /// bucket pass, warm lookups read only the sampled span instead
+            /// of rehashing the whole blob. `null` keeps per-read whole-bucket
+            /// verification. This is a local policy, never committed bytes.
+            read_index: ?storage.ReadIndexOptions = .{},
             /// An external trust anchor also detects local catalog rollback.
             expected: ?Reference = null,
         };
@@ -59,6 +64,7 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             errdefer gpa.destroy(self);
             self.* = .{ .gpa = gpa, .io = io, .store = try storage.Store.open(gpa, io, path), .options = options, .current_metadata = &.{} };
             errdefer self.store.deinit();
+            if (options.read_index) |read_index| try self.store.enableReadIndex(read_index);
             const catalog = try self.store.readManifest(gpa, catalog_domain.len + 64);
             defer if (catalog) |bytes| gpa.free(bytes);
             if (catalog) |bytes| {
@@ -134,7 +140,7 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
         fn lookup(self: *Self, state: *const Frontier, table: u32, key: []const u8) !storage.BucketLookup {
             for (state.levels) |level| {
                 for ([_]Hash{ level.curr, level.snap }) |hash| {
-                    var found = try self.store.lookupBucket(self.gpa, hash, table, key, self.mergeLimits());
+                    var found = try self.store.lookupBucketIndexed(self.gpa, hash, table, key, self.mergeLimits());
                     if (found != .absent) return found;
                     found.deinit(self.gpa);
                 }

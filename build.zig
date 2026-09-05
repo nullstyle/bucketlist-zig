@@ -243,6 +243,22 @@ pub fn build(b: *std.Build) void {
     disk_bench_run.addPassthruArgs();
     b.step("disk-bench", "Measure file execution; -- fresh-path [MiB] [batch-rows] [read-samples] [trials]").dependOn(&disk_bench_run.step);
     check.dependOn(&disk_bench.step);
+    const read_bench = b.addExecutable(.{
+        .name = "read-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/read-bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "bucketlist", .module = lib },
+                .{ .name = "bucketlist-disk", .module = disk },
+            },
+        }),
+    });
+    const read_bench_run = b.addRunArtifact(read_bench);
+    read_bench_run.addPassthruArgs();
+    b.step("read-bench", "Measure point-read latency; -- fresh-path [MiB] [batch-rows] [samples-per-class]").dependOn(&read_bench_run.step);
+    check.dependOn(&read_bench.step);
     const api = b.addExecutable(.{
         .name = "bucketlist-api",
         .root_module = b.createModule(.{

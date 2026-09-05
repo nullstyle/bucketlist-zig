@@ -51,6 +51,166 @@ pub const BucketLookup = union(enum) {
     }
 };
 
+/// Local read-index policy: not part of any hash or committed byte.
+pub const ReadIndexOptions = struct {
+    /// A new sampled span starts at least this many bytes after the previous
+    /// one, so a warm point read streams at most roughly this many bytes.
+    min_span_bytes: usize = 64 * 1024,
+    /// Hard per-bucket bound; further records land in the last, wider span.
+    max_samples: usize = 1 << 16,
+    /// Retained bucket indexes; excess entries are evicted least-recently-used.
+    max_buckets: usize = 512,
+};
+
+/// One sampled span start: records at `offset` begin with key `key`.
+const Sample = struct {
+    table: u32,
+    offset: u64,
+    key: []u8,
+};
+
+/// Immutable after construction. A warm lookup holds a reference; eviction
+/// removes the entry from the map and frees it only once references drop.
+const BucketIndex = struct {
+    refs: std.atomic.Value(u32) = .init(1),
+    newer: ?*BucketIndex = null,
+    older: ?*BucketIndex = null,
+    hash: Hash,
+    size: u64,
+    record_count: u64,
+    samples: []Sample,
+
+    fn order(_: void, a: Sample, b: Sample) bool {
+        if (a.table != b.table) return a.table < b.table;
+        return std.mem.order(u8, a.key, b.key) == .lt;
+    }
+};
+
+const ReadIndexCache = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    options: ReadIndexOptions,
+    map: std.HashMapUnmanaged(Hash, *BucketIndex, HashContext, std.hash_map.default_max_load_percentage) = .empty,
+    newest: ?*BucketIndex = null,
+    oldest: ?*BucketIndex = null,
+
+    const HashContext = struct {
+        pub fn hash(_: HashContext, key: Hash) u64 {
+            return std.mem.readInt(u64, key[0..8], .little);
+        }
+        pub fn eql(_: HashContext, a: Hash, b: Hash) bool {
+            return std.mem.eql(u8, &a, &b);
+        }
+    };
+
+    fn create(gpa: std.mem.Allocator, io: std.Io, options: ReadIndexOptions) Error!*ReadIndexCache {
+        const self = gpa.create(ReadIndexCache) catch return error.OutOfMemory;
+        self.* = .{ .gpa = gpa, .io = io, .options = .{
+            .min_span_bytes = @max(1, options.min_span_bytes),
+            .max_samples = @max(1, options.max_samples),
+            .max_buckets = @max(1, options.max_buckets),
+        } };
+        return self;
+    }
+
+    fn destroy(self: *ReadIndexCache) void {
+        var entry = self.oldest;
+        while (entry) |index| {
+            const next = index.newer;
+            self.freeIndex(index);
+            entry = next;
+        }
+        self.map.deinit(self.gpa);
+        self.gpa.destroy(self);
+    }
+
+    fn freeIndex(self: *ReadIndexCache, index: *BucketIndex) void {
+        for (index.samples) |sample| self.gpa.free(sample.key);
+        self.gpa.free(index.samples);
+        self.gpa.destroy(index);
+    }
+
+    /// Caller must call release exactly once per acquired index.
+    fn acquire(self: *ReadIndexCache, hash: Hash) ?*BucketIndex {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const index = self.map.get(hash) orelse return null;
+        _ = index.refs.fetchAdd(1, .acq_rel);
+        self.touch(index);
+        return index;
+    }
+
+    fn release(self: *ReadIndexCache, index: *BucketIndex) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.releaseLocked(index);
+    }
+
+    fn releaseLocked(self: *ReadIndexCache, index: *BucketIndex) void {
+        if (index.refs.fetchSub(1, .acq_rel) == 1) self.freeIndex(index);
+    }
+
+    fn touch(self: *ReadIndexCache, index: *BucketIndex) void {
+        if (self.newest == index) return;
+        // Unlink from the interior or either end.
+        if (index.newer) |above| above.older = index.older else self.newest = index.older;
+        if (index.older) |below| below.newer = index.newer else self.oldest = index.newer;
+        // Relink at the newest end.
+        index.newer = null;
+        index.older = self.newest;
+        if (self.newest) |above| above.newer = index;
+        self.newest = index;
+        if (self.oldest == null) self.oldest = index;
+    }
+
+    /// Takes ownership of `samples`; an empty or duplicate install frees them.
+    /// Allocation failure is caller-visible: the read fails with OutOfMemory
+    /// and may be retried, keeping every allocation failure observable.
+    fn install(self: *ReadIndexCache, hash: Hash, size: u64, record_count: u64, samples: []Sample) Error!void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (samples.len == 0) {
+            self.freeSamples(samples);
+            return;
+        }
+        if (self.map.get(hash)) |existing| {
+            self.releaseLocked(existing);
+            self.freeSamples(samples);
+            return;
+        }
+        const index = self.gpa.create(BucketIndex) catch {
+            self.freeSamples(samples);
+            return error.OutOfMemory;
+        };
+        index.* = .{ .hash = hash, .size = size, .record_count = record_count, .samples = samples };
+        self.map.put(self.gpa, hash, index) catch {
+            self.gpa.destroy(index);
+            self.freeSamples(samples);
+            return error.OutOfMemory;
+        };
+        index.older = self.newest;
+        if (self.newest) |above| above.newer = index;
+        self.newest = index;
+        if (self.oldest == null) self.oldest = index;
+        while (self.map.count() > self.options.max_buckets) {
+            const victim = self.oldest orelse break;
+            std.debug.assert(self.map.remove(victim.hash));
+            // Unlink; LRU ends are maintained by touch on remaining links.
+            self.oldest = victim.newer;
+            if (self.oldest) |above| above.older = null else self.newest = null;
+            victim.newer = null;
+            victim.older = null;
+            self.releaseLocked(victim);
+        }
+    }
+
+    fn freeSamples(self: *ReadIndexCache, samples: []Sample) void {
+        for (samples) |sample| self.gpa.free(sample.key);
+        self.gpa.free(samples);
+    }
+};
+
 /// Owned bounded-memory scan. Do not copy; deinit closes its file and workspace.
 /// Stop only after next returns null or finish succeeds to verify the hash,
 /// order, framing, counts, and EOF. Deinit alone abandons verification.
@@ -108,6 +268,7 @@ pub const Store = struct {
     root: std.Io.Dir,
     blobs: std.Io.Dir,
     lock: std.Io.File,
+    read_index: ?*ReadIndexCache = null,
 
     /// Owns open directory and exclusive advisory lock handles. The allocator
     /// and Io must remain valid until deinit and support every calling thread.
@@ -152,10 +313,20 @@ pub const Store = struct {
     }
 
     pub fn deinit(self: *Store) void {
+        if (self.read_index) |cache| cache.destroy();
+        self.read_index = null;
         self.blobs.close(self.io);
         self.lock.close(self.io);
         self.root.close(self.io);
         self.* = undefined;
+    }
+
+    /// Opt in to a local read index for `lookupBucketIndexed`. Call once after
+    /// open, before concurrent use. Index memory comes from the Store
+    /// allocator; entries hold verified blob shapes only, never record data.
+    pub fn enableReadIndex(self: *Store, options: ReadIndexOptions) Error!void {
+        if (self.read_index != null) return error.StoreBusy;
+        self.read_index = try ReadIndexCache.create(self.gpa, self.io, options);
     }
 
     /// SHA256(bytes) names immutable contents. Existing contents must verify;
@@ -235,7 +406,161 @@ pub const Store = struct {
         return result;
     }
 
-    /// Merge canonical sorted buckets with newest-record precedence. The
+    /// Verified lookup through the optional read index. With an index and an
+    /// unchanged file size, only the sampled span containing the key is read
+    /// (no whole-blob hash: the blob was fully verified when its index was
+    /// built, and immutable content-addressed names make that entry sound).
+    /// A size change, missing index, or index-build allocation failure falls
+    /// back to `lookupBucket`'s fully verified whole-bucket stream. Framing
+    /// anomalies inside a span still fail closed.
+    pub fn lookupBucketIndexed(self: *Store, gpa: std.mem.Allocator, hash: Hash, table: u32, key: []const u8, limits: MergeLimits) Error!BucketLookup {
+        if (key.len > limits.max_key_bytes) return error.TooLarge;
+        if (self.read_index) |cache| {
+            if (cache.acquire(hash)) |index| {
+                defer cache.release(index);
+                const name = std.fmt.bytesToHex(hash, .lower);
+                const file = try openRegular(self.blobs, self.io, &name);
+                defer file.close(self.io);
+                const size = (file.stat(self.io) catch return error.IoFailed).size;
+                if (size == index.size) {
+                    // Capture the index before release; the entry may be
+                    // evicted and freed as soon as the lock is dropped, but
+                    // `index` stays alive through our reference.
+                    return self.lookupSpan(file, index, table, key, limits, gpa);
+                }
+                // The file no longer matches its verified shape. Distrust the
+                // index entry and fall through to a full re-verification.
+            }
+        }
+        return self.lookupIndexedCold(gpa, hash, table, key, limits);
+    }
+
+    /// Whole-bucket verified scan that opportunistically records span starts.
+    /// Identical semantics to `lookupBucket`; index-build allocation failures
+    /// only disable sampling, never the read or its verification.
+    fn lookupIndexedCold(self: *Store, gpa: std.mem.Allocator, hash: Hash, table: u32, key: []const u8, limits: MergeLimits) Error!BucketLookup {
+        var reader = try BucketReader.init(self, hash, limits);
+        defer reader.deinit();
+        const total_records = reader.remaining;
+        const cache = self.read_index;
+        const options = if (cache) |c| c.options else undefined;
+        var samples: std.ArrayList(Sample) = .empty;
+        errdefer {
+            for (samples.items) |sample| self.gpa.free(sample.key);
+            samples.deinit(self.gpa);
+        }
+        var sampled_offset: u64 = 0;
+        var result: BucketLookup = .absent;
+        errdefer result.deinit(gpa);
+        while (true) {
+            const record_offset = reader.consumed;
+            try reader.advance();
+            const record = reader.current orelse break;
+            if (cache != null and samples.items.len < options.max_samples and
+                (samples.items.len == 0 or record_offset - sampled_offset >= options.min_span_bytes))
+            {
+                const key_copy = self.gpa.dupe(u8, record.key) catch return error.OutOfMemory;
+                errdefer self.gpa.free(key_copy);
+                try samples.append(self.gpa, .{ .table = record.table, .offset = record_offset, .key = key_copy });
+                sampled_offset = record_offset;
+            }
+            if (record.table == table and std.mem.eql(u8, record.key, key)) {
+                result.deinit(gpa);
+                result = if (record.value) |value|
+                    .{ .value = gpa.dupe(u8, value) catch return error.OutOfMemory }
+                else
+                    .tombstone;
+            }
+        }
+        if (cache) |c| {
+            const owned = try samples.toOwnedSlice(self.gpa);
+            try c.install(hash, reader.size, total_records, owned);
+        } else {
+            samples.deinit(self.gpa);
+        }
+        return result;
+    }
+
+    /// Parse and search one indexed span with positional reads only. Every
+    /// framing anomaly fails closed; order gives an early confirmed absence.
+    fn lookupSpan(self: *Store, file: std.Io.File, index: *BucketIndex, table: u32, key: []const u8, limits: MergeLimits, gpa: std.mem.Allocator) Error!BucketLookup {
+        const sampleBefore = struct {
+            fn call(sample: Sample, want_table: u32, want_key: []const u8) bool {
+                if (sample.table != want_table) return sample.table < want_table;
+                return std.mem.order(u8, sample.key, want_key) != .gt;
+            }
+        }.call;
+        // Last sample that does not sort after the target. Its span is the
+        // only one that can contain the target: every record in span j sorts
+        // in [samples[j], samples[j+1]), and samples[0] is the first record.
+        var best: ?usize = null;
+        var lo: usize = 0;
+        var hi: usize = index.samples.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (sampleBefore(index.samples[mid], table, key)) {
+                best = mid;
+                lo = mid + 1;
+            } else hi = mid;
+        }
+        const span = best orelse return .absent;
+        const span_start = index.samples[span].offset;
+        const span_end = if (span + 1 < index.samples.len) index.samples[span + 1].offset else index.size;
+        if (span_start >= span_end or span_end > index.size) return error.InvalidBucket;
+        const key_buffer = self.gpa.alloc(u8, limits.max_key_bytes) catch return error.OutOfMemory;
+        defer self.gpa.free(key_buffer);
+        const value_buffer = self.gpa.alloc(u8, limits.max_value_bytes) catch return error.OutOfMemory;
+        defer self.gpa.free(value_buffer);
+        var offset = span_start;
+        while (offset < span_end) {
+            var header: [8]u8 = undefined;
+            try self.readSpan(file, &header, offset);
+            offset += header.len;
+            const record_table = std.mem.readInt(u32, header[0..4], .big);
+            const key_len = std.mem.readInt(u32, header[4..8], .big);
+            if (key_len > key_buffer.len) return error.TooLarge;
+            const record_key = key_buffer[0..key_len];
+            try self.readSpan(file, record_key, offset);
+            offset += key_len;
+            var tag: [1]u8 = undefined;
+            try self.readSpan(file, &tag, offset);
+            offset += tag.len;
+            const value: []const u8 = switch (tag[0]) {
+                0 => &.{},
+                1 => value: {
+                    var length: [4]u8 = undefined;
+                    try self.readSpan(file, &length, offset);
+                    offset += length.len;
+                    const value_len = std.mem.readInt(u32, &length, .big);
+                    if (value_len > value_buffer.len) return error.TooLarge;
+                    const bytes = value_buffer[0..value_len];
+                    try self.readSpan(file, bytes, offset);
+                    offset += value_len;
+                    break :value bytes;
+                },
+                else => return error.InvalidBucket,
+            };
+            const order: std.math.Order = if (record_table != table)
+                (if (record_table < table) .lt else .gt)
+            else
+                std.mem.order(u8, record_key, key);
+            switch (order) {
+                .eq => return if (tag[0] == 0)
+                    .tombstone
+                else
+                    .{ .value = gpa.dupe(u8, value) catch return error.OutOfMemory },
+                .gt => return .absent,
+                .lt => {},
+            }
+        }
+        return .absent;
+    }
+
+    fn readSpan(self: *Store, file: std.Io.File, buffer: []u8, offset: u64) Error!void {
+        if (buffer.len == 0) return;
+        _ = file.readPositionalAll(self.io, buffer, offset) catch return error.IoFailed;
+    }
+
     /// caller may drop tombstones only at a boundary with no older records.
     /// Two fully verified passes use bounded record workspace, independent of
     /// bucket size. The result is durable; no manifest is published here.
@@ -1250,6 +1575,141 @@ test "public scans and verified lookup keep fixed workspace across large buckets
     defer absent.deinit(testing.allocator);
     try testing.expect(absent == .absent);
     try testing.expectEqual(@as(usize, 0), fixed.end_index);
+}
+
+test "read index answers warm lookups from one span after a fully verified pass" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    const bytes = try manyRecords(testing.allocator, 10000, 0);
+    defer testing.allocator.free(bytes);
+    const hash = try store.putBlob(bytes);
+    const limits: MergeLimits = .{ .max_key_bytes = 4, .max_value_bytes = 4 };
+    try store.enableReadIndex(.{ .min_span_bytes = 128 });
+
+    var cold_key: [4]u8 = undefined;
+    std.mem.writeInt(u32, &cold_key, 5000, .big);
+    var cold = try store.lookupBucketIndexed(testing.allocator, hash, 1, &cold_key, limits);
+    defer cold.deinit(testing.allocator);
+    try testing.expectEqualStrings(&cold_key, cold.value);
+
+    // Warm lookups must stay byte-exact across present and both absent
+    // classes, and read only a span instead of the whole blob.
+    const Guard = struct {
+        var read_bytes: usize = 0;
+        fn read(ctx: ?*anyopaque, file: std.Io.File, buffers: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+            const n = try testing.io.vtable.fileReadPositional(ctx, file, buffers, offset);
+            read_bytes += n;
+            return n;
+        }
+    };
+    var vtable = testing.io.vtable.*;
+    vtable.fileReadPositional = Guard.read;
+    store.io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    defer store.io = testing.io;
+    defer Guard.read_bytes = 0;
+    for (0..10000) |i| {
+        var key: [4]u8 = undefined;
+        std.mem.writeInt(u32, &key, @intCast(i * 2), .big);
+        var found = try store.lookupBucketIndexed(testing.allocator, hash, 1, &key, limits);
+        defer found.deinit(testing.allocator);
+        try testing.expectEqualStrings(&key, found.value);
+    }
+    for (0..10000) |i| {
+        var key: [4]u8 = undefined;
+        std.mem.writeInt(u32, &key, @intCast(i * 2 + 1), .big);
+        var found = try store.lookupBucketIndexed(testing.allocator, hash, 1, &key, limits);
+        defer found.deinit(testing.allocator);
+        try testing.expect(found == .absent);
+    }
+    var beyond: [4]u8 = undefined;
+    std.mem.writeInt(u32, &beyond, 40000, .big);
+    var absent = try store.lookupBucketIndexed(testing.allocator, hash, 1, &beyond, limits);
+    defer absent.deinit(testing.allocator);
+    try testing.expect(absent == .absent);
+    // Each warm lookup streamed only its span (a 128-byte span holds at
+    // most seven 21-byte records); the whole-bucket path would read the
+    // 210,025-byte blob on every one of these 20,001 lookups.
+    const lookups = 2 * 10000 + 1;
+    try testing.expect(Guard.read_bytes / lookups < 512);
+}
+
+test "read index re-verifies after size changes and reads only the probed span" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    const bytes = try manyRecords(testing.allocator, 10000, 0);
+    defer testing.allocator.free(bytes);
+    const hash = try store.putBlob(bytes);
+    const name = std.fmt.bytesToHex(hash, .lower);
+    const limits: MergeLimits = .{ .max_key_bytes = 4, .max_value_bytes = 4 };
+    try store.enableReadIndex(.{ .min_span_bytes = 2048 });
+    var probe: [4]u8 = undefined;
+    std.mem.writeInt(u32, &probe, 0, .big);
+    var warm = try store.lookupBucketIndexed(testing.allocator, hash, 1, &probe, limits);
+    defer warm.deinit(testing.allocator);
+    try testing.expectEqualStrings(&probe, warm.value);
+
+    // A same-size flip in a record far after the probe target is outside the
+    // probed span: the warm read still answers from verified span bytes.
+    const file = try store.blobs.openFile(testing.io, &name, .{ .mode = .read_write });
+    defer file.close(testing.io);
+    const far_offset = bytes.len - 4;
+    try file.writePositionalAll(testing.io, "X", far_offset);
+    var again = try store.lookupBucketIndexed(testing.allocator, hash, 1, &probe, limits);
+    defer again.deinit(testing.allocator);
+    try testing.expectEqualStrings(&probe, again.value);
+
+    // Truncation changes the file size: the entry is distrusted and the
+    // fallback re-verification fails closed (truncated framing here).
+    try file.setLength(testing.io, bytes.len - 1);
+    try testing.expectError(error.InvalidBucket, store.lookupBucketIndexed(testing.allocator, hash, 1, &probe, limits));
+    // Appending changes the size as well; re-verification rejects it too.
+    try file.setLength(testing.io, bytes.len + 1);
+    try testing.expectError(error.InvalidBucket, store.lookupBucketIndexed(testing.allocator, hash, 1, &probe, limits));
+    try testing.expectError(error.InvalidBucket, store.lookupBucket(testing.allocator, hash, 1, &probe, limits));
+}
+
+test "read index eviction re-verifies and allocation failure only skips sampling" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    const even = try manyRecords(testing.allocator, 4000, 0);
+    defer testing.allocator.free(even);
+    const odd = try manyRecords(testing.allocator, 4000, 1);
+    defer testing.allocator.free(odd);
+    const a = try store.putBlob(even);
+    const b = try store.putBlob(odd);
+    const limits: MergeLimits = .{ .max_key_bytes = 4, .max_value_bytes = 4 };
+    try store.enableReadIndex(.{ .min_span_bytes = 1024, .max_buckets = 1 });
+    var key: [4]u8 = undefined;
+    for (0..4) |round| {
+        const hash = if (round % 2 == 0) a else b;
+        const shift: u32 = if (round % 2 == 0) 0 else 1;
+        std.mem.writeInt(u32, &key, 2 * 1998 + shift, .big);
+        var found = try store.lookupBucketIndexed(testing.allocator, hash, 1, &key, limits);
+        defer found.deinit(testing.allocator);
+        try testing.expectEqualStrings(&key, found.value);
+    }
+    // Index-bookkeeping allocation failure is observable as OutOfMemory,
+    // leaks nothing, and a retry succeeds once memory is available again.
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    store.gpa = failing.allocator();
+    std.mem.writeInt(u32, &key, 4, .big);
+    try testing.expectError(error.OutOfMemory, store.lookupBucketIndexed(testing.allocator, a, 1, &key, limits));
+    try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    store.gpa = testing.allocator;
+    store.gpa = testing.allocator;
+    store.read_index.?.destroy();
+    store.read_index = null;
+    try store.enableReadIndex(.{ .min_span_bytes = 1024 });
+    std.mem.writeInt(u32, &key, 4, .big);
+    var restored = try store.lookupBucketIndexed(testing.allocator, a, 1, &key, limits);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqualStrings(&key, restored.value);
 }
 
 test "one store supports concurrent immutable puts merges and independent cursors" {
