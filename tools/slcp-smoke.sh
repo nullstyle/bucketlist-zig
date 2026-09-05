@@ -3,12 +3,14 @@ set -euo pipefail
 repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 revision=458e25effc3e9676ac02f9a34c104521a5e0757b
 source_repo="${SLCP_SOURCE:-$repo/../slcp-zig}"
+remote="${SLCP_REMOTE:-https://github.com/nullstyle/slcp-zig.git}"
 companion="$repo/.zig-cache/companions/slcp"
 export ZIG_LOCAL_CACHE_DIR="$repo/.zig-cache/slcp-local"
 export ZIG_GLOBAL_CACHE_DIR="$repo/.zig-cache/slcp-global"
 export ZIG_LOCAL_PKG_DIR="$repo/.zig-cache/slcp-packages"
 mkdir -p "$repo/.zig-cache/companions" "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_PKG_DIR"
-# The pinned commit is not publicly downloadable. Read Git objects only;
+# The pinned commit is fetched from the public remote when no local source
+# holds it; the object hash itself pins the content. Read Git objects only;
 # compilation and package resolution happen entirely inside bucketlist-zig.
 if [[ ! -f "$companion/.bucketlist-revision" ]] || [[ "$(cat "$companion/.bucketlist-revision")" != "$revision" ]]; then
     if [[ -e "$companion" ]]; then
@@ -17,7 +19,16 @@ if [[ ! -f "$companion/.bucketlist-revision" ]] || [[ "$(cat "$companion/.bucket
     fi
     stage="$(mktemp -d "$repo/.zig-cache/companions/slcp-stage.XXXXXX")"
     trap 'rm -rf -- "$stage"' EXIT
-    git -C "$source_repo" archive "$revision" | tar -x -C "$stage"
+    if git -C "$source_repo" cat-file -e "$revision^{commit}" >/dev/null 2>&1; then
+        git -C "$source_repo" archive "$revision" | tar -x -C "$stage"
+    else
+        fetch="$(mktemp -d "$repo/.zig-cache/companions/slcp-fetch.XXXXXX")"
+        git -C "$fetch" init -q
+        git -C "$fetch" remote add origin "$remote"
+        git -C "$fetch" fetch -q --depth 1 origin "$revision"
+        git -C "$fetch" archive "$revision" | tar -x -C "$stage"
+        rm -rf "$fetch"
+    fi
     printf '%s\n' "$revision" > "$stage/.bucketlist-revision"
     mv "$stage" "$companion"
     trap - EXIT

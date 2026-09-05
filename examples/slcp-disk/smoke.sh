@@ -4,6 +4,7 @@ repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 revision=e2c48987e4f1237f1b87ee27c148ce51edfe8fda
 companion="$repo/.zig-cache/companions/slcp-disk"
 source_repo="${SLCP_SOURCE:-$repo/../slcp-zig}"
+remote="${SLCP_REMOTE:-https://github.com/nullstyle/slcp-zig.git}"
 export ZIG_LOCAL_CACHE_DIR="$repo/.zig-cache/slcp-disk-$revision-local"
 export ZIG_GLOBAL_CACHE_DIR="$repo/.zig-cache/slcp-disk-$revision-global"
 export ZIG_LOCAL_PKG_DIR="$repo/.zig-cache/slcp-packages"
@@ -12,7 +13,16 @@ if [[ ! -f "$companion/.bucketlist-revision" ]]; then
     [[ ! -e "$companion" ]] || { echo "Unrecognized companion cache: $companion" >&2; exit 1; }
     stage="$(mktemp -d "$repo/.zig-cache/companions/slcp-disk-stage.XXXXXX")"
     trap 'rm -rf -- "$stage"' EXIT
-    git -C "$source_repo" archive "$revision" | tar -x -C "$stage"
+    if git -C "$source_repo" cat-file -e "$revision^{commit}" >/dev/null 2>&1; then
+        git -C "$source_repo" archive "$revision" | tar -x -C "$stage"
+    else
+        fetch="$(mktemp -d "$repo/.zig-cache/companions/slcp-disk-fetch.XXXXXX")"
+        git -C "$fetch" init -q
+        git -C "$fetch" remote add origin "$remote"
+        git -C "$fetch" fetch -q --depth 1 origin "$revision"
+        git -C "$fetch" archive "$revision" | tar -x -C "$stage"
+        rm -rf "$fetch"
+    fi
     printf '%s\n' "$revision" > "$stage/.bucketlist-revision"
     mv "$stage" "$companion"
     trap - EXIT

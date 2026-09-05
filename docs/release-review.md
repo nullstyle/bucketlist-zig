@@ -82,8 +82,9 @@ injection covers software boundaries only. Warm point reads trust one prior
 full verification per blob with a size guard
 ([storage.md](storage.md) documents the residual risk and the
 `read_index = null` opt-out). Production workload qualification and
-multi-day soaks remain open; the SLCP companion dependency is not yet an
-accessible immutable release.
+multi-day soaks remain open. The SLCP companion objects are fetched from the
+public `slcp-zig` remote when no local source holds them, verified end to end
+without a local sibling.
 
 ## Promotion conditions for `0.1.0`
 

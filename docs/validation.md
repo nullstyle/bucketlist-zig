@@ -70,9 +70,7 @@ M6 adds deterministic malformed-input campaigns and larger disk workload
 measurements. The v0.1 release review — full gate evidence, the supported
 versus experimental surface classification, the skip audit, and promotion
 conditions — is recorded in [release-review.md](release-review.md).
-Multi-day soak testing, production workload qualification, and an accessible
-immutable companion artifact for a distributable standalone SLCP consumer
-remain open.
+Multi-day soak testing and production workload qualification remain open.
 
 The recorded ReleaseSafe campaigns execute **300,000 portable** and **30,000
 native** mutation/property cases across three seeds, without mismatches or
@@ -147,7 +145,7 @@ Zig toolchain under Rosetta and is not counted as runtime validation.
 | Native checkpoint tests | Seventeen checks cover spill-boundary continuation, metadata authentication, retained/current reachability, hash-valid malformed manifests, inclusive limits, all save/restore allocation failures, and both pre-replacement and ambiguous publication errors. They also require full manifest checks before bucket reads and save a database over 4 MiB with a 32 KiB manager allocator. Imported-module tests are explicitly included through the dedicated test root. |
 | Portable checkpoint and staging tests | Borrowed-frame restoration survives reused input buffers, source failures, and all allocator failures; malformed headers fail before callbacks. Large repeated batches match final-only canonical effects, and every staging allocation failure permits a correct retry on the same batch. |
 | `just disk-example-smoke` | Bounded queue admission, explicit backpressure, durable background publication, authenticated disk reopen, and typed two-table reads. |
-| `just slcp-disk-smoke` | The pinned three-process watermark/recovery fixture described above; local Git source required only for this optional gate. |
+| `just slcp-disk-smoke` | The pinned three-process watermark/recovery fixture described above; fetches its pinned SLCP object from the public remote or a local source. |
 | `just persistent-example-smoke` | A pinned advance-1 snapshot survives close/reopen, replays identically through advance 3, and remains loadable alongside current advance 3 after obsolete blobs are collected. |
 | `zig build test -Doptimize=ReleaseSafe` | Same semantic gates with runtime safety and optimization. |
 | `just vectors-check` | Independent Python model reproduces 274 unique bucket frames, four profiles, and 128 advances per profile. |
@@ -225,8 +223,9 @@ beyond the recorded bounded and extended campaigns, production workload
 qualification, and release review remain necessary before promotion to
 Stable.
 
-The SLCP revision used here is not publicly available as an immutable archive.
-The optional integration reads that exact Git object from a local source and
-materializes it in this repo's cache. A distributable standalone SLCP consumer
-needs an accessible immutable companion release. The main bucketlist package
-is independent of this limitation.
+The optional SLCP integration pins exact Git objects and materializes them in
+this repo's cache from a local source when one holds the object, or from the
+public `slcp-zig` remote otherwise (`SLCP_SOURCE`/`SLCP_REMOTE` override both).
+Both companion gates were verified end to end with no local sibling present,
+so the pinned objects are accessible and immutable for anyone. The main
+bucketlist package remains independent of this integration.

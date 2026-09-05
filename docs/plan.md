@@ -435,9 +435,10 @@ ARM64 — bounded campaigns plus extended 10M-cycle-per-test soaks — through a
 fail-closed wrapper with exact input replay (see
 [fuzzing.md](fuzzing.md)). The v0.1 release review — gate evidence, surface
 classification, skip audit, and promotion conditions — is recorded in
-[release-review.md](release-review.md). It still needs multi-day soak
-testing, production workload qualification, and an accessible immutable SLCP
-dependency before a standalone integration release. Local gates and API
+[release-review.md](release-review.md). The SLCP companion objects are now
+fetched from the public `slcp-zig` remote when no local source holds them.
+It still needs multi-day soak testing and production workload qualification
+before a standalone integration release. Local gates and API
 snapshots are necessary evidence, not a stability promise. Disk point reads
 are served from a verified per-bucket span index that preserves exact v1
 bytes and hashes; scans still govern merges, reopen validation, and
