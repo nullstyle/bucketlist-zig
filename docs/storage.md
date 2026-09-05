@@ -6,8 +6,8 @@ The deterministic database and BucketList layers define the bytes and references
 the store neither interprets a schema nor decides which state is authoritative.
 For typed checkpoint publication, application metadata, and automatic reference
 discovery during collection, use [Checkpoints(DatabaseType)](checkpoints.md).
-The [disk engine and bounded host](disk.md) build on the same primitives; that
-architectural phase is in progress.
+The implemented [disk engine and bounded host](disk.md) build on the same
+primitives for file-backed execution and bounded asynchronous publication.
 
 `Store.open(gpa, io, path)` returns an owned value. Call `deinit` exactly once.
 An exclusive advisory `LOCK` file prevents another cooperating store from opening

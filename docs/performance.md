@@ -89,3 +89,27 @@ counters, and resulting commitments. Compare commitments and manifest hashes
 before drawing performance conclusions. Filesystem and hardware differences
 can change timings substantially; the fixed-buffer save regression in ordinary
 tests separately enforces the absence of a checkpoint-sized save allocation.
+
+## Disk engine working-memory bound
+
+The disk adversarial fixture persists **384 records of 4,096 value bytes** in a
+1,580,957-byte canonical bucket. A separate allocator enforces a **131,072-byte
+live allocation cap** while the disk engine reopens the trusted reference,
+performs hit/miss reads, pins a view, normalizes a typed update, merges and
+publishes advance 2, collects with the view retained, and reopens the resulting
+continuation. Its commitment must match an independently executed portable
+history.
+
+The measured peak is **36,041 requested bytes**, with zero denied allocations
+and zero live tracked bytes after close, in Debug and ReleaseSafe on macOS ARM64
+and Linux ARM64. The test configures one merge worker so the measuring allocator
+can remain serial. Separate Store and Host tests exercise actual concurrent
+workers and active queue capacity.
+
+This measures allocations requested through the disk engine's allocator. It
+excludes fixture construction, the portable reference computation, stack space,
+filesystem cache, and the `std.Io` backend. It establishes bounded execution of a
+database larger than the allocator budget; it is not an RSS measurement or a
+production throughput benchmark. Linear authenticated point reads and batch
+normalization still scale with the bytes scanned. See
+`src/disk_adversarial_test.zig` for the repeatable gate.

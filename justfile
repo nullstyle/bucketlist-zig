@@ -13,10 +13,10 @@ test:
     mise exec -- zig build test --summary all
 
 fmt:
-    mise exec -- zig fmt build.zig build.zig.zon src tests tools/*.zig examples/directory examples/persistent-directory
+    mise exec -- zig fmt build.zig build.zig.zon src tests tools/*.zig examples/directory examples/persistent-directory examples/disk-directory
 
 fmt-check:
-    mise exec -- zig fmt --check build.zig build.zig.zon src tests tools/*.zig examples/directory examples/persistent-directory
+    mise exec -- zig fmt --check build.zig build.zig.zon src tests tools/*.zig examples/directory examples/persistent-directory examples/disk-directory
 
 vectors:
     mise exec -- zig build vectors
@@ -32,6 +32,12 @@ example-smoke:
 
 persistent-example-smoke:
     mise exec -- zig build persistent-example-smoke
+
+disk-example-smoke:
+    mise exec -- zig build disk-example-smoke
+
+slcp-disk-smoke:
+    mise exec -- bash tools/slcp-disk-smoke.sh
 
 slcp-smoke:
     mise exec -- bash tools/slcp-smoke.sh

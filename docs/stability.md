@@ -21,6 +21,10 @@ uses a pinned companion revision and its Experimental owned-state interface.
 Native storage supports Linux and macOS and is a separate import from the
 portable database. Its I/O errors cannot be returned from the current SLCP
 `OwnedAppNode.apply` callback; persistence belongs to the host/observation path.
+The implemented `bucketlist-disk` database, worker, and host phase
+uses raw-node delivery admission with explicit backpressure and recovery
+outside the live callback. See [ADR 0001](adr/0001-disk-engine-and-bounded-delivery.md).
+These additional interfaces remain Experimental and do not change v1 hashes.
 
 The library supplies commitments, not record membership proofs, validator
 certificates, a network transport, or automatic schema migration.

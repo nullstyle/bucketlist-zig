@@ -126,6 +126,10 @@ Collection restores retained checkpoints one at a time before deletion. This
 manager is not an engine for databases larger than memory. Limits on encoded
 input bytes are not exact bounds on total process memory. See the measured
 [scalability comparison](performance.md).
+The separately authorized [disk engine](disk.md) addresses resident bucket data
+and bounded background execution; its implementation and verification are in
+progress. It uses a distinct local frontier manifest rather than extending this
+manager's checkpoint size limit.
 
 The low-level store's Linux/macOS filesystem, synchronization, advisory-lock,
 and trusted-directory requirements apply. See [storage.md](storage.md). The

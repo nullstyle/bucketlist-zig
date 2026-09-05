@@ -1,10 +1,11 @@
 # Build plan for bucketlist-zig
 
-Date: 2026-09-04. Status: accepted and implemented as an Experimental development
-release. See [validation and remaining scope](validation.md) for delivered
-features, measured checks, and limits. This document retains the design
-rationale and original milestone gates; the format documents describe the
-implemented contract.
+Date: 2026-09-04. Status: the Experimental baseline is implemented; the
+authorized M7–M9 disk-engine and native-host phase is **implemented and verified**. M6 release
+hardening remains open. See [validation and remaining scope](validation.md) for
+delivered evidence and [ADR 0001](adr/0001-disk-engine-and-bounded-delivery.md) for
+the architectural extension. The format documents continue to define the
+unchanged v1 commitment contract.
 
 ## 1. Intended product
 
@@ -21,14 +22,16 @@ Stellar XDR types and historical protocol compatibility are not dependencies.
 
 The first useful delivery is an in-memory database with two typed tables,
 atomic changes across them, deterministic commitments, exact checkpoint
-round-trips, and an SLCP consumer example. Disk-backed operation follows the
-correctness model. SQL, a query planner, automatic secondary indexes, network
-replication, Stellar transaction execution, and succinct record proofs are
+round-trips, and an SLCP consumer example. Disk-resident operation now follows
+in M7–M9, including real parallel merge workers and an explicit bounded
+publication/delivery lifecycle. SQL, a query planner, automatic secondary
+indexes, network replication, Stellar transaction execution, and succinct record proofs are
 outside the initial scope.
 
-This plan only authorizes work in `bucketlist-zig`. Another agent is developing
-`slcp-zig`; keep sibling inspections read-only. Future integration changes in
-that repo require coordination rather than treating it as an owned worktree.
+The user has authorized work across this workspace, including companion
+changes if integration requires them. The phase adds an Experimental application durability watermark to `slcp-zig`
+while preserving its Stable answering policy, and verifies the consumer against
+an immutable companion snapshot. Keep the main package independently consumable.
 
 ## 2. Research baseline and implications
 
@@ -214,12 +217,20 @@ interface. Test them directly where byte-level vectors need it, but do not
 make developers orchestrate those internals. Delay a public storage abstraction
 until the memory and file implementations establish what actually varies.
 
-Add a separate native module, provisionally `bucketlist-store`, in M5. It takes
+Add a separate native module, `bucketlist-store`, in M5. It takes
 `std.Io` explicitly and owns immutable bucket files, manifests, garbage
 collection, and recovery. This keeps the common import name `bucketlist`
 stable and lets the deterministic database remain usable without a filesystem.
 Separate optional consumer packages import SLCP; the main manifest never
 requires a sibling checkout.
+
+M7–M9 add `bucketlist-disk`, exporting `Database(Schema)` and `Host(Schema)`.
+The disk database retains hashes and frontier descriptors in memory, with
+canonical bucket contents on disk. The host owns bounded admission and durable
+execution. The existing portable `bucketlist` database and
+`bucketlist-checkpoints` manager remain distinct choices. Native disk manifests
+have a separate local format and do not inherit the portable checkpoint's
+aggregate byte cap. See the [disk and host contract](disk.md).
 
 ## 6. SLCP integration
 
@@ -305,24 +316,29 @@ retention floor must never advance past the only recoverable application
 checkpoint. Local integrity checks alone do not turn peer-supplied snapshots
 into authenticated checkpoints.
 
-Disk-backed apply and background merges need a separate host-integration
-design: `OwnedAppNode.apply` cannot express file failures and cannot wait for
-storage. M5 provides a standalone persistent store first. Integrating it with
-SLCP requires an explicit publication/error/backpressure contract, coordinated
-with the companion's maintainer. Do not promise that adding `std.Io` inside
-the current callback is enough.
+The authorized native-host design uses the raw SLCP node's existing
+`DeliveryHook` for bounded admission. Its callback hands off ownership without
+waiting for filesystem work. An admission failure is explicit backpressure and
+stops delivery; recovery outside the callback replays contiguous agreed values
+from the durable frontier. `OwnedAppNode.apply` remains the in-memory example's
+interface and is not extended with filesystem errors. M9 implements and verifies
+this contract against the pinned companion, with any necessary companion
+changes verified through the same integration gates.
 
 ## 8. Milestones and exit criteria
 
 | Milestone | Deliverables | Exit evidence |
 | --- | --- | --- |
 | M0 — research and tooling | This plan, source report, glossary, independent Git repo, aligned `mise.toml`, `just doctor`. | `mise install` succeeds and `doctor` reports the expected Zig and just versions. **Done.** |
-| M1 — schema and byte contract | Minimal `build.zig`/manifest/module, typed two-table consumer, normative format, built-in codec, sorted-map semantic oracle, initial literal vectors, test/fmt commands and Linux/macOS CI. | Exact bytes/hashes for empty, single-record, two-table, signed-key and bounded-byte cases; namespace/schema-version changes alter commitments; malformed encodings rejected; declaration-independent table identity; compiled consumer; allocator cleanup checks. |
-| M2 — bucket and merge engine | Immutable bucket builder/reader, canonical batch reduction, upsert/tombstone streaming merge, terminal deletion rule. | Golden merge cases; randomized equivalence to the independent sorted map; no duplicate visible keys or resurrected deletions; failure-atomic preparation under injected allocation failures. |
-| M3 — complete in-memory database | Fixed schedule, eleven-level profile, deterministic pending/promotion state, typed reads/views, atomic multi-table prepare/commit, commitment, exact checkpoint/restore. | Boundary traces including empty advances, stale prepared results, bottom-level deletion, and checkpoint continuation; same trace gives identical bytes/roots across ordering of independent batch inputs, targets, optimization modes, and artificial worker schedules. |
-| M4 — SLCP consumer MVP | New two-table application importing both packages; bounded canonical values, owned state, root-bearing headers, restart snapshots. | Three loopback nodes agree on every root; kill/restart one node around spill/checkpoint boundaries; a lagging node catches up without rejecting valid future values; replay reaches the same root and exact previous value; no changes required in the sibling engine. |
-| M5 — native persistence | Explicit-I/O bucket store, streaming file merges, durable manifest publication, recovery and reachability GC; separate proposal for SLCP host integration if needed. | Fault injection at publication boundaries; restart yields the last recoverable frontier plus replay; corrupt/missing input rejection; reader/pending-work pinning; bounded-memory merge benchmarks. |
-| M6 — release hardening | Stable/Experimental surface policy, API snapshot, fuzzing, native/WASM differential runner, package/preflight checks, realistic performance report and usage docs. | Fresh package consumer works without sibling checkouts; Linux/macOS gates pass; no skipped oracle/differential tests masquerade as success; published vectors include provenance and negative cases. |
+| M1 — schema and byte contract | **Done (Experimental).** Minimal `build.zig`/manifest/module, typed two-table consumer, normative format, built-in codec, sorted-map semantic oracle, initial literal vectors, test/fmt commands and Linux/macOS CI. | Exact bytes/hashes for empty, single-record, two-table, signed-key and bounded-byte cases; namespace/schema-version changes alter commitments; malformed encodings rejected; declaration-independent table identity; compiled consumer; allocator cleanup checks. |
+| M2 — bucket and merge engine | **Done (Experimental).** Immutable bucket builder/reader, canonical batch reduction, upsert/tombstone streaming merge, terminal deletion rule. | Golden merge cases; randomized equivalence to the independent sorted map; no duplicate visible keys or resurrected deletions; failure-atomic preparation under injected allocation failures. |
+| M3 — complete in-memory database | **Done (Experimental).** Fixed schedule, eleven-level profile, deterministic pending/promotion state, typed reads/views, atomic multi-table prepare/commit, commitment, exact checkpoint/restore. | Boundary traces including empty advances, stale prepared results, bottom-level deletion, and checkpoint continuation; same trace gives identical bytes/roots across ordering of independent batch inputs, targets, optimization modes, and artificial worker schedules. |
+| M4 — SLCP consumer MVP | **Done (Experimental).** New two-table application importing both packages; bounded canonical values, owned state, root-bearing headers, restart snapshots. | Three loopback nodes agree on every root; kill/restart one node around spill/checkpoint boundaries; a lagging node catches up without rejecting valid future values; replay reaches the same root and exact previous value; no changes required in the sibling engine. |
+| M5 — native persistence | **Done (Experimental).** Explicit-I/O bucket store, streaming file merges, durable manifest publication, recovery and reachability GC; separate proposal for SLCP host integration if needed. | Fault injection at publication boundaries; restart yields the last recoverable frontier plus replay; corrupt/missing input rejection; reader/pending-work pinning; bounded-memory merge benchmarks. |
+| M6 — release hardening | **Open.** Stable/Experimental surface policy, API snapshot, fuzzing, native/WASM differential runner, package/preflight checks, realistic performance report and usage docs. | Fresh package consumer works without sibling checkouts; Linux/macOS gates pass; no skipped oracle/differential tests masquerade as success; published vectors include provenance and negative cases. |
+| M7 — disk-resident typed engine | **Done (Experimental).** `bucketlist-disk.Database(Schema)`, hash-only frontier, bounded typed batch staging, verified disk point reads, pinned disk read views, atomic frontier/recovery-metadata publication, strict reopen and reachability GC. | Exact portable/disk v1 commitments and continuation across spill/terminal boundaries; datasets exceeding the configured working-memory budget; no whole-bucket or whole-checkpoint load; missing/corrupt/noncanonical inputs rejected; retained views survive publication and GC. |
+| M8 — real background merges | **Done (Experimental).** Bounded worker threads execute independent merge jobs derived from the immutable pre-advance frontier; each advance waits for every required pending hash before publication. | Real overlapping workers; varied completion orders yield identical bytes and commitments; batch plus per-worker record-buffer memory remains bounded; job failures publish no incomplete frontier; shutdown and GC quiesce workers. |
+| M9 — bounded native host and SLCP delivery | **Done (Experimental).** `bucketlist-disk.Host(Schema)`, ownership-moving nonblocking `trySubmit`, capacity including active work, durable acknowledgements, latched failures, raw-node `DeliveryHook` consumer and journal replay outside callbacks. | Full/contended admission returns explicit backpressure without consuming the caller's batch; delivery fails closed without losing agreed values; explicit application-durability acknowledgements constrain journal compaction; restart replays a contiguous suffix from the durable snapshot; ambiguous publication is resolved by reopen; pinned companion integration passes. |
 
 M1 → M2 → M3 is the correctness path. Start M4's adapter sketch during M1 to
 check ergonomics, but its cluster gate depends on M3. Define M5's checkpoint
@@ -333,7 +349,8 @@ support only after M5. Freeze a supported v0.1 surface after M6.
 M1's schema consumer and vectors are implemented, along with the in-memory
 database, SLCP restart example, native storage primitives, and release checks.
 Follow [validation.md](validation.md) for current evidence rather than treating
-this original sequencing section as a queue of unstarted tasks.
+the original M1–M5 sequencing as a queue of unstarted tasks. M7 → M8 → M9 extends
+that baseline; the new phase does not close M6 or claim production readiness.
 
 ## 9. Verification strategy
 
@@ -404,19 +421,17 @@ two libraries without automatically editing the companion repo.
 
 ## 11. Remaining design choices
 
-M1 must freeze exact key ordering/framing, hash tags, the canonical schema
-descriptor, no-op reduction, and genesis bytes. M3 must prove checkpoint
-continuation and pending-work authentication. M4 must choose measured resource
-bounds for its example. M5 must establish host publication and failure policy
-before a disk-backed SLCP integration is advertised.
+M1/M3's encoding and continuation choices are frozen by the v1 format documents.
+M4's in-memory consumer and M5's [native checkpoint manager](checkpoints.md)
+remain the validated baseline. M7–M9 implement the accepted disk/host decisions
+in [ADR 0001](adr/0001-disk-engine-and-bounded-delivery.md), with completed
+resource, failure/recovery, platform, and real-process integration evidence in
+[validation.md](validation.md).
 
-The format documents now resolve M1/M3's encoding and continuation choices.
-The bounded SLCP example establishes M4's integration and recovery behavior.
-The native checkpoint manager now handles shared bucket files, publication,
-authenticated restoration, and explicit historical retention; see
-[its contract](checkpoints.md). The database engine remains in memory.
-Production disk-backed engine orchestration, background resource policy, and
-application journal retention remain future work; see the current validation
-report. The product scope remains generic typed databases,
-independent encoding, deterministic commitments, and a compatible development
-experience with SLCP.
+M6 still needs release review, sustained malformed-input/fuzz coverage,
+realistic larger-than-memory performance evidence, and an accessible immutable
+SLCP dependency before a standalone integration release. Local gates and API
+snapshots are necessary evidence, not a stability promise. The initial disk
+point lookup deliberately scans and authenticates complete buckets; indexes and
+caches are later optimizations that must preserve exact v1 bytes and hashes.
+Application-specific journal retention and checkpoint trust remain host policy.

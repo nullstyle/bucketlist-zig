@@ -22,7 +22,14 @@ and bounded-memory file merges. The `bucketlist-checkpoints` module builds on
 that store: it publishes typed read views with application recovery metadata,
 shares unchanged bucket files, restores exact database state, and collects
 unreferenced files while retaining selected historical checkpoints. The
-database engine still operates in memory.
+portable database engine operates in memory.
+
+The native `bucketlist-disk` module executes the same typed batches against
+files, keeping only bucket identities in its frontier. It adds authenticated
+linear reads, pinned read views, parallel streaming merges, and atomic durable
+publication. `Host(Schema)` runs that work on a dedicated thread behind a bounded
+queue with explicit `Backpressure`; accepted and durable advances are distinct.
+See the [disk and host contract](docs/disk.md).
 
 ## Use
 
@@ -64,6 +71,13 @@ and instantiate `Checkpoints(Directory)`. The
 publication, close/reopen, exact replay, and retention. See the
 [checkpoint contract](docs/checkpoints.md) for ownership and trust requirements.
 
+For file-backed execution, import `dependency.module("bucketlist-disk")`.
+The [disk directory example](examples/disk-directory/main.zig) stages ordinary
+`Host.Batch` values, submits them without filesystem I/O, waits for durable
+publication, and reopens with an authenticated reference. Native disk commit
+performs I/O and can fail; a publication error requires reopening to resolve
+its durable outcome. Allocators and `std.Io` must support the worker threads.
+
 ## Development
 
 ```sh
@@ -89,6 +103,9 @@ Other checks:
 - `zig build check-api` checks the Experimental interface snapshot.
 - `just package-preflight` tests an extracted archive and standalone consumer.
 - `just persistent-example-smoke` exercises native checkpoint recovery.
+- `just disk-example-smoke` exercises bounded background publication and disk recovery.
+- `just slcp-disk-smoke` exercises disk delivery, backpressure, journal replay,
+  and quorum recovery using three real SLCP processes.
 - `just slcp-smoke` runs the isolated companion integration; see its
   [instructions](examples/slcp-directory/README.md).
 - `just core-oracle` compares original pinned Core schedule functions with
@@ -123,6 +140,14 @@ updates run there; host storage publication runs outside it. The example uses
 a pinned Experimental SLCP interface, and does not change the consensus engine
 or the existing registry's format.
 
+The [disk SLCP host](examples/slcp-disk/README.md) uses the raw delivery hook
+for bounded admission and explicitly acknowledges durable publication to keep
+SLCP journal retention behind the recoverable database frontier. It preserves exact command metadata with each durable
+database frontier and recovers a journaled suffix after backpressure or process
+termination. Its blind-write command model requires no database I/O inside
+consensus callbacks; applications with state-dependent validation need their
+own bounded validation state or a suitable preparation stage.
+
 ## Reference
 
 - [Database format and ownership](docs/format.md)
@@ -130,6 +155,7 @@ or the existing registry's format.
 - [Bucket structure and scheduling](docs/structure.md)
 - [Native storage](docs/storage.md)
 - [Native checkpoint management](docs/checkpoints.md)
+- [Disk database and bounded host](docs/disk.md)
 - [Stability policy](docs/stability.md)
 - [Validation results and limitations](docs/validation.md)
 - [Implementation plan](docs/plan.md)

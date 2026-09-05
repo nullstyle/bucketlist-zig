@@ -1,0 +1,11 @@
+.{
+    .name = .bucketlist_slcp_disk,
+    .version = "0.1.0-dev",
+    .fingerprint = 0xba5aa2b312ae940d,
+    .minimum_zig_version = "0.17.0-dev.1786",
+    .dependencies = .{
+        .bucketlist = .{ .path = "../.." },
+        .slcp = .{ .path = "../../.zig-cache/companions/slcp-disk" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "README.md", "smoke.sh", "process-test.sh" },
+}

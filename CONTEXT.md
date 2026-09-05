@@ -69,6 +69,16 @@ A commitment to the pending merge results that will enter the database's
 committed representation at future advances.
 _Avoid_: Current BucketList root
 
+**Pending output**:
+A completed merge result committed as part of the database's continuation,
+awaiting its scheduled promotion into visible history.
+_Avoid_: Running merge job
+
+**Merge job**:
+Work that computes a bucket from fixed older and newer inputs under the
+database's merge rules.
+_Avoid_: Advance, pending output
+
 **Format profile**:
 The shared rules that determine which database histories have identical
 commitments.
@@ -76,6 +86,20 @@ commitments.
 **Database checkpoint**:
 A saved database frontier sufficient to resume its committed history exactly.
 _Avoid_: Logical export, bucket snapshot
+
+**Durable frontier**:
+The published database advance, commitment, and application recovery metadata
+from which the host can resume after a restart.
+_Avoid_: Latest submitted advance
+
+**Disk read view**:
+A fixed database frontier whose referenced buckets remain available until the
+view is released.
+_Avoid_: Logical export
+
+**Recovery metadata**:
+Application information associated with one database frontier and required to
+resume its history, such as the exact previous consensus value.
 
 **Logical export**:
 A listing of the currently visible records without a promise to preserve the
@@ -96,3 +120,13 @@ does not replace those bytes.
 A database checkpoint whose commitment has been accepted under the
 application's trust rules.
 _Avoid_: Hash-verified checkpoint
+
+**Delivery backlog**:
+Agreed advances accepted by the application host but not yet included in its
+durable frontier.
+_Avoid_: Durable history
+
+**Durable acknowledgement**:
+Confirmation that an accepted advance and its recovery metadata belong to the
+published durable frontier.
+_Avoid_: Submission accepted

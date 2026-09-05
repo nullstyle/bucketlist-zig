@@ -91,8 +91,10 @@ Whenever level `i-1` spills:
 Then merge the new batch into level zero's current bucket immediately. With
 depth one this is the terminal merge, so tombstones are removed there.
 
-The destination's next output is computed synchronously but remains pending
-until the *next* incoming spill. Pending output presence is meaningful even
+The destination's next output remains pending until the *next* incoming spill.
+The portable engine computes it synchronously; independent native merge jobs
+may run concurrently. Every required output hash must be known before the
+advance's complete commitment is published. Pending output presence is meaningful even
 when that output is empty. Reads do not search pending outputs. Reads search
 level zero's current and snapshot, followed by level one's current and
 snapshot, continuing to the terminal level. The first identity found wins;
@@ -171,7 +173,9 @@ Advance builds a retained candidate and publishes only after every allocation
 and merge succeeds. An OOM leaves sequence, values, current/snapshot roots,
 pending outputs, and existing read snapshots unchanged. Dropping the candidate
 releases all tentative allocations. No full logical database clone is needed.
-Merges are synchronous, so a large spill still has linear foreground cost.
+The portable engine's merges are synchronous, so a large spill still has linear
+foreground cost. Native worker scheduling may move this work to other threads;
+it cannot change the committed transition or omit required pending hashes.
 
 The independent Python model in `tools/reference.py` uses dictionaries and
 explicit lookahead arithmetic, not production Zig encoders or merge code.
