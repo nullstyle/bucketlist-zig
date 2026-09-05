@@ -99,7 +99,7 @@ traffic from normalization alone.
 
 Opening a disk frontier validates its local framing, schema/profile, all unique
 referenced bucket files, typed canonical records, schedule shape, terminal
-tombstone rules, and recomputed pending outputs before accepting the database
+tombstone rules, and re-derived each pending output (write-free hash verification) before accepting the database
 commitment. A streaming cursor's rows and header counts are provisional until
 verified EOF. Corruption cannot be converted into a missing record or an empty
 database. Local checks establish integrity; checkpoint authenticity and rollback

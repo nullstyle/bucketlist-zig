@@ -408,7 +408,7 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
                     if (duplicate) continue;
                     seen[count] = hash;
                     count += 1;
-                    var cursor = try self.store.scanBucket(hash, self.mergeLimits());
+                    var cursor = try self.store.scanBucketIndexed(hash, self.mergeLimits());
                     defer cursor.deinit();
                     while (try cursor.next()) |row| {
                         try validateRecord(row);
@@ -416,9 +416,13 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
                     }
                 }
             }
+            // The pending output is already a durable blob; re-derive its
+            // hash from the authenticated inputs without rewriting it.
             for (0..depth) |i| if (state.pendingJob(i)) |job| {
-                const hash = try self.store.mergeBuckets(job.older, job.newer, job.drop_tombstones, self.mergeLimits());
-                if (!std.mem.eql(u8, &hash, &state.levels[i].next.?)) return error.InvalidTopology;
+                self.store.mergeBucketsVerify(job.older, job.newer, job.drop_tombstones, self.mergeLimits(), state.levels[i].next.?) catch |err| switch (err) {
+                    error.MergeMismatch => return error.InvalidTopology,
+                    else => return err,
+                };
             };
         }
 

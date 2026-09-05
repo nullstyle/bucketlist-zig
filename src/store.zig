@@ -16,6 +16,7 @@ pub const Error = error{
     StoreBusy,
     InvalidPath,
     InvalidBucket,
+    MergeMismatch,
 };
 
 /// Per-record workspace and total-work limits for native bucket reads/merges.
@@ -151,13 +152,17 @@ const ReadIndexCache = struct {
         if (index.refs.fetchSub(1, .acq_rel) == 1) self.freeIndex(index);
     }
 
-    fn touch(self: *ReadIndexCache, index: *BucketIndex) void {
-        if (self.newest == index) return;
-        // Unlink from the interior or either end.
+    fn unlink(self: *ReadIndexCache, index: *BucketIndex) void {
         if (index.newer) |above| above.older = index.older else self.newest = index.older;
         if (index.older) |below| below.newer = index.newer else self.oldest = index.newer;
-        // Relink at the newest end.
         index.newer = null;
+        index.older = null;
+    }
+
+    fn touch(self: *ReadIndexCache, index: *BucketIndex) void {
+        if (self.newest == index) return;
+        self.unlink(index);
+        // Relink at the newest end.
         index.older = self.newest;
         if (self.newest) |above| above.newer = index;
         self.newest = index;
@@ -175,7 +180,8 @@ const ReadIndexCache = struct {
             return;
         }
         if (self.map.get(hash)) |existing| {
-            self.releaseLocked(existing);
+            // Keep the already-installed verified entry; drop the new samples.
+            self.touch(existing);
             self.freeSamples(samples);
             return;
         }
@@ -196,11 +202,7 @@ const ReadIndexCache = struct {
         while (self.map.count() > self.options.max_buckets) {
             const victim = self.oldest orelse break;
             std.debug.assert(self.map.remove(victim.hash));
-            // Unlink; LRU ends are maintained by touch on remaining links.
-            self.oldest = victim.newer;
-            if (self.oldest) |above| above.older = null else self.newest = null;
-            victim.newer = null;
-            victim.older = null;
+            self.unlink(victim);
             self.releaseLocked(victim);
         }
     }
@@ -245,6 +247,79 @@ pub const BucketCursor = struct {
     /// Drain the unread suffix and authenticate the complete bucket.
     pub fn finish(self: *BucketCursor) Error!void {
         while (try self.next() != null) {}
+    }
+};
+
+/// Scan cursor that additionally records read-index samples and installs
+/// them exactly when verification reaches EOF. Record slices and verification
+/// rules follow BucketCursor; with no read index enabled it behaves as
+/// scanBucket. Index-bookkeeping allocation failures are observable errors.
+pub const IndexedCursor = struct {
+    cursor: BucketCursor,
+    store: *Store,
+    hash: Hash,
+    total_records: u64,
+    samples: std.ArrayList(Sample) = .empty,
+    sampled_offset: u64 = 0,
+    installed: bool = false,
+
+    pub fn byteLength(self: *const IndexedCursor) u64 {
+        return self.cursor.byteLength();
+    }
+    pub fn recordCount(self: *const IndexedCursor) u64 {
+        return self.total_records;
+    }
+    pub fn deinit(self: *IndexedCursor) void {
+        if (!self.installed) {
+            for (self.samples.items) |sample| self.store.gpa.free(sample.key);
+            self.samples.deinit(self.store.gpa);
+        }
+        self.cursor.deinit();
+        self.* = undefined;
+    }
+    pub fn next(self: *IndexedCursor) Error!?BucketRecord {
+        if (self.cursor.failure) |err| return err;
+        const reader = &self.cursor.reader;
+        const record_offset = reader.consumed;
+        reader.advance() catch |err| {
+            self.cursor.failure = err;
+            return err;
+        };
+        const record = reader.current orelse {
+            self.install() catch |err| {
+                self.cursor.failure = err;
+                return err;
+            };
+            return null;
+        };
+        if (self.store.read_index != null and self.samples.items.len < self.indexOptions().max_samples and
+            (self.samples.items.len == 0 or record_offset - self.sampled_offset >= self.indexOptions().min_span_bytes))
+        {
+            const key_copy = self.store.gpa.dupe(u8, record.key) catch return error.OutOfMemory;
+            errdefer self.store.gpa.free(key_copy);
+            self.samples.append(self.store.gpa, .{ .table = record.table, .offset = record_offset, .key = key_copy }) catch return error.OutOfMemory;
+            self.sampled_offset = record_offset;
+        }
+        return record;
+    }
+    /// Drain the unread suffix, authenticate the bucket, install the index.
+    pub fn finish(self: *IndexedCursor) Error!void {
+        while (try self.next() != null) {}
+    }
+    fn indexOptions(self: *const IndexedCursor) ReadIndexOptions {
+        return self.store.read_index.?.options;
+    }
+    fn install(self: *IndexedCursor) Error!void {
+        if (self.store.read_index) |cache| {
+            // Ownership transfers on success; a failed install frees them.
+            const owned = try self.samples.toOwnedSlice(self.store.gpa);
+            self.installed = true;
+            try cache.install(self.hash, self.cursor.reader.size, self.total_records, owned);
+        } else {
+            self.installed = true;
+            for (self.samples.items) |sample| self.store.gpa.free(sample.key);
+            self.samples.deinit(self.store.gpa);
+        }
     }
 };
 
@@ -385,6 +460,13 @@ pub const Store = struct {
     pub fn scanBucket(self: *Store, hash: Hash, limits: MergeLimits) Error!BucketCursor {
         const reader = try BucketReader.init(self, hash, limits);
         return .{ .reader = reader, .record_count = reader.remaining };
+    }
+
+    /// Verified scan that seeds the read index at EOF (see IndexedCursor).
+    pub fn scanBucketIndexed(self: *Store, hash: Hash, limits: MergeLimits) Error!IndexedCursor {
+        const cursor = try BucketReader.init(self, hash, limits);
+        const total = cursor.remaining;
+        return .{ .cursor = .{ .reader = cursor, .record_count = total }, .store = self, .hash = hash, .total_records = total };
     }
 
     /// Stream and verify the WHOLE bucket, even after finding the key. Runtime
@@ -594,6 +676,26 @@ pub const Store = struct {
         defer installed.close(self.io);
         try fullSync(self.io, installed);
         return hash;
+    }
+
+    /// Verify that merging two stored buckets yields exactly `expected`
+    /// without writing anything: the same two bounded passes and record
+    /// semantics as `mergeBuckets`, hashing the would-be output only.
+    /// Reopen validation uses this when the pending output is already a
+    /// durable blob; `error.MergeMismatch` rejects a forged pending hash.
+    pub fn mergeBucketsVerify(self: *Store, older: Hash, newer: Hash, drop_tombstones: bool, limits: MergeLimits, expected: Hash) Error!void {
+        const first = try mergePass(self, older, newer, drop_tombstones, limits, null);
+        var sink: MergeOutput = .{ .writer = null, .limit = limits.max_bucket_bytes };
+        // Hash the exact output byte stream, header included, exactly as
+        // mergeBuckets writes it.
+        try sink.write(bucket_domain);
+        var count_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &count_bytes, first.count, .big);
+        try sink.write(&count_bytes);
+        const second = try mergePass(self, older, newer, drop_tombstones, limits, &sink);
+        if (second.count != first.count or second.size != first.size or sink.size != first.size)
+            return error.MergeMismatch;
+        if (!std.mem.eql(u8, &expected, &sink.hash.finalResult())) return error.MergeMismatch;
     }
 
     /// Publish an opaque application manifest after putBlob has durably
@@ -815,14 +917,16 @@ const BucketReader = struct {
 };
 
 const MergeOutput = struct {
-    writer: *std.Io.Writer,
+    /// A null writer hashes and counts without producing bytes: two
+    /// null-writer passes derive a merge's exact hash with no writes.
+    writer: ?*std.Io.Writer,
     hash: std.crypto.hash.sha2.Sha256 = .init(.{}),
     size: u64 = 0,
     limit: u64,
 
     fn write(self: *MergeOutput, bytes: []const u8) Error!void {
         if (bytes.len > self.limit - self.size) return error.TooLarge;
-        self.writer.writeAll(bytes) catch return error.IoFailed;
+        if (self.writer) |writer| writer.writeAll(bytes) catch return error.IoFailed;
         self.hash.update(bytes);
         self.size += bytes.len;
     }

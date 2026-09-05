@@ -282,6 +282,12 @@ bucket (~110x here); misses remain O(levels) rather than O(1). Reopen
 rebuilds indexes on first touch; earlier recorded workload numbers above
 predate the index and measured per-read full verification.
 
+Reopen after these changes costs 38.8 ms on the 16 MiB workload versus
+71.0 ms before (write-free pending-merge verification replaces the temporary
+rewrite and syncs during validation), and because validation seeds the read
+index, the first reads after reopen are already warm (41 KB per lookup) with
+no cold per-bucket pass.
+
 ```sh
 mise exec -- zig build read-bench -Doptimize=ReleaseFast -- /absolute/fresh/store 64 16 128
 ```

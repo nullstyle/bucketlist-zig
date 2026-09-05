@@ -92,6 +92,19 @@ are caller-visible `OutOfMemory` errors, never silent degradation; entries are
 reference-counted so concurrent merges and lookups on one thread-safe Store
 remain safe. Warm spans allocate the same bounded key/value scratch as a scan.
 
+`mergeBucketsVerify(older, newer, drop_tombstones, limits, expected)` proves
+that a merge would produce exactly `expected` without writing anything: the
+same two bounded passes hash the would-be output stream, header included.
+Reopen validation uses it to re-derive pending outputs that are already
+durable blobs, instead of rewriting and re-syncing them; a forged pending
+hash fails with `MergeMismatch`.
+
+`scanBucketIndexed(hash, limits)` returns an `IndexedCursor`: a verified scan
+like `scanBucket` that additionally records read-index samples and installs
+them exactly when verification reaches EOF (see the read index section).
+Open validation uses it, so the required full-bucket scans at reopen also
+seed the index and every post-open lookup is warm immediately.
+
 `mergeBuckets(older, newer, drop_tombstones, limits)` merges two stored canonical
 buckets without loading either whole bucket into memory. Records are ordered by
 numeric table ID then lexicographic encoded key. The newer input wins duplicate

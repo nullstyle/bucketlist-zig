@@ -213,8 +213,12 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     {
+        const clock = std.Io.Clock.awake;
+        const start = clock.now(io_counter.original);
         var db = try Db.open(gpa, io_counter.io(), path, .{});
         defer db.deinit();
+        const elapsed = start.durationTo(clock.now(io_counter.original)).nanoseconds;
+        try json(writer, .{ .phase = "reopen", .elapsed_ns = @as(u64, @intCast(elapsed)) });
         inline for (std.meta.tags(Class)) |class| {
             try measure(db, &io_counter, writer, "first_touch_reopened", class, rows, samples, latencies, gpa);
         }

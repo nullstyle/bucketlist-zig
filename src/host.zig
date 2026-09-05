@@ -22,6 +22,8 @@ pub fn Host(comptime Schema: type) type {
             queued: usize,
             capacity: usize,
             failure: ?anyerror,
+            /// Total trySubmit rejections for a full or contended ring.
+            backpressure: u64 = 0,
         };
 
         pub const Snapshot = struct {
@@ -49,6 +51,7 @@ pub fn Host(comptime Schema: type) type {
         disk: *Disk,
         ring: []Entry,
         metadata_slots: []u8,
+        backpressure: std.atomic.Value(u64) = .init(0),
         durable_metadata: []u8,
         durable_metadata_len: usize,
         durable_commitment: Commitment,
@@ -123,11 +126,17 @@ pub fn Host(comptime Schema: type) type {
         /// and the caller's Batch becomes empty and safe to deinit or reuse.
         /// Every error leaves the Batch and accepted frontier unchanged.
         pub fn trySubmit(self: *Self, next: u64, batch: *Batch, metadata: []const u8) !void {
-            if (!self.mutex.tryLock()) return error.Backpressure;
+            if (!self.mutex.tryLock()) {
+                _ = self.backpressure.fetchAdd(1, .monotonic);
+                return error.Backpressure;
+            }
             defer self.mutex.unlock(self.io);
             if (self.stopping) return error.Closed;
             if (self.failure) |err| return err;
-            if (self.count == self.ring.len) return error.Backpressure;
+            if (self.count == self.ring.len) {
+                _ = self.backpressure.fetchAdd(1, .monotonic);
+                return error.Backpressure;
+            }
             if (self.accepted == std.math.maxInt(u64)) return error.SequenceExhausted;
             if (next != self.accepted + 1) return error.InvalidSequence;
             if (metadata.len > self.options.disk.max_metadata_bytes) return error.TooLarge;
@@ -148,6 +157,7 @@ pub fn Host(comptime Schema: type) type {
             return .{
                 .accepted = self.accepted,
                 .durable = self.durable_commitment.advance,
+                .backpressure = self.backpressure.load(.monotonic),
                 .queued = self.count,
                 .capacity = self.ring.len,
                 .failure = self.failure,
@@ -319,6 +329,7 @@ test "host: nonblocking admission preserves rejected ownership and durable snaps
         defer host.mutex.unlock(testing.io);
         try testing.expectError(error.Backpressure, host.trySubmit(1, &first, "one"));
     }
+    try testing.expectEqual(@as(u64, 1), host.status().backpressure);
     var too_many = H.Batch.init(testing.allocator);
     defer too_many.deinit();
     try too_many.put(.rows, 1, 1);
@@ -346,6 +357,7 @@ test "host: nonblocking admission preserves rejected ownership and durable snaps
     try third.put(.rows, 1, 30);
     const third_key = third.changes.items[0].key.ptr;
     try testing.expectError(error.Backpressure, host.trySubmit(3, &third, "tre"));
+    try testing.expectEqual(@as(u64, 2), host.status().backpressure);
     try testing.expectEqual(third_key, third.changes.items[0].key.ptr);
     var genesis = try host.snapshot(testing.allocator);
     defer genesis.deinit();

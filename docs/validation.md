@@ -122,7 +122,11 @@ per-read measurements show warm deep-level reads improving about 96x at
 67.2 MB to 41 KB at 64 MiB; misses improve about 110x. The index changes no
 committed byte, and indexed and non-indexed opens agree across the test
 suite. Full-bucket scanning still governs merges, reopen validation, and
-retained-checkpoint verification by design.
+retained-checkpoint verification by design. Reopen validation now also seeds
+the read index during those required scans (first reads after open are warm)
+and re-derives pending merge outputs with a write-free hash verification
+instead of rewriting durable blobs; recorded reopen time fell from 71 ms to
+39 ms on the 16 MiB workload with the same rejection guarantees.
 
 ## Reproducible checks
 
