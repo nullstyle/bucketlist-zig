@@ -185,6 +185,36 @@ counters versus 11,188 on macOS, so percentages are not comparable across
 platforms; each platform's plateau reflects that shared-binary ceiling, not
 an explored limit of the library.
 
+### Extended soak campaigns
+
+Both platforms then ran the same harness at one hundred times that budget —
+10,000,000 cycles per test, three fresh seeds (`20260905`, `8675309`,
+`424242`), fresh cache per campaign, 7,200-second watchdogs, at the same
+pinned commit:
+
+| Platform | Seed | Runs | Unique inputs | Coverage | Active time |
+| --- | --- | ---: | ---: | --- | ---: |
+| macOS | 20260905 | 30,011,429 | 11,211 | 1542/11188 (13.78%) | 18.5 min |
+| macOS | 8675309 | 30,014,853 | 14,635 | 1541/11188 (13.77%) | 18.0 min |
+| macOS | 424242 | 30,011,488 | 11,270 | 1538/11188 (13.75%) | 21.0 min |
+| Linux | 20260905 | 30,010,471 | 10,222 | 1554/12384 (12.55%) | 46.7 min |
+| Linux | 8675309 | 30,010,513 | 10,258 | 1557/12384 (12.57%) | 46.7 min |
+| Linux | 424242 | 30,012,320 | 12,071 | 1556/12384 (12.56%) | 46.8 min |
+
+Across both platforms that is **180,071,074 runs** with no failure
+diagnostics, no watchdog expiry, and 3/3 tests passing in every build. The
+soak-opening self-tests again recovered and exactly replayed the synthetic
+probe (135 runs on macOS with the usual empty crash file; 68 runs on Linux,
+repeating the bounded campaign's probe byte for byte). Counters and
+provenance are tracked in [guided-soak-macos.jsonl](fuzz/guided-soak-macos.jsonl)
+and [guided-soak-linux.jsonl](fuzz/guided-soak-linux.jsonl); artifacts are
+under `.zig-cache/guided-soak-{macos,linux}-20260905T050212Z/`. The Linux
+soak survived two recorded environment incidents — a host sleep that wedged
+the container engine, and an untracked evidence file that briefly broke the
+driver's clean-tree invariant; affected partial runs are preserved in the
+artifact directory and every counted row ran against the clean pinned tree.
+Elapsed times are monotonic active time and exclude the sleep.
+
 ## Run and replay
 
 ```sh
@@ -207,7 +237,7 @@ run was repeated with byte-identical output. Native roots use random names but
 their samples and outcomes depend on the seed. The optional native final
 argument supplies a fresh root; use resolved paths without symlinked parents.
 
-Corpus minimization, longer soak campaigns, larger resource limits, and
+Corpus minimization, multi-day soak campaigns, larger resource limits, and
 physical power-loss testing remain future work. Existing deterministic
 publication-failure and process-restart tests cover different failure
 boundaries and remain separate gates.

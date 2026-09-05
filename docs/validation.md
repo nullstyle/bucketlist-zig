@@ -67,7 +67,7 @@ bind to port 1. No oracle or differential check is skipped. The journal watermar
 is Experimental and does not change the peer answering-window policy.
 
 M6 adds deterministic malformed-input campaigns and larger disk workload
-measurements. Release review, longer soak testing, production workload
+measurements. Release review, multi-day soak testing, production workload
 qualification, and an accessible immutable companion artifact for a
 distributable standalone SLCP consumer remain open.
 
@@ -96,6 +96,13 @@ The Linux campaigns ran in a disposable native-architecture container
 (OrbStack, Debian 13 trixie) with per-invocation watchdogs and unchanged
 source hashes; runner counters and provenance are in [fuzzing.md](fuzzing.md)
 and [guided-linux.jsonl](fuzz/guided-linux.jsonl).
+
+Both platforms then ran extended soaks at one hundred times that budget
+(10,000,000 mutation cycles per test, three further seeds each, 7,200-second
+watchdogs): 90,037,770 runs on macOS and 90,033,304 on Linux — 180,071,074
+total — again with no failure diagnostics and unchanged sources. Counters
+and provenance are in [fuzzing.md](fuzzing.md) and the
+`guided-soak-*.jsonl` evidence files.
 
 The disk workload comparison against `a7741e5` validates 192 identical committed
 digests and manifest references. At 16 MiB, median measured time improves about
@@ -194,10 +201,10 @@ The APIs and format remain Experimental. There is no automatic schema migration,
 SQL/query planner, secondary-index maintenance, succinct record proof, or
 application-independent checkpoint trust policy. Disk reads currently scan
 complete buckets, and recovery recomputes pending merges. The examples are bounded
-demonstrations, not production services. Extended coverage-guided soak
-campaigns beyond the recorded bounded runs, longer soak testing, production
-workload qualification, and release review remain necessary before promotion
-to Stable.
+demonstrations, not production services. Multi-day coverage-guided soaks
+beyond the recorded bounded and extended campaigns, production workload
+qualification, and release review remain necessary before promotion to
+Stable.
 
 The SLCP revision used here is not publicly available as an immutable archive.
 The optional integration reads that exact Git object from a local source and

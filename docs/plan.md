@@ -431,8 +431,9 @@ resource, failure/recovery, platform, and real-process integration evidence in
 M6 now includes deterministic portable/native malformed-input campaigns, fast
 seeded CI cases, larger disk workload measurements, sorted streaming batch
 normalization, and LLVM coverage-guided campaigns on macOS and native Linux
-ARM64 through a fail-closed wrapper with exact input replay (see
-[fuzzing.md](fuzzing.md)). It still needs release review, longer soak
+ARM64 — bounded campaigns plus extended 10M-cycle-per-test soaks — through a
+fail-closed wrapper with exact input replay (see
+[fuzzing.md](fuzzing.md)). It still needs release review, multi-day soak
 testing, production workload qualification, and an accessible immutable SLCP
 dependency before a standalone integration release. Local gates and API
 snapshots are necessary evidence, not a stability promise. The initial disk
