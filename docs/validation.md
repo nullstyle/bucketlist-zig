@@ -1,6 +1,6 @@
 # Implementation and validation
 
-Date: 2026-09-04. Version: Experimental `0.1.0-dev`.
+Date: 2026-09-04, evidence extended through 2026-09-05. Version: Experimental `0.1.0-dev`.
 
 ## Delivered
 
@@ -67,9 +67,12 @@ bind to port 1. No oracle or differential check is skipped. The journal watermar
 is Experimental and does not change the peer answering-window policy.
 
 M6 adds deterministic malformed-input campaigns and larger disk workload
-measurements. Release review, multi-day soak testing, production workload
-qualification, and an accessible immutable companion artifact for a
-distributable standalone SLCP consumer remain open.
+measurements. The v0.1 release review — full gate evidence, the supported
+versus experimental surface classification, the skip audit, and promotion
+conditions — is recorded in [release-review.md](release-review.md).
+Multi-day soak testing, production workload qualification, and an accessible
+immutable companion artifact for a distributable standalone SLCP consumer
+remain open.
 
 The recorded ReleaseSafe campaigns execute **300,000 portable** and **30,000
 native** mutation/property cases across three seeds, without mismatches or

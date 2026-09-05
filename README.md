@@ -26,8 +26,8 @@ portable database engine operates in memory.
 
 The native `bucketlist-disk` module executes the same typed batches against
 files, keeping only bucket identities in its frontier. It adds authenticated
-linear reads, pinned read views, parallel streaming merges, and atomic durable
-publication. `Host(Schema)` runs that work on a dedicated thread behind a bounded
+point reads served from a verified per-bucket span index, pinned read views,
+parallel streaming merges, and atomic durable publication. `Host(Schema)` runs that work on a dedicated thread behind a bounded
 queue with explicit `Backpressure`; accepted and durable advances are distinct.
 See the [disk and host contract](docs/disk.md).
 

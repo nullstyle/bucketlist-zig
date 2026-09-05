@@ -2,6 +2,7 @@ const std = @import("std");
 const lib = @import("bucketlist");
 const native = @import("bucketlist-disk");
 const checkpoints = @import("bucketlist-checkpoints");
+const storage = @import("bucketlist-store");
 const Schema = struct {
     pub const namespace = "api";
     pub const version: u32 = 1;
@@ -38,6 +39,9 @@ pub fn main() void {
     describe("HostSnapshot", Host.Snapshot);
     describeFields("HostOptions", Host.Options);
     describeFields("HostStatus", Host.Status);
+    describe("Store", storage.Store);
+    describeFields("StoreReadIndexOptions", storage.ReadIndexOptions);
+    describeFields("StoreMergeLimits", storage.MergeLimits);
 }
 
 fn describeFields(comptime label: []const u8, comptime Container: type) void {

@@ -433,10 +433,13 @@ seeded CI cases, larger disk workload measurements, sorted streaming batch
 normalization, and LLVM coverage-guided campaigns on macOS and native Linux
 ARM64 — bounded campaigns plus extended 10M-cycle-per-test soaks — through a
 fail-closed wrapper with exact input replay (see
-[fuzzing.md](fuzzing.md)). It still needs release review, multi-day soak
+[fuzzing.md](fuzzing.md)). The v0.1 release review — gate evidence, surface
+classification, skip audit, and promotion conditions — is recorded in
+[release-review.md](release-review.md). It still needs multi-day soak
 testing, production workload qualification, and an accessible immutable SLCP
 dependency before a standalone integration release. Local gates and API
-snapshots are necessary evidence, not a stability promise. The initial disk
-point lookup deliberately scans and authenticates complete buckets; indexes and
-caches are later optimizations that must preserve exact v1 bytes and hashes.
+snapshots are necessary evidence, not a stability promise. Disk point reads
+are served from a verified per-bucket span index that preserves exact v1
+bytes and hashes; scans still govern merges, reopen validation, and
+retained-checkpoint verification.
 Application-specific journal retention and checkpoint trust remain host policy.
