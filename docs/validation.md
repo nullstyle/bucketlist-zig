@@ -81,16 +81,21 @@ source/compiler provenance, counters, and replay commands are in
 exhaustive input coverage; the coverage-guided campaigns below add LLVM-guided
 exploration on top of it.
 
-Coverage-guided campaigns on the same pinned compiler (macOS ARM64, LLVM,
-ReleaseSafe, fresh cache per campaign) ran three seeds at 100,000 mutation
-cycles per test through the fail-closed `guided-fuzz.py` wrapper. The wrapper
-exists because the pinned build runner can exit zero after a discovered fuzz
-failure and write an empty crash file; `just guided-self-test` (part of
+Coverage-guided campaigns on the same pinned compiler (macOS ARM64 and native
+Linux ARM64, LLVM, ReleaseSafe, fresh cache per campaign) ran three seeds at
+100,000 mutation cycles per test through the fail-closed `guided-fuzz.py`
+wrapper. The wrapper exists because the pinned build runner can exit zero
+after a discovered fuzz failure and write an empty crash file; the Linux run
+observed this exit-zero defect directly. `just guided-self-test` (part of
 `just preflight`) replays an armed synthetic failure end to end to prove the
-wrapper recovers the mapped input and reproduces the failure exactly. The
-library campaigns completed with no failure diagnostics; program-counter
-coverage is not library-statement coverage. Runner counters and provenance
-are in [fuzzing.md](fuzzing.md).
+wrapper recovers the mapped input and reproduces the failure exactly; on
+Linux the probe failed after 68 runs and replayed `SyntheticProbeFailure`
+exactly. The library campaigns completed with no failure diagnostics on
+either platform; program-counter coverage is not library-statement coverage.
+The Linux campaigns ran in a disposable native-architecture container
+(OrbStack, Debian 13 trixie) with per-invocation watchdogs and unchanged
+source hashes; runner counters and provenance are in [fuzzing.md](fuzzing.md)
+and [guided-linux.jsonl](fuzz/guided-linux.jsonl).
 
 The disk workload comparison against `a7741e5` validates 192 identical committed
 digests and manifest references. At 16 MiB, median measured time improves about
@@ -189,9 +194,10 @@ The APIs and format remain Experimental. There is no automatic schema migration,
 SQL/query planner, secondary-index maintenance, succinct record proof, or
 application-independent checkpoint trust policy. Disk reads currently scan
 complete buckets, and recovery recomputes pending merges. The examples are bounded
-demonstrations, not production services. Coverage-guided and longer soak testing,
-production workload qualification, and release review remain necessary before
-promotion to Stable.
+demonstrations, not production services. Extended coverage-guided soak
+campaigns beyond the recorded bounded runs, longer soak testing, production
+workload qualification, and release review remain necessary before promotion
+to Stable.
 
 The SLCP revision used here is not publicly available as an immutable archive.
 The optional integration reads that exact Git object from a local source and

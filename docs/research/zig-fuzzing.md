@@ -81,7 +81,8 @@ The self-hosted ARM64 test runner uses `need_simple`, which skips
 therefore required for this project's ARM64 targets. The runtime supports
 ELF and Mach-O; the build runner explicitly rejects Windows and 32-bit hosts.
 Linux ARM64 is supported by these code paths but was **not runtime-tested in
-this research sprint**. [Simple-runner backend selection](https://github.com/nullstyle/zig/blob/75044cb04cc67454db98ed7c054081806c3830c6/lib/compiler/test_runner.zig#L27),
+this research sprint** (validated on 2026-09-05; see the last section).
+[Simple-runner backend selection](https://github.com/nullstyle/zig/blob/75044cb04cc67454db98ed7c054081806c3830c6/lib/compiler/test_runner.zig#L27),
 [object formats](https://github.com/nullstyle/zig/blob/75044cb04cc67454db98ed7c054081806c3830c6/lib/fuzzer.zig#L182),
 [host restrictions](https://github.com/nullstyle/zig/blob/75044cb04cc67454db98ed7c054081806c3830c6/lib/compiler/Maker.zig#L2418).
 
@@ -163,6 +164,39 @@ also recommend embedded corpus entries for crash reproduction.
 Local scratch evidence remains under `.zig-cache/zig-fuzz-probe-szdtvozh`.
 Logs are `.zig-cache/zig-fuzz-probe.log`, `zig-fuzz-crash-probe.log`,
 `zig-fuzz-replay-probe.log`, and `zig-fuzz-recovered-probe.log`. They are
-untracked research artifacts. No research processes remain running. Linux
-runtime validation, a wrapper self-test for the false-success defect, and any
-compiler fixes remain follow-up work.
+untracked research artifacts. No research processes remain running. Follow-up
+status as of 2026-09-05: Linux ARM64 runtime validation and the wrapper
+self-test for the false-success defect are done — see the section below and
+[fuzzing.md](../fuzzing.md). Compiler fixes for the runner defects remain
+out of scope for this repository.
+
+## Linux ARM64 runtime validation (2026-09-05)
+
+The pinned integration was runtime-validated on native Linux ARM64 in a
+disposable Docker container (OrbStack, `ghcr.io/jdx/mise:2026.8.10`, Debian
+13 trixie, same pinned compiler `0.17.0-dev.1786+75044cb04`). A scratch
+driver ran the fail-closed wrapper's self-test and three library campaigns —
+seeds `1`, `20260904`, `305419896`, 100,000 mutation cycles per test, fresh
+dedicated cache per campaign, 1,200-second watchdog per invocation:
+
+- **Self-test:** the armed probe failed after 68 runs with the usual zero
+  build exit; the wrapper recovered the 45-byte Smith-framed input (`f/crash`
+  happened to hold the same 45 bytes this time but remains untrusted) and the
+  exact replay reproduced `SyntheticProbeFailure`.
+- **Campaigns:** 301,513 / 301,450 / 301,499 runs with 1,295 / 1,231 / 1,280
+  unique inputs; every build passed 3/3 tests with no failure diagnostics and
+  no watchdog expiry (50–55 seconds per campaign).
+- Linux instruments 12,384 program counters versus 11,188 on macOS;
+  cross-platform percentages are not comparable.
+- The consolidated single-report behavior documented above appeared
+  identically on Linux — one report block naming `codec`, counters summed
+  across tests. A scratch-driver assertion that wrongly demanded three
+  per-test report names aborted the first driver attempt after the seed-1
+  campaign; the preserved runtime evidence was re-verified in place and the
+  remaining campaigns completed. This was a driver-expectation bug, not a
+  runner difference.
+
+Tracked counters and provenance are in [guided-linux.jsonl](../fuzz/guided-linux.jsonl);
+full untracked artifacts (build/replay logs, reports, recovered mapped
+inputs, driver results and both campaign logs) are under
+`.zig-cache/linux-guided-20260905T021131Z/results/`.

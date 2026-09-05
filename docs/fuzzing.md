@@ -81,8 +81,9 @@ correctness campaign, not storage throughput.
 ## Coverage-guided campaigns
 
 The same `Guided` oracle runs under Zig's integrated LLVM fuzzer on this
-repository's pinned compiler (macOS ARM64; the self-hosted AArch64 backend
-silently skips `std.testing.fuzz`, so the guided artifacts set `use_llvm`).
+repository's pinned compiler on macOS and native Linux ARM64 (the self-hosted
+AArch64 backend silently skips `std.testing.fuzz`, so the guided artifacts set
+`use_llvm`).
 Three fuzz tests — codec, bucket, and checkpoint — execute a fixed seed corpus
 derived from the deterministic corpus above: codec boundary values, empty and
 framed buckets, all 39 checkpoint fixtures with a depth selector byte, and two
@@ -127,11 +128,16 @@ replay command recorded; no automatic crash minimization exists on this pin.
 
 ### Recorded guided campaigns
 
-macOS ARM64, ReleaseSafe, fresh cache per campaign, three seeds
-(`1`, `20260904`, `305419896` — build seeds are u32, so the deterministic
-campaigns' `11400714819323198485` cannot be reused verbatim), 100,000 mutation
-cycles per test per campaign
-(23 seconds each; most mutated inputs are rejected by early framing checks):
+Build seeds are u32, so the deterministic campaigns'
+`11400714819323198485` cannot be reused verbatim; the guided seeds are `1`,
+`20260904`, and `305419896` at 100,000 mutation cycles per test per campaign,
+ReleaseSafe, with a fresh cache per campaign. The pinned build runner
+consolidates every fuzz test in a step into a single report block naming the
+first test, with counters accumulated across tests, so `Runs` totals all three
+tests ([research detail](research/zig-fuzzing.md)).
+
+**macOS ARM64** — 23 seconds per campaign; most mutated inputs are rejected by
+early framing checks:
 
 | Seed | Runs | Unique inputs | Coverage |
 | --- | ---: | ---: | --- |
@@ -140,11 +146,43 @@ cycles per test per campaign
 | 305419896 | 301,476 | 1,258 | 1509/11188 (13.49%) |
 
 No campaign reported failure diagnostics, so no input required recovery or
-replay. Per-seed artifacts (provenance, report, mapped inputs) are preserved
-under `.zig-cache/guided-fuzz/` in the working tree. Coverage counts
-instrumented program counters in the whole test binary — shared by all three
-tests and dominated by code these entry points cannot reach — and is not
-library-statement coverage; the plateau near 13.5% reflects that ceiling, not
+replay. Per-seed macOS artifacts (provenance, report, mapped inputs) are
+preserved under `.zig-cache/guided-fuzz/` in the working tree.
+
+**Linux ARM64** — native-architecture Docker container (OrbStack,
+`ghcr.io/jdx/mise:2026.8.10`, Debian 13 trixie), same pinned compiler,
+1,200-second watchdog per invocation; campaigns finished in 50–55 seconds
+each:
+
+| Seed | Runs | Unique inputs | Coverage |
+| --- | ---: | ---: | --- |
+| 1 | 301,513 | 1,295 | 1525/12384 (12.31%) |
+| 20260904 | 301,450 | 1,231 | 1525/12384 (12.31%) |
+| 305419896 | 301,499 | 1,280 | 1534/12384 (12.39%) |
+
+The wrapper self-test ran first on Linux: the armed synthetic probe failed
+after 68 runs with the usual zero build exit, the wrapper recovered the
+45-byte Smith-framed input, and the exact replay reproduced
+`SyntheticProbeFailure`. Every library campaign passed 3/3 tests with no
+failure diagnostics and no watchdog expiry. Exact provenance and counters are
+tracked in [guided-linux.jsonl](fuzz/guided-linux.jsonl); full artifacts
+(build and replay logs, reports, recovered mapped inputs, driver results) are
+preserved under `.zig-cache/linux-guided-20260905T021131Z/results/` in the
+working tree. Reproduce on any native Linux ARM64 host with the repo-pinned
+mise tools via `mise exec -- just guided-self-test` and
+`mise exec -- just guided-fuzz 100000 1`, or inside a container such as:
+
+```sh
+docker run --rm -v "$PWD:/work" -w /work ghcr.io/jdx/mise:2026.8.10 \
+  sh -c 'git config --global --add safe.directory /work &&
+         mise exec -- just guided-self-test && mise exec -- just guided-fuzz 100000 1'
+```
+
+Coverage counts instrumented program counters in the whole test binary —
+shared by all three tests and dominated by code these entry points cannot
+reach — and is not library-statement coverage. Linux instruments 12,384
+counters versus 11,188 on macOS, so percentages are not comparable across
+platforms; each platform's plateau reflects that shared-binary ceiling, not
 an explored limit of the library.
 
 ## Run and replay
@@ -169,7 +207,7 @@ run was repeated with byte-identical output. Native roots use random names but
 their samples and outcomes depend on the seed. The optional native final
 argument supplies a fresh root; use resolved paths without symlinked parents.
 
-Corpus minimization, longer soak campaigns, larger resource limits, Linux
-coverage-guided runtime validation, and physical power-loss testing remain
-future work. Existing deterministic publication-failure and process-restart
-tests cover different failure boundaries and remain separate gates.
+Corpus minimization, longer soak campaigns, larger resource limits, and
+physical power-loss testing remain future work. Existing deterministic
+publication-failure and process-restart tests cover different failure
+boundaries and remain separate gates.
