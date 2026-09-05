@@ -67,9 +67,9 @@ bind to port 1. No oracle or differential check is skipped. The journal watermar
 is Experimental and does not change the peer answering-window policy.
 
 M6 adds deterministic malformed-input campaigns and larger disk workload
-measurements. Release review, coverage-guided and longer soak testing,
-production workload qualification, and an accessible immutable companion
-artifact for a distributable standalone SLCP consumer remain open.
+measurements. Release review, longer soak testing, production workload
+qualification, and an accessible immutable companion artifact for a
+distributable standalone SLCP consumer remain open.
 
 The recorded ReleaseSafe campaigns execute **300,000 portable** and **30,000
 native** mutation/property cases across three seeds, without mismatches or
@@ -77,8 +77,20 @@ leaks. Portable runs include 17,113 accepted checkpoint continuations and 6,885
 intentional allocation failures; native runs include hash-valid malformed
 buckets/manifests and preservation after rejected recovery/collection. Exact
 source/compiler provenance, counters, and replay commands are in
-[fuzzing.md](fuzzing.md). This is deterministic mutation testing; it does not
-claim coverage-guided exploration or exhaustive input coverage.
+[fuzzing.md](fuzzing.md). Deterministic mutation testing does not claim
+exhaustive input coverage; the coverage-guided campaigns below add LLVM-guided
+exploration on top of it.
+
+Coverage-guided campaigns on the same pinned compiler (macOS ARM64, LLVM,
+ReleaseSafe, fresh cache per campaign) ran three seeds at 100,000 mutation
+cycles per test through the fail-closed `guided-fuzz.py` wrapper. The wrapper
+exists because the pinned build runner can exit zero after a discovered fuzz
+failure and write an empty crash file; `just guided-self-test` (part of
+`just preflight`) replays an armed synthetic failure end to end to prove the
+wrapper recovers the mapped input and reproduces the failure exactly. The
+library campaigns completed with no failure diagnostics; program-counter
+coverage is not library-statement coverage. Runner counters and provenance
+are in [fuzzing.md](fuzzing.md).
 
 The disk workload comparison against `a7741e5` validates 192 identical committed
 digests and manifest references. At 16 MiB, median measured time improves about
@@ -90,16 +102,17 @@ documented in [performance.md](performance.md). Large scans remain expensive.
 
 ## Reproducible checks
 
-Local gates passed all 99 tests on macOS ARM64 and Linux ARM64 in
-Debug and ReleaseSafe, plus the checks below. Linux runs in a disposable native
-ARM container; x86_64 Linux is separately cross-compiled. The first emulated
-x86 container could not run this Zig toolchain under Rosetta and is not counted
-as runtime validation.
+Local gates passed all 104 tests on macOS ARM64 and Linux ARM64 in Debug and
+ReleaseSafe (including the fixed guided corpus through LLVM), plus the checks
+below. Linux runs in a disposable native ARM container; x86_64 Linux is
+separately cross-compiled. The first emulated x86 container could not run this
+Zig toolchain under Rosetta and is not counted as runtime validation.
 
 | Check | Evidence |
 | --- | --- |
-| `just test` | All 99 tests described above, 100 native mutation cases, API/schema diagnostics, and portable, checkpoint, and disk-host consumers. |
-| `just fuzz-smoke` | A 1,000-case portable parser campaign, exhaustive checkpoint continuation allocation failures, and 100 native cases; included in ordinary tests. See [fuzzing.md](fuzzing.md) for coverage and replay. |
+| `just test` | All 104 tests described above, 100 native mutation cases, API/schema diagnostics, and portable, checkpoint, and disk-host consumers. |
+| `just fuzz-smoke` | A 1,000-case portable parser campaign, exhaustive checkpoint continuation allocation failures, the fixed guided corpus through LLVM, and 100 native cases; included in ordinary tests. See [fuzzing.md](fuzzing.md) for coverage and replay. |
+| `just guided-self-test` | An armed synthetic fuzz failure is discovered by a bounded campaign, reported with a zero build exit and an empty crash file, and the wrapper still fails closed: it recovers the mapped input, resolves the test identity, and replays the exact `SyntheticProbeFailure`; part of `just preflight`. |
 | Native checkpoint tests | Seventeen checks cover spill-boundary continuation, metadata authentication, retained/current reachability, hash-valid malformed manifests, inclusive limits, all save/restore allocation failures, and both pre-replacement and ambiguous publication errors. They also require full manifest checks before bucket reads and save a database over 4 MiB with a 32 KiB manager allocator. Imported-module tests are explicitly included through the dedicated test root. |
 | Portable checkpoint and staging tests | Borrowed-frame restoration survives reused input buffers, source failures, and all allocator failures; malformed headers fail before callbacks. Large repeated batches match final-only canonical effects, and every staging allocation failure permits a correct retry on the same batch. |
 | `just disk-example-smoke` | Bounded queue admission, explicit backpressure, durable background publication, authenticated disk reopen, and typed two-table reads. |

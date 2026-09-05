@@ -31,6 +31,18 @@ wasm-diff:
 fuzz-smoke:
     mise exec -- zig build fuzz-smoke
 
+# Fixed guided corpus through LLVM; the same step campaigns fuzz.
+guided-smoke:
+    mise exec -- zig build guided-coverage --summary all
+
+# Bounded LLVM coverage-guided campaign behind the fail-closed wrapper.
+guided-fuzz cycles="20000" seed="1" timeout="1200":
+    mise exec -- python3 tools/guided-fuzz.py --cycles {{cycles}} --seed {{seed}} --timeout {{timeout}}
+
+# Prove the wrapper fails closed on a deliberate synthetic fuzz failure.
+guided-self-test:
+    mise exec -- python3 tools/guided-fuzz.py --self-test
+
 # Explicit sustained runs. Replay with the same seed and failing case prefix.
 fuzz-portable iterations="100000" seed="1":
     mise exec -- zig build fuzz-portable -Doptimize=ReleaseSafe -- --iterations {{iterations}} --seed {{seed}}
@@ -70,7 +82,7 @@ linux-check:
 core-oracle:
     mise exec -- python3 tools/check-core-oracle.py
 
-preflight: doctor fmt-check ci-lint vectors-check test wasm-diff
+preflight: doctor fmt-check ci-lint vectors-check test wasm-diff guided-self-test
     mise exec -- zig build test -Doptimize=ReleaseSafe --summary all
     mise exec -- zig build check -Dtarget=x86_64-linux --summary all
     mise exec -- python3 tools/package-preflight.py

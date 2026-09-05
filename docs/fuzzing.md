@@ -1,10 +1,11 @@
 # Deterministic parser campaigns
 
 The ordinary `zig build test` gate includes a 1,000-case portable campaign,
-exhaustive allocation failures through one checkpoint continuation, and 100
-native cases. Longer seeded runs are explicit. These are bounded mutation and
-property tests, not a coverage-guided fuzzing engine or exhaustive input search.
-The formats and interfaces remain Experimental.
+exhaustive allocation failures through one checkpoint continuation, the fixed
+guided corpus described below, and 100 native cases. Longer seeded runs are
+explicit. The bounded mutation tests are not exhaustive input search; the
+guided campaigns are coverage-guided exploration. The formats and interfaces
+remain Experimental.
 
 ## Coverage
 
@@ -77,6 +78,75 @@ The three processes ran concurrently and took about 18.5 minutes each, with
 other verification work overlapping. Those durations measure a durability-heavy
 correctness campaign, not storage throughput.
 
+## Coverage-guided campaigns
+
+The same `Guided` oracle runs under Zig's integrated LLVM fuzzer on this
+repository's pinned compiler (macOS ARM64; the self-hosted AArch64 backend
+silently skips `std.testing.fuzz`, so the guided artifacts set `use_llvm`).
+Three fuzz tests — codec, bucket, and checkpoint — execute a fixed seed corpus
+derived from the deterministic corpus above: codec boundary values, empty and
+framed buckets, all 39 checkpoint fixtures with a depth selector byte, and two
+deliberate >128-record seeds. The ordinary `guided-coverage` step (included in
+`test` through `fuzz-smoke`) runs that corpus and fails if a backend skips it.
+
+Sustained campaigns go through `tools/guided-fuzz.py`, a fail-closed wrapper
+that exists because the pinned build runner can exit **zero** after a
+discovered fuzz failure and its `f/crash` file can be **empty**. The wrapper:
+
+- runs `zig build guided-coverage --fuzz=N --seed=S` in a **fresh dedicated
+  cache** under a wall-clock process-group watchdog (`--fuzz=N` bounds mutation
+  cycles per test, not wall time);
+- scans the captured log for failure diagnostics regardless of process status;
+- preserves the campaign's mapped inputs (`f/in*`: 20-byte little-endian
+  `<QIII>` header, then the Smith-framed input; trailing bytes are padding)
+  before anything reuses the cache, validating `20 + length <= file size`;
+- maps each recovered input to its test via the header test index and the
+  report's fuzz-test list;
+- replays every recovered input **exactly** through `zig build fuzz-portable --
+  --replay-target T --replay-mapped F --expect-error E` and exits nonzero
+  unless the reported failure reproduces.
+
+Exit codes distinguish clean completion (0), recovery failure (2), watchdog
+expiry (3), non-fuzz build failure (4), non-reproducing findings (5), and a
+reproduced finding (7). `just guided-self-test` arms a synthetic
+`-Dguided-probe=true` target that fails when its first input byte is 42 and
+requires the wrapper to catch the zero-exit failure, recover the input, and
+replay it exactly; it is part of `just preflight`.
+
+```sh
+mise exec -- just guided-smoke      # fixed corpus through LLVM
+mise exec -- just guided-fuzz 100000 1
+mise exec -- just guided-self-test
+```
+
+Replay tooling is shared, not duplicated: raw inputs take `--replay-raw`,
+Smith-framed inputs `--replay-smith`, and fuzzer cache files `--replay-mapped`;
+`--expect accepted|rejected|oom` or `--expect-error NAME` assert the outcome.
+A real finding is minimized by hand into a checked-in corpus entry with the
+replay command recorded; no automatic crash minimization exists on this pin.
+
+### Recorded guided campaigns
+
+macOS ARM64, ReleaseSafe, fresh cache per campaign, three seeds
+(`1`, `20260904`, `305419896` — build seeds are u32, so the deterministic
+campaigns' `11400714819323198485` cannot be reused verbatim), 100,000 mutation
+cycles per test per campaign
+(23 seconds each; most mutated inputs are rejected by early framing checks):
+
+| Seed | Runs | Unique inputs | Coverage |
+| --- | ---: | ---: | --- |
+| 1 | 301,526 | 1,308 | 1511/11188 (13.51%) |
+| 20260904 | 301,525 | 1,307 | 1510/11188 (13.50%) |
+| 305419896 | 301,476 | 1,258 | 1509/11188 (13.49%) |
+
+No campaign reported failure diagnostics, so no input required recovery or
+replay. Per-seed artifacts (provenance, report, mapped inputs) are preserved
+under `.zig-cache/guided-fuzz/` in the working tree. Coverage counts
+instrumented program counters in the whole test binary — shared by all three
+tests and dominated by code these entry points cannot reach — and is not
+library-statement coverage; the plateau near 13.5% reflects that ceiling, not
+an explored limit of the library.
+
 ## Run and replay
 
 ```sh
@@ -99,7 +169,7 @@ run was repeated with byte-identical output. Native roots use random names but
 their samples and outcomes depend on the seed. The optional native final
 argument supplies a fresh root; use resolved paths without symlinked parents.
 
-Coverage-guided execution, corpus minimization, longer soak campaigns, larger
-resource limits, and physical power-loss testing remain future work. Existing
-deterministic publication-failure and process-restart tests cover different
-failure boundaries and remain separate gates.
+Corpus minimization, longer soak campaigns, larger resource limits, Linux
+coverage-guided runtime validation, and physical power-loss testing remain
+future work. Existing deterministic publication-failure and process-restart
+tests cover different failure boundaries and remain separate gates.

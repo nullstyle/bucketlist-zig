@@ -98,12 +98,15 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(frontier_tests).step);
     check.dependOn(&frontier_tests.step);
 
-    const fuzz_smoke = b.step("fuzz-smoke", "Run bounded deterministic portable and native parser cases");
+    const fuzz_smoke = b.step("fuzz-smoke", "Run bounded deterministic portable, guided corpus, and native parser cases");
     const portable_fuzz_module = b.createModule(.{
         .root_source_file = b.path("src/fuzz_portable.zig"),
         .target = target,
         .optimize = optimize,
     });
+    const portable_options = b.addOptions();
+    portable_options.addOption(bool, "synthetic_probe", b.option(bool, "guided-probe", "Enable the synthetic failing fuzz target used by wrapper self-tests") orelse false);
+    portable_fuzz_module.addOptions("build_options", portable_options);
     const portable_fuzz_tests = b.addTest(.{ .root_module = portable_fuzz_module, .filters = &.{"portable fuzz:"} });
     const portable_fuzz_smoke = b.addRunArtifact(portable_fuzz_tests);
     fuzz_smoke.dependOn(&portable_fuzz_smoke.step);
@@ -111,8 +114,19 @@ pub fn build(b: *std.Build) void {
     const portable_fuzz = b.addExecutable(.{ .name = "fuzz-portable", .root_module = portable_fuzz_module });
     const portable_fuzz_run = b.addRunArtifact(portable_fuzz);
     portable_fuzz_run.addPassthruArgs();
-    b.step("fuzz-portable", "Exercise portable parsers; -- --iterations N --seed N").dependOn(&portable_fuzz_run.step);
+    b.step("fuzz-portable", "Exercise portable parsers; -- --iterations N --seed N, or --replay-target/--replay-mapped for exact input replay").dependOn(&portable_fuzz_run.step);
     check.dependOn(&portable_fuzz.step);
+    // The self-hosted AArch64 backend silently skips std.testing.fuzz, so the
+    // guided corpus and coverage campaigns require LLVM explicitly.
+    const guided_tests = b.addTest(.{ .root_module = portable_fuzz_module, .filters = &.{"portable guided:"} });
+    guided_tests.use_llvm = true;
+    const guided_run = b.addRunArtifact(guided_tests);
+    fuzz_smoke.dependOn(&guided_run.step);
+    check.dependOn(&guided_tests.step);
+    b.step("guided-coverage", "Run the fixed guided corpus; pass --fuzz=N --seed=N for LLVM coverage-guided campaigns").dependOn(&guided_run.step);
+    const guided_probe_tests = b.addTest(.{ .root_module = portable_fuzz_module, .filters = &.{"portable guided probe:"} });
+    guided_probe_tests.use_llvm = true;
+    b.step("guided-probe-coverage", "Fuzz the synthetic probe target; requires -Dguided-probe=true (wrapper self-test)").dependOn(&b.addRunArtifact(guided_probe_tests).step);
     const native_fuzz = b.addExecutable(.{
         .name = "fuzz-native",
         .root_module = b.createModule(.{
