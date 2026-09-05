@@ -37,5 +37,9 @@ with tempfile.TemporaryDirectory(prefix="bucketlist-package-") as scratch:
         ["zig", "build", "run", "--build-file", "examples/persistent-directory/build.zig", "--", str(scratch / "native-store")],
         cwd=extracted, check=True,
     )
+    subprocess.run(
+        ["zig", "build", "run", "--build-file", "examples/disk-directory/build.zig", "--", str(scratch / "disk-store")],
+        cwd=extracted, check=True,
+    )
     package_hash = subprocess.check_output(["zig", "fetch", str(archive)], cwd=scratch, text=True).strip()
     print(f"[package-preflight] clean extracted tests + standalone consumer passed; {package_hash}")

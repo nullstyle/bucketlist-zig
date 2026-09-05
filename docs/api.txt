@@ -49,3 +49,51 @@ Reference.manifest_hash: [32]u8
 Reference.database_digest: [32]u8
 CheckpointLimits.max_checkpoint_bytes: usize
 CheckpointLimits.max_metadata_bytes: usize
+DiskDatabase.open: fn (mem.Allocator, Io, []const u8, disk.DatabaseWithDepth(api.Schema,11).Options) @typeInfo(@typeInfo(@TypeOf(disk.DatabaseWithDepth(api.Schema,11).open)).@"fn".return_type.?).error_union.error_set!*disk.DatabaseWithDepth(api.Schema,11)
+DiskDatabase.deinit: fn (*disk.DatabaseWithDepth(api.Schema,11)) void
+DiskDatabase.commitment: fn (*const disk.DatabaseWithDepth(api.Schema,11)) database.Commitment
+DiskDatabase.reference: fn (*const disk.DatabaseWithDepth(api.Schema,11)) disk.Reference
+DiskDatabase.metadata: fn (*const disk.DatabaseWithDepth(api.Schema,11)) []const u8
+DiskDatabase.get: fn (*disk.DatabaseWithDepth(api.Schema,11), comptime meta.FieldEnum(api.Schema.tables__struct_ANON), anytype) @typeInfo(@typeInfo(@TypeOf(disk.DatabaseWithDepth(api.Schema,11).get)).@"fn".return_type.?).error_union.error_set!anytype
+DiskDatabase.prepare: fn (*disk.DatabaseWithDepth(api.Schema,11), u64, *disk.DatabaseWithDepth(api.Schema,11).Batch, []const u8) @typeInfo(@typeInfo(@TypeOf(disk.DatabaseWithDepth(api.Schema,11).prepare)).@"fn".return_type.?).error_union.error_set!disk.DatabaseWithDepth(api.Schema,11).Prepared
+DiskDatabase.readView: fn (*disk.DatabaseWithDepth(api.Schema,11)) @typeInfo(@typeInfo(@TypeOf(disk.DatabaseWithDepth(api.Schema,11).readView)).@"fn".return_type.?).error_union.error_set!*disk.DatabaseWithDepth(api.Schema,11).ReadView
+DiskDatabase.collect: fn (*disk.DatabaseWithDepth(api.Schema,11), []const disk.Reference) @typeInfo(@typeInfo(@TypeOf(disk.DatabaseWithDepth(api.Schema,11).collect)).@"fn".return_type.?).error_union.error_set!usize
+DiskBatch.init: fn (mem.Allocator) disk.DatabaseWithDepth(api.Schema,11).Batch
+DiskBatch.initBounded: fn (mem.Allocator, usize, usize) disk.DatabaseWithDepth(api.Schema,11).Batch
+DiskBatch.deinit: fn (*disk.DatabaseWithDepth(api.Schema,11).Batch) void
+DiskBatch.checkLimits: fn (*const disk.DatabaseWithDepth(api.Schema,11).Batch, disk.DatabaseWithDepth(api.Schema,11).Options) @typeInfo(@typeInfo(@TypeOf(disk.DatabaseWithDepth(api.Schema,11).Batch.checkLimits)).@"fn".return_type.?).error_union.error_set!void
+DiskBatch.put: fn (*disk.DatabaseWithDepth(api.Schema,11).Batch, comptime meta.FieldEnum(api.Schema.tables__struct_ANON), anytype, anytype) @typeInfo(@typeInfo(@TypeOf(disk.DatabaseWithDepth(api.Schema,11).Batch.put)).@"fn".return_type.?).error_union.error_set!void
+DiskBatch.delete: fn (*disk.DatabaseWithDepth(api.Schema,11).Batch, comptime meta.FieldEnum(api.Schema.tables__struct_ANON), anytype) @typeInfo(@typeInfo(@TypeOf(disk.DatabaseWithDepth(api.Schema,11).Batch.delete)).@"fn".return_type.?).error_union.error_set!void
+DiskPrepared.commitment: fn (*const disk.DatabaseWithDepth(api.Schema,11).Prepared) database.Commitment
+DiskPrepared.deinit: fn (*disk.DatabaseWithDepth(api.Schema,11).Prepared) void
+DiskPrepared.commit: fn (*disk.DatabaseWithDepth(api.Schema,11).Prepared) @typeInfo(@typeInfo(@TypeOf(disk.DatabaseWithDepth(api.Schema,11).Prepared.commit)).@"fn".return_type.?).error_union.error_set!void
+DiskReadView.commitment: fn (*const disk.DatabaseWithDepth(api.Schema,11).ReadView) database.Commitment
+DiskReadView.reference: fn (*const disk.DatabaseWithDepth(api.Schema,11).ReadView) disk.Reference
+DiskReadView.get: fn (*disk.DatabaseWithDepth(api.Schema,11).ReadView, comptime meta.FieldEnum(api.Schema.tables__struct_ANON), anytype) @typeInfo(@typeInfo(@TypeOf(disk.DatabaseWithDepth(api.Schema,11).ReadView.get)).@"fn".return_type.?).error_union.error_set!anytype
+DiskReadView.deinit: fn (*disk.DatabaseWithDepth(api.Schema,11).ReadView) void
+DiskOptions.merge_workers: usize
+DiskOptions.max_batch_bytes: usize
+DiskOptions.max_batch_changes: usize
+DiskOptions.max_metadata_bytes: usize
+DiskOptions.max_bucket_bytes: u64
+DiskOptions.max_bucket_records: u64
+DiskOptions.max_read_views: usize
+DiskOptions.expected: ?disk.Reference
+DiskReference.manifest_hash: [32]u8
+DiskReference.database_digest: [32]u8
+Host.create: fn (mem.Allocator, Io, []const u8, host.Host(api.Schema).Options) @typeInfo(@typeInfo(@TypeOf(host.Host(api.Schema).create)).@"fn".return_type.?).error_union.error_set!*host.Host(api.Schema)
+Host.deinit: fn (*host.Host(api.Schema)) void
+Host.trySubmit: fn (*host.Host(api.Schema), u64, *disk.DatabaseWithDepth(api.Schema,11).Batch, []const u8) @typeInfo(@typeInfo(@TypeOf(host.Host(api.Schema).trySubmit)).@"fn".return_type.?).error_union.error_set!void
+Host.status: fn (*host.Host(api.Schema)) host.Host(api.Schema).Status
+Host.wait: fn (*host.Host(api.Schema), u64) @typeInfo(@typeInfo(@TypeOf(host.Host(api.Schema).wait)).@"fn".return_type.?).error_union.error_set!void
+Host.snapshot: fn (*host.Host(api.Schema), mem.Allocator) @typeInfo(@typeInfo(@TypeOf(host.Host(api.Schema).snapshot)).@"fn".return_type.?).error_union.error_set!host.Host(api.Schema).Snapshot
+Host.pause: fn (*host.Host(api.Schema)) void
+Host.resumeProcessing: fn (*host.Host(api.Schema)) void
+HostSnapshot.deinit: fn (*host.Host(api.Schema).Snapshot) void
+HostOptions.capacity: usize
+HostOptions.disk: disk.DatabaseWithDepth(api.Schema,11).Options
+HostStatus.accepted: u64
+HostStatus.durable: u64
+HostStatus.queued: usize
+HostStatus.capacity: usize
+HostStatus.failure: ?anyerror

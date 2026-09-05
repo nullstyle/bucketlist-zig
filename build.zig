@@ -29,6 +29,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "bucketlist-store", .module = store }},
     });
+    const disk = b.addModule("bucketlist-disk", .{
+        .root_source_file = b.path("src/native.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "bucketlist", .module = lib },
+            .{ .name = "bucketlist-store", .module = store },
+        },
+    });
     const tests = b.addTest(.{ .root_module = lib });
     const test_step = b.step("test", "Run codec, schema, database, bucket, and native store tests");
     const check = b.step("check", "Compile all native tests and example without executing them");
@@ -63,6 +72,32 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(checkpoint_tests).step);
     check.dependOn(&checkpoint_tests.step);
 
+    const disk_tests = b.addTest(.{
+        .filters = &.{ "disk:", "host:" },
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/disk_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "bucketlist", .module = lib },
+                .{ .name = "bucketlist-store", .module = store },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(disk_tests).step);
+    check.dependOn(&disk_tests.step);
+    b.step("disk-test", "Run native disk and background host tests").dependOn(&b.addRunArtifact(disk_tests).step);
+    const frontier_tests = b.addTest(.{
+        .filters = &.{"frontier:"},
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/frontier_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(frontier_tests).step);
+    check.dependOn(&frontier_tests.step);
+
     const example = b.addExecutable(.{
         .name = "directory",
         .root_module = b.createModule(.{
@@ -96,6 +131,25 @@ pub fn build(b: *std.Build) void {
     _ = persistent_run.addOutputDirectoryArg("store");
     b.step("persistent-example-smoke", "Run native checkpoint publication and recovery").dependOn(&persistent_run.step);
     test_step.dependOn(&persistent_run.step);
+
+    const disk_example = b.addExecutable(.{
+        .name = "disk-directory",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/disk-directory/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "bucketlist", .module = lib },
+                .{ .name = "bucketlist-disk", .module = disk },
+            },
+        }),
+    });
+    b.installArtifact(disk_example);
+    check.dependOn(&disk_example.step);
+    const disk_run = b.addRunArtifact(disk_example);
+    _ = disk_run.addOutputDirectoryArg("store");
+    b.step("disk-example-smoke", "Run bounded background publication and disk recovery").dependOn(&disk_run.step);
+    test_step.dependOn(&disk_run.step);
 
     const bench = b.addExecutable(.{
         .name = "bucketlist-bench",
@@ -132,6 +186,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "bucketlist", .module = lib },
                 .{ .name = "bucketlist-checkpoints", .module = checkpoints },
+                .{ .name = "bucketlist-disk", .module = disk },
             },
         }),
     });

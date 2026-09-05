@@ -1,5 +1,6 @@
 const std = @import("std");
 const lib = @import("bucketlist");
+const native = @import("bucketlist-disk");
 const checkpoints = @import("bucketlist-checkpoints");
 const Schema = struct {
     pub const namespace = "api";
@@ -25,6 +26,18 @@ pub fn main() void {
     describe("Restored", checkpoints.Checkpoints(Db).Restored);
     describeFields("Reference", checkpoints.Reference);
     describeFields("CheckpointLimits", checkpoints.Limits);
+    const Disk = native.Database(Schema);
+    const Host = native.Host(Schema);
+    describe("DiskDatabase", Disk);
+    describe("DiskBatch", Disk.Batch);
+    describe("DiskPrepared", Disk.Prepared);
+    describe("DiskReadView", Disk.ReadView);
+    describeFields("DiskOptions", Disk.Options);
+    describeFields("DiskReference", native.Reference);
+    describe("Host", Host);
+    describe("HostSnapshot", Host.Snapshot);
+    describeFields("HostOptions", Host.Options);
+    describeFields("HostStatus", Host.Status);
 }
 
 fn describeFields(comptime label: []const u8, comptime Container: type) void {
