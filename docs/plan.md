@@ -203,7 +203,10 @@ or byte layouts before that work:
 The BucketList is not a general Merkle search tree with logarithmic record
 proofs. Keep membership/non-membership proofs out of the advertised v0.1
 contract. A slow sorted-map digest may be useful as a test oracle, but it is
-not the fast BucketList root.
+not the fast BucketList root. That exclusion holds for v1 profiles;
+[ADR 0002](adr/0002-block-hashed-v2-buckets-and-record-proofs.md) records the
+accepted opt-in v2 profile decision that adds block-hashed buckets and record
+proofs without touching any v1 history.
 
 ## 5. Implementation shape
 

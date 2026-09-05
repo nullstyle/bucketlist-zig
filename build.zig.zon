@@ -3,6 +3,11 @@
     .fingerprint = 0x6a9e7a04f47d9082,
     .version = "0.1.0-dev",
     .minimum_zig_version = "0.17.0-dev.1786",
-    .dependencies = .{},
+    .dependencies = .{
+        .none = .{
+            .url = "git+https://github.com/nullstyle/capnp-zig.git?ref=v0.18.0#51e6da819fa2eb1e646c0d4157c11a4108348b76",
+            .hash = "capnpc_zig-0.18.0-nUduFTdRNwBzlJgTt6x9lUwRGmpWzSVXrMSE-xFj_dND",
+        },
+    },
     .paths = .{ "build.zig", "build.zig.zon", "src", "tests", "examples/directory", "examples/persistent-directory", "examples/disk-directory", "tools", "vectors", "docs/api.txt" },
 }
