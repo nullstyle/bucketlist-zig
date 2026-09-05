@@ -5,6 +5,7 @@ export Table
 export Definition
 export Database
 export Commitment
+export proofs
 Database.init: fn (mem.Allocator) database.DatabaseWithDepth(api.Schema,11)
 Database.deinit: fn (*database.DatabaseWithDepth(api.Schema,11)) void
 Database.commitment: fn (*const database.DatabaseWithDepth(api.Schema,11)) database.Commitment

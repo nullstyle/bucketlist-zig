@@ -5,6 +5,7 @@ pub const Table = @import("schema.zig").Table;
 pub const Definition = @import("schema.zig").Definition;
 pub const Database = @import("database.zig").Database;
 pub const Commitment = @import("database.zig").Commitment;
+pub const proofs = @import("proofs.zig");
 
 test {
     _ = @import("codec.zig");
@@ -14,4 +15,5 @@ test {
     _ = @import("database.zig");
     _ = @import("checkpoint_stream_test.zig");
     _ = @import("vectors_test.zig");
+    _ = proofs;
 }
