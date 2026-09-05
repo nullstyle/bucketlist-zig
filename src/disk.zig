@@ -260,19 +260,8 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             if (meta.len > self.options.max_metadata_bytes) return error.MetadataTooLarge;
             const owned_meta = try self.gpa.dupe(u8, meta);
             errdefer self.gpa.free(owned_meta);
-            var rows: std.ArrayList(Record) = .empty;
+            var rows = try self.normalize(batch.changes.items);
             defer rows.deinit(self.gpa);
-            try rows.ensureTotalCapacity(self.gpa, batch.changes.items.len);
-            for (batch.changes.items) |row| {
-                var old = try self.lookup(&self.frontier, row.table, row.key);
-                defer old.deinit(self.gpa);
-                const changed = if (row.value) |v| switch (old) {
-                    .value => |previous| !std.mem.eql(u8, v, previous),
-                    else => true,
-                } else old == .value;
-                if (changed) rows.appendAssumeCapacity(row);
-            }
-            std.mem.sort(Record, rows.items, {}, less);
             const fresh = try encodeBucket(self.gpa, rows.items);
             defer self.gpa.free(fresh);
             const hash = try self.store.putBlob(fresh);
@@ -283,6 +272,56 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             const ref = try self.writeManifest(&state, meta);
             self.prepared_open = true;
             return .{ .owner = self, .state = state, .meta = owned_meta, .ref = ref };
+        }
+
+        /// Merge-joins sorted changes with each visible bucket once. Decisions
+        /// use youngest-first precedence, including tombstones, and remain
+        /// private until every scanned file reaches its authenticated EOF.
+        fn normalize(self: *Self, changes: []const Record) !std.ArrayList(Record) {
+            var rows: std.ArrayList(Record) = .empty;
+            errdefer rows.deinit(self.gpa);
+            try rows.appendSlice(self.gpa, changes);
+            std.mem.sort(Record, rows.items, {}, less);
+            const Decision = enum { unresolved, keep, omit };
+            const decisions = try self.gpa.alloc(Decision, rows.items.len);
+            defer self.gpa.free(decisions);
+            @memset(decisions, .unresolved);
+            var remaining = rows.items.len;
+            levels: for (self.frontier.levels) |level| {
+                for ([_]Hash{ level.curr, level.snap }) |hash| {
+                    if (remaining == 0) break :levels;
+                    var cursor = try self.store.scanBucket(hash, self.mergeLimits());
+                    defer cursor.deinit();
+                    var index: usize = 0;
+                    while (try cursor.next()) |old| {
+                        while (index < rows.items.len and
+                            (decisions[index] != .unresolved or less({}, rows.items[index], old))) : (index += 1)
+                        {}
+                        if (index == rows.items.len) {
+                            try cursor.finish();
+                            break;
+                        }
+                        const row = rows.items[index];
+                        if (less({}, old, row)) continue;
+                        const changed = if (row.value) |value|
+                            if (old.value) |previous| !std.mem.eql(u8, value, previous) else true
+                        else
+                            old.value != null;
+                        decisions[index] = if (changed) .keep else .omit;
+                        remaining -= 1;
+                        index += 1;
+                    }
+                }
+            }
+            var count: usize = 0;
+            for (rows.items, decisions) |row, decision| {
+                if (decision == .keep or (decision == .unresolved and row.value != null)) {
+                    rows.items[count] = row;
+                    count += 1;
+                }
+            }
+            rows.items.len = count;
+            return rows;
         }
 
         const Work = struct {
