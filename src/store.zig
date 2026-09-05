@@ -18,13 +18,74 @@ pub const Error = error{
     InvalidBucket,
 };
 
-/// Per-record workspace and total-work limits for native streaming merges.
+/// Per-record workspace and total-work limits for native bucket reads/merges.
 /// These are local resource policies, not part of the bucket hash encoding.
 pub const MergeLimits = struct {
     max_key_bytes: u32 = 64 * 1024,
     max_value_bytes: u32 = 1024 * 1024,
     max_records: u64 = 1 << 32,
     max_bucket_bytes: u64 = 1 << 40,
+};
+
+/// Slices borrow the cursor and are invalidated by its next/finish/deinit call.
+/// A record is provisional until the cursor reaches verified EOF successfully.
+pub const BucketRecord = struct {
+    table: u32,
+    key: []const u8,
+    value: ?[]const u8,
+};
+
+/// A verified lookup distinguishes no record, deletion, and a live empty value.
+/// A value allocation belongs to the allocator passed to lookupBucket.
+pub const BucketLookup = union(enum) {
+    absent,
+    tombstone,
+    value: []u8,
+
+    pub fn deinit(self: *BucketLookup, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .value => |bytes| gpa.free(bytes),
+            else => {},
+        }
+        self.* = .absent;
+    }
+};
+
+/// Owned bounded-memory scan. Do not copy; deinit closes its file and workspace.
+/// Stop only after next returns null or finish succeeds to verify the hash,
+/// order, framing, counts, and EOF. Deinit alone abandons verification.
+pub const BucketCursor = struct {
+    reader: BucketReader,
+    record_count: u64,
+    failure: ?Error = null,
+
+    /// File/header metadata is provisional until verified EOF or finish.
+    pub fn byteLength(self: *const BucketCursor) u64 {
+        return self.reader.size;
+    }
+
+    pub fn recordCount(self: *const BucketCursor) u64 {
+        return self.record_count;
+    }
+
+    pub fn deinit(self: *BucketCursor) void {
+        self.reader.deinit();
+        self.* = undefined;
+    }
+
+    pub fn next(self: *BucketCursor) Error!?BucketRecord {
+        if (self.failure) |err| return err;
+        self.reader.advance() catch |err| {
+            self.failure = err;
+            return err;
+        };
+        return self.reader.current;
+    }
+
+    /// Drain the unread suffix and authenticate the complete bucket.
+    pub fn finish(self: *BucketCursor) Error!void {
+        while (try self.next() != null) {}
+    }
 };
 
 const magic = "BKLSTOR1";
@@ -49,7 +110,11 @@ pub const Store = struct {
     lock: std.Io.File,
 
     /// Owns open directory and exclusive advisory lock handles. The allocator
-    /// must remain valid until deinit. Calls on one Store must be serialized.
+    /// and Io must remain valid until deinit and support every calling thread.
+    /// With thread-safe allocator/Io, immutable blob reads, puts, and merges may
+    /// run concurrently on one Store. Do not mutate Store fields during use.
+    /// Each cursor has one owner. Serialize publication/recovery decisions;
+    /// collect and deinit require no active calls, cursors, or background jobs.
     pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) Error!Store {
         if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos)
             return error.UnsupportedPlatform;
@@ -143,6 +208,33 @@ pub const Store = struct {
         return bytes;
     }
 
+    /// The cursor owns a file handle and 2*max_key+max_value+8192 scratch bytes
+    /// from the Store allocator. Its allocator and Io must outlive the cursor.
+    /// Record slices are provisional until successful verified EOF.
+    pub fn scanBucket(self: *Store, hash: Hash, limits: MergeLimits) Error!BucketCursor {
+        const reader = try BucketReader.init(self, hash, limits);
+        return .{ .reader = reader, .record_count = reader.remaining };
+    }
+
+    /// Stream and verify the WHOLE bucket, even after finding the key. Runtime
+    /// is O(bucket bytes); memory is cursor scratch plus at most one value copy.
+    /// All failures free a captured value and return no unverified result.
+    pub fn lookupBucket(self: *Store, gpa: std.mem.Allocator, hash: Hash, table: u32, key: []const u8, limits: MergeLimits) Error!BucketLookup {
+        if (key.len > limits.max_key_bytes) return error.TooLarge;
+        var cursor = try self.scanBucket(hash, limits);
+        defer cursor.deinit();
+        var result: BucketLookup = .absent;
+        errdefer result.deinit(gpa);
+        while (try cursor.next()) |record| {
+            if (record.table != table or !std.mem.eql(u8, record.key, key)) continue;
+            result = if (record.value) |value|
+                .{ .value = gpa.dupe(u8, value) catch return error.OutOfMemory }
+            else
+                .tombstone;
+        }
+        return result;
+    }
+
     /// Merge canonical sorted buckets with newest-record precedence. The
     /// caller may drop tombstones only at a boundary with no older records.
     /// Two fully verified passes use bounded record workspace, independent of
@@ -182,6 +274,8 @@ pub const Store = struct {
     /// Publish an opaque application manifest after putBlob has durably
     /// installed EVERY referenced blob. This layer cannot inspect references.
     /// After a post-rename error the new manifest may already be visible.
+    /// An owner may publish alongside independent blob jobs, but must await
+    /// every referenced output and serialize its own publication decisions.
     pub fn publish(self: *Store, manifest_bytes: []const u8) Error!void {
         return self.publishImpl(manifest_bytes, .none);
     }
@@ -237,6 +331,7 @@ pub const Store = struct {
     /// retained checkpoints, active readers, and pending publications' blobs.
     /// Only regular files with exactly 64 lowercase hex characters are removed.
     /// Unknown names, symlinks, directories, and atomic-write debris survive.
+    /// Caller must quiesce all blob jobs/cursors before collecting.
     pub fn collect(self: *Store, reachable: []const Hash) Error!usize {
         var removed: usize = 0;
         var iter = self.blobs.iterate();
@@ -269,11 +364,7 @@ const bucket_domain = "bucketlist.bucket.v1\x00";
 const empty_bucket = bucket_domain ++ "\x00\x00\x00\x00\x00\x00\x00\x00";
 const stream_buffer_len = 8192;
 
-const StreamRecord = struct {
-    table: u32,
-    key: []const u8,
-    value: ?[]const u8,
-};
+const StreamRecord = BucketRecord;
 
 fn recordOrder(a: StreamRecord, b: StreamRecord) std.math.Order {
     if (a.table != b.table) return std.math.order(a.table, b.table);
@@ -916,6 +1007,128 @@ const fixture_terminal = bucket_domain ++ "\x00\x00\x00\x00\x00\x00\x00\x03" ++
     "\x00\x00\x00\x01\x00\x00\x00\x01c\x01\x00\x00\x00\x00" ++
     "\x00\x00\x00\x02\x00\x00\x00\x01a\x01\x00\x00\x00\x05other";
 
+test "verified bucket lookup distinguishes absent, tombstone, empty, and table identity" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    const hash = try store.putBlob(fixture_merged);
+    var absent = try store.lookupBucket(testing.allocator, hash, 1, "missing", .{});
+    defer absent.deinit(testing.allocator);
+    try testing.expect(absent == .absent);
+    var tombstone = try store.lookupBucket(testing.allocator, hash, 1, "a", .{});
+    defer tombstone.deinit(testing.allocator);
+    try testing.expect(tombstone == .tombstone);
+    var empty = try store.lookupBucket(testing.allocator, hash, 1, "c", .{});
+    defer empty.deinit(testing.allocator);
+    try testing.expect(empty == .value);
+    try testing.expectEqualStrings("", empty.value);
+    var value = try store.lookupBucket(testing.allocator, hash, 1, "b", .{});
+    defer value.deinit(testing.allocator);
+    try testing.expectEqualStrings("new", value.value);
+    var other = try store.lookupBucket(testing.allocator, hash, 2, "a", .{});
+    defer other.deinit(testing.allocator);
+    try testing.expectEqualStrings("other", other.value);
+
+    var cursor = try store.scanBucket(hash, .{});
+    defer cursor.deinit();
+    try testing.expectEqual(@as(u64, fixture_merged.len), cursor.byteLength());
+    try testing.expectEqual(@as(u64, 4), cursor.recordCount());
+    const first = (try cursor.next()).?;
+    try testing.expectEqual(@as(u32, 1), first.table);
+    try testing.expectEqualStrings("a", first.key);
+    try testing.expect(first.value == null);
+    const second = (try cursor.next()).?;
+    try testing.expectEqualStrings("b", second.key);
+    try testing.expectEqualStrings("new", second.value.?);
+    try cursor.finish();
+    try testing.expectEqual(@as(u64, 4), cursor.recordCount());
+    try testing.expect(try cursor.next() == null);
+    try cursor.finish();
+    var empty_cursor = try store.scanBucket(try store.putBlob(empty_bucket), .{});
+    defer empty_cursor.deinit();
+    try testing.expect(try empty_cursor.next() == null);
+}
+
+test "lookup and scan reject corrupt tails after an early matching record" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    const hash = try store.putBlob(fixture_old);
+    const name = std.fmt.bytesToHex(hash, .lower);
+    const file = try store.blobs.openFile(testing.io, &name, .{ .mode = .read_write });
+    try file.writePositionalAll(testing.io, "X", fixture_old.len - 1);
+    file.close(testing.io);
+    try testing.expectError(error.CorruptBlob, store.lookupBucket(testing.allocator, hash, 1, "a", .{}));
+    try testing.expectError(error.CorruptBlob, store.lookupBucket(testing.allocator, hash, 99, "absent", .{}));
+    var cursor = try store.scanBucket(hash, .{});
+    defer cursor.deinit();
+    // Streaming records are only provisional; successful early parsing cannot
+    // certify the unread tail. An error stays sticky until cursor destruction.
+    try testing.expectEqualStrings("old", (try cursor.next()).?.value.?);
+    try testing.expectError(error.CorruptBlob, cursor.finish());
+    try testing.expectError(error.CorruptBlob, cursor.next());
+    try testing.expectError(error.CorruptBlob, cursor.finish());
+
+    const trailing = try store.putBlob(fixture_new ++ "x");
+    try testing.expectError(error.InvalidBucket, store.lookupBucket(testing.allocator, trailing, 1, "a", .{}));
+    const bounded = try store.putBlob(fixture_new);
+    try testing.expectError(error.TooLarge, store.lookupBucket(testing.allocator, bounded, 1, "a", .{ .max_value_bytes = 2 }));
+    try testing.expectError(error.TooLarge, store.lookupBucket(testing.allocator, bounded, 1, "long", .{ .max_key_bytes = 1 }));
+}
+
+fn drainBucket(store: *Store, hash: Hash, limits: MergeLimits) Error!void {
+    var cursor = try store.scanBucket(hash, limits);
+    defer cursor.deinit();
+    try cursor.finish();
+}
+
+test "public bucket scans enforce canonical framing and declared resource bounds" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    const duplicate = bucket_domain ++ "\x00\x00\x00\x00\x00\x00\x00\x02" ++
+        "\x00\x00\x00\x01\x00\x00\x00\x01a\x00" ++
+        "\x00\x00\x00\x01\x00\x00\x00\x01a\x00";
+    const unordered = bucket_domain ++ "\x00\x00\x00\x00\x00\x00\x00\x02" ++
+        "\x00\x00\x00\x01\x00\x00\x00\x01b\x00" ++
+        "\x00\x00\x00\x01\x00\x00\x00\x01a\x00";
+    const invalid_tag = bucket_domain ++ "\x00\x00\x00\x00\x00\x00\x00\x01" ++
+        "\x00\x00\x00\x01\x00\x00\x00\x00\x02";
+    for ([_][]const u8{ duplicate, unordered, invalid_tag, fixture_new[0 .. fixture_new.len - 1], empty_bucket ++ "x", "bad domain" }) |bytes| {
+        try testing.expectError(error.InvalidBucket, drainBucket(&store, try store.putBlob(bytes), .{}));
+    }
+    const huge_count = bucket_domain ++ "\xff\xff\xff\xff\xff\xff\xff\xff";
+    try testing.expectError(error.TooLarge, drainBucket(&store, try store.putBlob(huge_count), .{}));
+    const huge_key = bucket_domain ++ "\x00\x00\x00\x00\x00\x00\x00\x01" ++
+        "\x00\x00\x00\x01\xff\xff\xff\xff\x00";
+    try testing.expectError(error.TooLarge, drainBucket(&store, try store.putBlob(huge_key), .{}));
+    const huge_value = bucket_domain ++ "\x00\x00\x00\x00\x00\x00\x00\x01" ++
+        "\x00\x00\x00\x01\x00\x00\x00\x00\x01\xff\xff\xff\xff";
+    try testing.expectError(error.TooLarge, drainBucket(&store, try store.putBlob(huge_value), .{}));
+    const hash = try store.putBlob(fixture_new);
+    try testing.expectError(error.TooLarge, drainBucket(&store, hash, .{ .max_records = 2 }));
+    try testing.expectError(error.TooLarge, drainBucket(&store, hash, .{ .max_bucket_bytes = fixture_new.len - 1 }));
+    try drainBucket(&store, hash, .{ .max_key_bytes = 1, .max_value_bytes = 3, .max_records = 3, .max_bucket_bytes = fixture_new.len });
+}
+
+test "bucket lookup allocation failures release cursor and captured value" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    const hash = try store.putBlob(fixture_old);
+    for (0..2) |index| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = index });
+        store.gpa = failing.allocator();
+        try testing.expectError(error.OutOfMemory, store.lookupBucket(failing.allocator(), hash, 1, "a", .{}));
+        try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+    store.gpa = testing.allocator;
+}
+
 test "streaming merge matches canonical core fixture and newest/tombstone semantics" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1002,6 +1215,98 @@ fn manyRecords(gpa: std.mem.Allocator, count: u32, parity: u32) ![]u8 {
         pos += 21;
     }
     return bytes;
+}
+
+test "public scans and verified lookup keep fixed workspace across large buckets" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    const bytes = try manyRecords(testing.allocator, 100000, 0);
+    defer testing.allocator.free(bytes);
+    const hash = try store.putBlob(bytes);
+    var workspace: [8300]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&workspace);
+    store.gpa = fixed.allocator();
+    const limits: MergeLimits = .{ .max_key_bytes = 4, .max_value_bytes = 4 };
+    {
+        var cursor = try store.scanBucket(hash, limits);
+        defer cursor.deinit();
+        var count: usize = 0;
+        while (try cursor.next()) |record| {
+            const expected: u32 = @intCast(count * 2);
+            try testing.expectEqual(expected, std.mem.readInt(u32, record.key[0..4], .big));
+            try testing.expectEqual(expected, std.mem.readInt(u32, record.value.?[0..4], .big));
+            count += 1;
+        }
+        try testing.expectEqual(@as(usize, 100000), count);
+    }
+    try testing.expectEqual(@as(usize, 0), fixed.end_index);
+    var value = try store.lookupBucket(testing.allocator, hash, 1, "\x00\x00\x00\x00", limits);
+    defer value.deinit(testing.allocator);
+    try testing.expectEqualStrings("\x00\x00\x00\x00", value.value);
+    try testing.expectEqual(@as(usize, 0), fixed.end_index);
+    var absent = try store.lookupBucket(testing.allocator, hash, 1, "\xff\xff\xff\xff", limits);
+    defer absent.deinit(testing.allocator);
+    try testing.expect(absent == .absent);
+    try testing.expectEqual(@as(usize, 0), fixed.end_index);
+}
+
+test "one store supports concurrent immutable puts merges and independent cursors" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    const old = try store.putBlob(fixture_old);
+    const new = try store.putBlob(fixture_new);
+    const expected = digest(fixture_merged);
+    var start: std.atomic.Value(bool) = .init(false);
+    const Job = struct {
+        store: *Store,
+        old: Hash,
+        new: Hash,
+        expected: Hash,
+        start: *std.atomic.Value(bool),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            self.work() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn work(self: *@This()) !void {
+            for (0..4) |_| {
+                try testing.expectEqual(self.expected, try self.store.mergeBuckets(self.old, self.new, false, .{ .max_key_bytes = 1, .max_value_bytes = 5 }));
+                try testing.expectEqual(self.expected, try self.store.putBlob(fixture_merged));
+                var value = try self.store.lookupBucket(testing.allocator, self.expected, 1, "b", .{ .max_key_bytes = 1, .max_value_bytes = 5 });
+                defer value.deinit(testing.allocator);
+                try testing.expectEqualStrings("new", value.value);
+                var cursor = try self.store.scanBucket(self.expected, .{ .max_key_bytes = 1, .max_value_bytes = 5 });
+                defer cursor.deinit();
+                try cursor.finish();
+                try testing.expectEqual(@as(u64, 4), cursor.recordCount());
+            }
+        }
+    };
+    var jobs: [4]Job = @splat(.{ .store = &store, .old = old, .new = new, .expected = expected, .start = &start });
+    var threads: [4]std.Thread = undefined;
+    var started: usize = 0;
+    {
+        // Release already-spawned threads even if a later spawn fails.
+        defer {
+            start.store(true, .release);
+            for (threads[0..started]) |thread| thread.join();
+        }
+        for (&jobs, &threads) |*job, *thread| {
+            thread.* = try std.Thread.spawn(.{}, Job.run, .{job});
+            started += 1;
+        }
+        start.store(true, .release);
+    }
+    for (jobs) |job| if (job.failure) |err| return err;
+    try drainBucket(&store, expected, .{});
 }
 
 test "streaming merge uses fixed workspace for many records and existing large output" {

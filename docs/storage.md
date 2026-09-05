@@ -6,12 +6,17 @@ The deterministic database and BucketList layers define the bytes and references
 the store neither interprets a schema nor decides which state is authoritative.
 For typed checkpoint publication, application metadata, and automatic reference
 discovery during collection, use [Checkpoints(DatabaseType)](checkpoints.md).
+The [disk engine and bounded host](disk.md) build on the same primitives; that
+architectural phase is in progress.
 
 `Store.open(gpa, io, path)` returns an owned value. Call `deinit` exactly once.
 An exclusive advisory `LOCK` file prevents another cooperating store from opening
-the same directory. Calls on one Store must be serialized; there is no internal
-thread synchronization. Readers receive owned byte allocations and free them with
-the allocator supplied to the read.
+the same directory. With a thread-safe allocator and `std.Io`, immutable blob
+reads, puts, merges, and independent cursors may run concurrently on one Store.
+Do not mutate Store fields during use; each cursor has one owner. Serialize
+publication and recovery decisions. Collection and deinitialization require
+quiescence: no active calls, cursors, or background jobs. Readers receive owned
+byte allocations and free them with the allocator supplied to the read.
 
 The directory layout is:
 
@@ -37,6 +42,29 @@ Successful `putBlob` means the blob is durable before its hash is returned.
 inclusive byte limit before allocation and during reading, and recomputes the
 hash before returning. Empty blobs are valid. Missing blobs, oversized files, and
 hash mismatches are distinct errors. A truncation cannot pass hash verification.
+
+`lookupBucket(gpa, hash, table, key, limits)` streams and verifies the entire
+canonical bucket, including the tail after a matching record. It returns
+`BucketLookup.absent`, `.tombstone`, or `.value`; a live zero-length value is
+distinct from deletion. A value belongs to `gpa`; `result.deinit(gpa)` releases
+it. An error releases any captured value and returns no unverified result.
+Initial lookup cost is linear in bucket bytes. Its workspace is one cursor plus
+at most one value copy, independent of total bucket size.
+
+`scanBucket(hash, limits)` returns an owned `BucketCursor`. `next()` returns a
+`BucketRecord` with table ID and borrowed key/value slices, invalidated by the
+next `next`, `finish`, or `deinit` call. These rows are provisional until `next`
+returns `null` or `finish()` successfully drains the remainder: only then have
+hash, strict order, framing, counts, and EOF all been verified. `byteLength()`
+and `recordCount()` expose file/header metadata subject to the same verification
+rule. A scan error remains latched. `deinit()` closes the file and workspace but
+does not finish verification. The allocator and I/O context must outlive the
+cursor.
+
+Scans and lookups use the same `MergeLimits` as native merges. One cursor
+allocates `2 * max_key_bytes + max_value_bytes + 8192` scratch bytes. Limits
+apply to every parsed record, even one unrelated to the lookup target; a corrupt
+or oversized tail cannot be hidden by an early match.
 
 `mergeBuckets(older, newer, drop_tombstones, limits)` merges two stored canonical
 buckets without loading either whole bucket into memory. Records are ordered by
@@ -80,6 +108,9 @@ to a temporary file, flushes and syncs it, atomically replaces `manifest`, and
 syncs the store directory. Every referenced blob must already have been written
 successfully through `putBlob`. The payload is opaque, so this precondition is
 the caller's responsibility: the store cannot prove that references exist.
+An owner may publish alongside independent blob jobs, provided every referenced
+output has already completed durably. Completion of an unrelated background
+job does not choose which manifest is authoritative.
 
 The local storage envelope is `"BKLSTOR1" || payload_length:u64be ||
 SHA256(payload) || payload`. This wrapper is not a consensus encoding. The
@@ -108,7 +139,9 @@ canonical lowercase 64-character hash, then syncs the blob directory, and return
 the deletion count. Other names, directories, symlinks, and temporary debris are
 preserved. A collection error can follow partial deletion; callers must never
 offer an incomplete reachability set. There is no automatic collection or reader
-pinning in this low-level module.
+pinning in this low-level module. Quiesce all active jobs and cursors before
+collection; the owning disk database is responsible for tracking its read-view
+and pending-work references.
 
 Durability is currently supported on local Linux and macOS filesystems providing
 working file/directory sync and atomic same-directory replacement. Other targets
@@ -160,3 +193,12 @@ A FIFO regression test first uses an I/O guard that fails any attempted open,
 then checks real FIFO manifest/blob rejection. Removing the precheck makes the
 guard assertion fail immediately, so even a regressed test run cannot hang on
 the FIFO.
+
+The public read tests scan 100,000 records (about 2.1 MiB) and perform verified
+first-key and absent-key lookups with an 8,300-byte cursor allocator. They cover
+owned results, empty values, tombstones, full-tail corruption, sticky scan
+failure, strict framing and resource bounds, and allocation-failure cleanup.
+A four-thread test concurrently puts/merges the same immutable output and reads
+it through independent lookups and cursors on one Store. These primitive tests
+support the new concurrency contract; they are not the complete disk-host
+acceptance suite.
