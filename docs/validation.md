@@ -123,7 +123,20 @@ per-read measurements show warm deep-level reads improving about 96x at
 67.2 MB to 41 KB at 64 MiB; misses improve about 110x. The index changes no
 committed byte, and indexed and non-indexed opens agree across the test
 suite. Full-bucket scanning still governs merges, reopen validation, and
-retained-checkpoint verification by design. Reopen validation now also seeds
+retained-checkpoint verification by design.
+
+Opt-in v2 profiles ([ADR 0002](adr/0002-block-hashed-v2-buckets-and-record-proofs.md))
+add block-hashed buckets and succinct record proofs: v1 histories stay
+byte-identical (identical operations commit to different digests under
+the two profiles, and cross-format opens are rejected). Databases under
+v2 execute, reopen, and generate visible-state proofs from live
+frontiers that verify against nothing but the commitment digest —
+membership, tombstone, and absence, youngest-wins composed with the
+empty-slot rule. Proof components are covered by a byte-exhaustive
+mutation sweep, verification runs in the native+wasm32 differential,
+and the `bucketlist-proofs` capnp transport (capnp-zig v0.18.0, the
+package's first external dependency, serialization-only) roundtrips
+proofs through serialized bytes with forged digests rejected. Reopen validation now also seeds
 the read index during those required scans (first reads after open are warm)
 and re-derives pending merge outputs with a write-free hash verification
 instead of rewriting durable blobs; recorded reopen time fell from 71 ms to

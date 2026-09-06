@@ -102,6 +102,8 @@ HostStatus.queued: usize
 HostStatus.capacity: usize
 HostStatus.failure: ?anyerror
 HostStatus.backpressure: u64
+ProofsWire.write: fn (mem.Allocator, *const proofs.VisibleProof, *serialization.message.MessageBuilder) @typeInfo(@typeInfo(@TypeOf(proofs_wire.write)).@"fn".return_type.?).error_union.error_set!void
+ProofsWire.read: fn (mem.Allocator, *const serialization.message.Message) error{InvalidMessage,InvalidProof,IoFailed,OutOfMemory,PresentRecord,UnknownRecord}!proofs.VisibleProof
 Store.open: fn (mem.Allocator, Io, []const u8) error{CorruptBlob,CorruptManifest,InvalidBucket,InvalidPath,IoFailed,MergeMismatch,NotFound,NotRegularFile,OutOfMemory,StoreBusy,TooLarge,UnsupportedPlatform}!store.Store
 Store.deinit: fn (*store.Store) void
 Store.enableReadIndex: fn (*store.Store, store.ReadIndexOptions) error{CorruptBlob,CorruptManifest,InvalidBucket,InvalidPath,IoFailed,MergeMismatch,NotFound,NotRegularFile,OutOfMemory,StoreBusy,TooLarge,UnsupportedPlatform}!void

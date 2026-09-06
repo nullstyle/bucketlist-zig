@@ -285,6 +285,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "bucketlist-checkpoints", .module = checkpoints },
                 .{ .name = "bucketlist-disk", .module = disk },
                 .{ .name = "bucketlist-store", .module = store },
+                .{ .name = "bucketlist-proofs", .module = proofs_wire },
             },
         }),
     });

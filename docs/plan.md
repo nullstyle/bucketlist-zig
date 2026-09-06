@@ -438,7 +438,9 @@ ARM64 — bounded campaigns plus extended 10M-cycle-per-test soaks — through a
 fail-closed wrapper with exact input replay (see
 [fuzzing.md](fuzzing.md)). The v0.1 release review — gate evidence, surface
 classification, skip audit, and promotion conditions — is recorded in
-[release-review.md](release-review.md). The SLCP companion objects are now
+[release-review.md](release-review.md). Opt-in v2 profiles with record
+proofs are implemented Experimental per
+[ADR 0002](adr/0002-block-hashed-v2-buckets-and-record-proofs.md). The SLCP companion objects are now
 fetched from the public `slcp-zig` remote when no local source holds them.
 It still needs multi-day soak testing and production workload qualification
 before a standalone integration release. Local gates and API

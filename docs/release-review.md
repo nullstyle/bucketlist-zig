@@ -59,6 +59,13 @@ previously unlisted `Store` surface (14 operations) added by this review.
 
 **Experimental within v0.1** (shape may move without a version decision):
 
+- The **v2 proof surface** ([ADR 0002](adr/0002-block-hashed-v2-buckets-and-record-proofs.md)):
+  opt-in v2 profiles in `bucketlist.proofs` and `DiskOptions.format`,
+  proof generation (`Database.prove`), and the `bucketlist-proofs` capnp
+  transport — this package's first external dependency (capnp-zig v0.18.0,
+  serialization-only module, fetch-pinned). Evidence: independent-model
+  vectors, live-digest convergence tests, a byte-exhaustive mutation sweep
+  across every proof component, and native+wasm32 gated verification.
 - `Host(Schema)` and `HostOptions`/`HostStatus`: the bounded asynchronous
   publication surface is the newest concurrency API and has one consumer;
   its observability fields grew during review (backpressure counter).
@@ -68,6 +75,13 @@ previously unlisted `Store` surface (14 operations) added by this review.
 - `CheckpointLayout` internals and replay tooling interfaces
   (`tools/guided-fuzz.py` flags), which follow the pinned compiler's runner
   defects.
+
+**Workspace unification, scoped honestly:** checkpoint bytes are
+consensus-frozen v1 format and do not move to capnp; no new host or
+checkpoint wire surface exists today. The agreed unification therefore
+lands as the single pinned capnp transport and the committed-codegen
+pattern, established by `bucketlist-proofs` and standing ready for the
+next message surface that actually needs one.
 
 **Byte-frozen consensus inputs** (any change is a format decision, not an API
 change): v1 codecs, bucket framing, level/list/profile/schema/commitment hash
