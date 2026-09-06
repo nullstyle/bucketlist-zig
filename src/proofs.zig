@@ -1133,3 +1133,107 @@ test "visible proof composes absence, membership, and the empty-slot rule" {
     wrong[0] ^= 0xff;
     try testing.expectError(error.InvalidProof, verifyVisible(&proof, wrong));
 }
+
+test "every single-byte mutation of a proof component is rejected" {
+    const gpa = testing.allocator;
+    // Rebuild the membership fixture and sweep every byte of the block,
+    // key, digest, and each path sibling with a deterministic PRNG.
+    var block0: [42]u8 = undefined;
+    var block1: [21]u8 = undefined;
+    {
+        var position: usize = 0;
+        for (0..3) |i| {
+            const target: []u8 = if (i < 2) block0[position..] else block1[position - 42 ..];
+            std.mem.writeInt(u32, target[0..4], 1, .big);
+            std.mem.writeInt(u32, target[4..8], 4, .big);
+            std.mem.writeInt(u32, target[8..12], @intCast(2 * i), .big);
+            target[12] = 1;
+            std.mem.writeInt(u32, target[13..17], 4, .big);
+            std.mem.writeInt(u32, target[17..21], @intCast(i), .big);
+            position += 21;
+        }
+    }
+    const leaves = [_]Hash{ blockHash(0, &block0), blockHash(1, &block1) };
+    var tree: BlockTree = .{};
+    for (leaves) |leaf| tree.append(leaf);
+    const bucket = bucketHash(3, 2, tree.root());
+    var schema: Hash = undefined;
+    var seed: [4]u8 = undefined;
+    std.mem.writeInt(u32, &seed, 900, .big);
+    Sha256.hash(&seed, &schema, .{});
+    const profile = profileHash(11, 42);
+    var levels: [11]ChainLevel = undefined;
+    const empty_bucket = emptyBucketHash();
+    for (&levels, 0..) |*level, i| {
+        var hash: Hash = undefined;
+        std.mem.writeInt(u32, &seed, @intCast(50 + i), .big);
+        Sha256.hash(&seed, &hash, .{});
+        const young = i < 2;
+        level.* = .{
+            .curr = if (i == 2) bucket else if (young) empty_bucket else hash,
+            .snap = if (young) empty_bucket else hash,
+        };
+    }
+    const expected = chainCommitment(schema, profile, 9, &levels);
+    const path = try blockPath(gpa, &leaves, 0);
+    defer gpa.free(path.steps);
+    var key: [4]u8 = undefined;
+    std.mem.writeInt(u32, &key, 2, .big);
+    var value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value, 1, .big);
+    var proof = MembershipProof{
+        .table = 1,
+        .key = &key,
+        .value = &value,
+        .slot_level = 2,
+        .slot_snapshot = false,
+        .schema_hash = schema,
+        .profile_hash = profile,
+        .advance = 9,
+        .levels = &levels,
+        .bucket = .{ .block = &block0, .block_index = 0, .block_count = 2, .record_count = 3, .path = path },
+    };
+    try verifyMembership(&proof, expected);
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const random = prng.random();
+    // Every block byte, mutated one at a time with a random replacement.
+    for (0..block0.len) |i| {
+        var mutated: [42]u8 = block0;
+        mutated[i] = random.int(u8);
+        if (mutated[i] == block0[i]) mutated[i] ^= 0xFF;
+        proof.bucket.block = &mutated;
+        if (verifyMembership(&proof, expected)) |_| return error.MutationAccepted else |_| {}
+    }
+    proof.bucket.block = &block0;
+    // Every digest byte.
+    for (0..expected.len) |i| {
+        var wrong = expected;
+        wrong[i] ^= 0x01;
+        if (verifyMembership(&proof, wrong)) |_| return error.MutationAccepted else |_| {}
+    }
+    // Every sibling-hash byte via a mutated copy of the steps.
+    var steps_copy = try gpa.dupe(BlockPath.Step, path.steps);
+    defer gpa.free(steps_copy);
+    for (0..steps_copy.len) |step_i| {
+        for (0..steps_copy[step_i].hash.len) |byte_i| {
+            steps_copy[step_i].hash[byte_i] ^= 0x80;
+            proof.bucket.path = .{ .steps = steps_copy };
+            if (verifyMembership(&proof, expected)) |_| return error.MutationAccepted else |_| {}
+            steps_copy[step_i].hash[byte_i] ^= 0x80;
+        }
+    }
+    proof.bucket.path = path;
+    // Every frontier-level byte in a copied levels array.
+    var levels_copy = levels;
+    proof.levels = &levels_copy;
+    for (&levels_copy, 0..) |*level, level_i| {
+        for (0..level.curr.len) |byte_i| {
+            level.curr[byte_i] ^= 0x40;
+            if (verifyMembership(&proof, expected)) |_| return error.MutationAccepted else |_| {}
+            level.curr[byte_i] ^= 0x40;
+            _ = level_i;
+        }
+    }
+    proof.levels = &levels;
+    try verifyMembership(&proof, expected);
+}
