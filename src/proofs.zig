@@ -488,6 +488,166 @@ pub fn verifyAbsence(proof: *const AbsenceProof, expected_digest: Hash) error{ I
     try verifyPlacement(b, proof.slot_level, proof.slot_snapshot, proof.levels, proof.schema_hash, proof.profile_hash, proof.advance, expected_digest);
 }
 
+/// The v2 hash of a bucket with zero records: computable by any verifier,
+/// so uncovered younger slots holding it need no absence proof.
+pub fn emptyBucketHash() Hash {
+    return bucketHash(0, 0, emptyLeaf());
+}
+
+fn slotOrdinal(slot_level: usize, slot_snapshot: bool) usize {
+    return 2 * slot_level + @intFromBool(slot_snapshot);
+}
+
+/// A bucket's authenticated content placed in one frontier slot.
+pub const SlotPlacement = struct {
+    slot_level: usize,
+    slot_snapshot: bool,
+    bucket: BucketProof,
+};
+
+/// The composite proof for a key's visible state: every younger slot either
+/// proves absence or is the computable empty bucket, and the deciding slot
+/// proves the claimed membership or final absence. Slots are ordered
+/// youngest-first (level ascending, current before snapshot), matching the
+/// database's own lookup order.
+pub const VisibleProof = struct {
+    table: u32,
+    key: []const u8,
+    /// The claimed visible value; null with `absent` false claims a
+    /// tombstone, null with `absent` true claims full absence.
+    value: ?[]const u8,
+    absent: bool,
+    younger: []const SlotPlacement,
+    deciding: SlotPlacement,
+    schema_hash: Hash,
+    profile_hash: Hash,
+    advance: u64,
+    levels: []const ChainLevel,
+};
+
+/// Parse a block and require the claimed record with its exact value class.
+fn claimInBlock(block: []const u8, table: u32, key: []const u8, value: ?[]const u8) error{ InvalidProof, UnknownRecord }!void {
+    var position: usize = 0;
+    var found = false;
+    var previous_key: ?[]const u8 = null;
+    var previous_table: u32 = 0;
+    while (position < block.len) {
+        if (position + 8 > block.len) return error.InvalidProof;
+        const record_table = std.mem.readInt(u32, block[position..][0..4], .big);
+        const key_len = std.mem.readInt(u32, block[position + 4 ..][0..4], .big);
+        if (key_len > block.len or position + 8 + key_len > block.len) return error.InvalidProof;
+        const record_key = block[position + 8 ..][0..key_len];
+        position += 8 + key_len;
+        if (position + 1 > block.len) return error.InvalidProof;
+        const tag = block[position];
+        position += 1;
+        var record_value: ?[]const u8 = null;
+        if (tag == 1) {
+            if (position + 4 > block.len) return error.InvalidProof;
+            const value_len = std.mem.readInt(u32, block[position..][0..4], .big);
+            if (value_len > block.len or position + 4 + value_len > block.len) return error.InvalidProof;
+            record_value = block[position + 4 ..][0..value_len];
+            position += 4 + value_len;
+        } else if (tag != 0) return error.InvalidProof;
+        if (previous_key) |prev| {
+            if (previous_table == record_table and std.mem.order(u8, prev, record_key) != .lt) return error.InvalidProof;
+            if (previous_table > record_table) return error.InvalidProof;
+        }
+        previous_key = record_key;
+        previous_table = record_table;
+        if (record_table == table and std.mem.eql(u8, record_key, key)) {
+            if (found) return error.InvalidProof;
+            found = true;
+            if ((record_value != null) != (value != null)) return error.UnknownRecord;
+            if (value) |claimed| {
+                if (!std.mem.eql(u8, claimed, record_value.?)) return error.UnknownRecord;
+            }
+        }
+    }
+    if (position != block.len or !found) return error.UnknownRecord;
+}
+
+/// Parse a block and require the key to be absent under the bracketing rule.
+fn absentInBlock(b: *const BucketProof, table: u32, key: []const u8) error{ InvalidProof, PresentRecord }!void {
+    var position: usize = 0;
+    var before_first = true;
+    var after_last = true;
+    var previous_key: ?[]const u8 = null;
+    var previous_table: u32 = 0;
+    while (position < b.block.len) {
+        if (position + 8 > b.block.len) return error.InvalidProof;
+        const record_table = std.mem.readInt(u32, b.block[position..][0..4], .big);
+        const key_len = std.mem.readInt(u32, b.block[position + 4 ..][0..4], .big);
+        if (key_len > b.block.len or position + 8 + key_len > b.block.len) return error.InvalidProof;
+        const record_key = b.block[position + 8 ..][0..key_len];
+        position += 8 + key_len;
+        if (position + 1 > b.block.len) return error.InvalidProof;
+        const tag = b.block[position];
+        position += 1;
+        if (tag == 1) {
+            if (position + 4 > b.block.len) return error.InvalidProof;
+            const value_len = std.mem.readInt(u32, b.block[position..][0..4], .big);
+            if (value_len > b.block.len or position + 4 + value_len > b.block.len) return error.InvalidProof;
+            position += 4 + value_len;
+        } else if (tag != 0) return error.InvalidProof;
+        if (previous_key) |prev| {
+            if (previous_table == record_table and std.mem.order(u8, prev, record_key) != .lt) return error.InvalidProof;
+            if (previous_table > record_table) return error.InvalidProof;
+        }
+        previous_key = record_key;
+        previous_table = record_table;
+        const order: std.math.Order = if (record_table != table)
+            (if (record_table < table) .lt else .gt)
+        else
+            std.mem.order(u8, record_key, key);
+        switch (order) {
+            .eq => return error.PresentRecord,
+            .gt => after_last = false,
+            .lt => before_first = false,
+        }
+    }
+    if (position != b.block.len) return error.InvalidProof;
+    if (before_first and b.block_index != 0) return error.InvalidProof;
+    if (after_last and b.block_index + 1 != b.block_count) return error.InvalidProof;
+}
+
+/// Verify the composite visible-state proof against one trusted digest.
+pub fn verifyVisible(proof: *const VisibleProof, expected_digest: Hash) error{ InvalidProof, PresentRecord, UnknownRecord }!void {
+    const deciding_ordinal = slotOrdinal(proof.deciding.slot_level, proof.deciding.slot_snapshot);
+    if (proof.deciding.slot_level >= proof.levels.len) return error.InvalidProof;
+    var previous: ?usize = null;
+    for (proof.younger) |entry| {
+        if (entry.slot_level >= proof.levels.len) return error.InvalidProof;
+        const ordinal = slotOrdinal(entry.slot_level, entry.slot_snapshot);
+        if ((previous != null and ordinal <= previous.?) or ordinal >= deciding_ordinal) return error.InvalidProof;
+        previous = ordinal;
+        try absentInBlock(&entry.bucket, proof.table, proof.key);
+        try verifyPlacement(&entry.bucket, entry.slot_level, entry.slot_snapshot, proof.levels, proof.schema_hash, proof.profile_hash, proof.advance, expected_digest);
+    }
+    // Every slot strictly younger than the deciding one must be covered by
+    // an absence entry or hold the computable empty-bucket hash.
+    const empty = emptyBucketHash();
+    for (proof.levels[0..proof.deciding.slot_level], 0..) |level, level_index| {
+        for ([_]struct { hash: Hash, ordinal: usize }{
+            .{ .hash = level.curr, .ordinal = slotOrdinal(level_index, false) },
+            .{ .hash = level.snap, .ordinal = slotOrdinal(level_index, true) },
+        }) |slot| {
+            if (slot.ordinal >= deciding_ordinal) break;
+            var covered = std.mem.eql(u8, &slot.hash, &empty);
+            for (proof.younger) |entry| {
+                if (slotOrdinal(entry.slot_level, entry.slot_snapshot) == slot.ordinal) covered = true;
+            }
+            if (!covered) return error.InvalidProof;
+        }
+    }
+    if (proof.absent) {
+        try absentInBlock(&proof.deciding.bucket, proof.table, proof.key);
+    } else {
+        try claimInBlock(proof.deciding.bucket.block, proof.table, proof.key, proof.value);
+    }
+    try verifyPlacement(&proof.deciding.bucket, proof.deciding.slot_level, proof.deciding.slot_snapshot, proof.levels, proof.schema_hash, proof.profile_hash, proof.advance, expected_digest);
+}
+
 fn hashInt(comptime T: type, h: *Sha256, value: T) void {
     var bytes: [@sizeOf(T)]u8 = undefined;
     std.mem.writeInt(T, &bytes, value, .big);
@@ -863,4 +1023,113 @@ test "absence proof brackets the key and rejects boundary lies" {
     var wrong_digest = expected;
     wrong_digest[0] ^= 0xff;
     try testing.expectError(error.InvalidProof, verifyAbsence(&proof, wrong_digest));
+}
+
+test "visible proof composes absence, membership, and the empty-slot rule" {
+    // Deciding bucket: keys 0,2 (two blocks at target 42). Younger bucket:
+    // key 8 (one block). The proven key 1 is bracketed in the deciding one.
+    var deciding_block0: [42]u8 = undefined;
+    var deciding_block1: [21]u8 = undefined;
+    var younger_block: [21]u8 = undefined;
+    {
+        var position: usize = 0;
+        for (0..3) |i| {
+            const target: []u8 = if (i < 2) deciding_block0[position..] else deciding_block1[position - 42 ..];
+            std.mem.writeInt(u32, target[0..4], 1, .big);
+            std.mem.writeInt(u32, target[4..8], 4, .big);
+            std.mem.writeInt(u32, target[8..12], @intCast(i), .big);
+            target[12] = 1;
+            std.mem.writeInt(u32, target[13..17], 4, .big);
+            std.mem.writeInt(u32, target[17..21], @intCast(i), .big);
+            position += 21;
+        }
+        std.mem.writeInt(u32, younger_block[0..4], 1, .big);
+        std.mem.writeInt(u32, younger_block[4..8], 4, .big);
+        std.mem.writeInt(u32, younger_block[8..12], 8, .big);
+        younger_block[12] = 1;
+        std.mem.writeInt(u32, younger_block[13..17], 4, .big);
+        std.mem.writeInt(u32, younger_block[17..21], 8, .big);
+    }
+    const deciding_leaves = [_]Hash{ blockHash(0, &deciding_block0), blockHash(1, &deciding_block1) };
+    const deciding_path = try blockPath(std.heap.page_allocator, &deciding_leaves, 0);
+    defer std.heap.page_allocator.free(deciding_path.steps);
+    const deciding_bucket = bucketHash(3, 2, combine(deciding_leaves[0], deciding_leaves[1]));
+    const younger_bucket = bucketHash(1, 1, blockHash(0, &younger_block));
+    var schema: Hash = undefined;
+    var seed: [4]u8 = undefined;
+    std.mem.writeInt(u32, &seed, 900, .big);
+    Sha256.hash(&seed, &schema, .{});
+    const profile = profileHash(11, 42);
+    var levels: [11]ChainLevel = undefined;
+    const empty = emptyBucketHash();
+    for (&levels, 0..) |*level, i| {
+        var hash: Hash = undefined;
+        std.mem.writeInt(u32, &seed, @intCast(70 + i), .big);
+        Sha256.hash(&seed, &hash, .{});
+        // Uncovered younger slots (everything before the deciding slot)
+        // must hold the empty-bucket hash or carry an absence entry.
+        const young = i < 3;
+        level.* = .{
+            .curr = if (i == 0) younger_bucket else if (i == 3) deciding_bucket else if (young) empty else hash,
+            .snap = if (young) empty else hash,
+        };
+    }
+    const expected = chainCommitment(schema, profile, 11, &levels);
+    const no_steps: []const BlockPath.Step = &.{};
+    var key: [4]u8 = undefined;
+    std.mem.writeInt(u32, &key, 1, .big);
+    var value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value, 1, .big);
+    const younger_entry: SlotPlacement = .{
+        .slot_level = 0,
+        .slot_snapshot = false,
+        .bucket = .{ .block = &younger_block, .block_index = 0, .block_count = 1, .record_count = 1, .path = .{ .steps = no_steps } },
+    };
+    var proof = VisibleProof{
+        .table = 1,
+        .key = &key,
+        .value = &value,
+        .absent = false,
+        .younger = &.{younger_entry},
+        .deciding = .{
+            .slot_level = 3,
+            .slot_snapshot = false,
+            .bucket = .{ .block = &deciding_block0, .block_index = 0, .block_count = 2, .record_count = 3, .path = deciding_path },
+        },
+        .schema_hash = schema,
+        .profile_hash = profile,
+        .advance = 11,
+        .levels = &levels,
+    };
+    try verifyVisible(&proof, expected);
+    // Dropping the younger absence entry opens an uncovered non-empty slot.
+    proof.younger = &.{};
+    try testing.expectError(error.InvalidProof, verifyVisible(&proof, expected));
+    proof.younger = &.{younger_entry};
+    // An out-of-order or later-slot entry is rejected.
+    const misordered: SlotPlacement = .{ .slot_level = 3, .slot_snapshot = false, .bucket = younger_entry.bucket };
+    proof.younger = &.{misordered};
+    try testing.expectError(error.InvalidProof, verifyVisible(&proof, expected));
+    proof.younger = &.{younger_entry};
+    // If the younger bucket contained the key, its absence proof fails.
+    var young_hold: [21]u8 = younger_block;
+    std.mem.writeInt(u32, young_hold[8..12], 1, .big);
+    var young_levels = levels;
+    const hold_leaf = blockHash(0, &young_hold);
+    young_levels[0].curr = bucketHash(1, 1, hold_leaf);
+    proof.levels = &young_levels;
+    proof.deciding.bucket.block = &deciding_block0;
+    const hold_expected = chainCommitment(schema, profile, 11, &young_levels);
+    var young_proof = proof;
+    young_proof.younger = &.{.{ .slot_level = 0, .slot_snapshot = false, .bucket = .{ .block = &young_hold, .block_index = 0, .block_count = 1, .record_count = 1, .path = .{ .steps = no_steps } } }};
+    try testing.expectError(error.PresentRecord, verifyVisible(&young_proof, hold_expected));
+    proof.levels = &levels;
+    // Claiming absence when the deciding bucket holds the record.
+    proof.absent = true;
+    try testing.expectError(error.PresentRecord, verifyVisible(&proof, expected));
+    proof.absent = false;
+    // Digest forgery.
+    var wrong = expected;
+    wrong[0] ^= 0xff;
+    try testing.expectError(error.InvalidProof, verifyVisible(&proof, wrong));
 }
