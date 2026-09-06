@@ -713,7 +713,15 @@ pub const Store = struct {
         defer atomic.deinit(self.io);
         var buffer: [8192]u8 = undefined;
         var writer = atomic.file.writer(self.io, &buffer);
-        var output: MergeOutput = .{ .writer = &writer.interface, .limit = limits.max_bucket_bytes };
+        var v2_hasher = switch (limits.format) {
+            .v1 => undefined,
+            .v2 => |v2| V2Hasher.init(v2.target_block_bytes),
+        };
+        var output: MergeOutput = .{
+            .writer = &writer.interface,
+            .limit = limits.max_bucket_bytes,
+            .v2 = if (limits.format == .v2) &v2_hasher else null,
+        };
         try output.write(bucket_domain);
         var count_bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &count_bytes, first.count, .big);
@@ -722,7 +730,7 @@ pub const Store = struct {
         if (second.count != first.count or second.size != first.size or output.size != first.size)
             return error.CorruptBlob;
         writer.interface.flush() catch return error.IoFailed;
-        const hash = output.hash.finalResult();
+        const hash = if (output.v2) |hasher| hasher.final() else output.hash.finalResult();
         name = std.fmt.bytesToHex(hash, .lower);
         try fullSync(self.io, atomic.file);
         atomic.link(self.io) catch |err| switch (err) {
@@ -743,7 +751,15 @@ pub const Store = struct {
     /// durable blob; `error.MergeMismatch` rejects a forged pending hash.
     pub fn mergeBucketsVerify(self: *Store, older: Hash, newer: Hash, drop_tombstones: bool, limits: MergeLimits, expected: Hash) Error!void {
         const first = try mergePass(self, older, newer, drop_tombstones, limits, null);
-        var sink: MergeOutput = .{ .writer = null, .limit = limits.max_bucket_bytes };
+        var v2_hasher = switch (limits.format) {
+            .v1 => undefined,
+            .v2 => |v2| V2Hasher.init(v2.target_block_bytes),
+        };
+        var sink: MergeOutput = .{
+            .writer = null,
+            .limit = limits.max_bucket_bytes,
+            .v2 = if (limits.format == .v2) &v2_hasher else null,
+        };
         // Hash the exact output byte stream, header included, exactly as
         // mergeBuckets writes it.
         try sink.write(bucket_domain);
@@ -753,7 +769,8 @@ pub const Store = struct {
         const second = try mergePass(self, older, newer, drop_tombstones, limits, &sink);
         if (second.count != first.count or second.size != first.size or sink.size != first.size)
             return error.MergeMismatch;
-        if (!std.mem.eql(u8, &expected, &sink.hash.finalResult())) return error.MergeMismatch;
+        const actual = if (sink.v2) |hasher| hasher.final() else sink.hash.finalResult();
+        if (!std.mem.eql(u8, &expected, &actual)) return error.MergeMismatch;
     }
 
     /// Publish an opaque application manifest after putBlob has durably
@@ -1133,7 +1150,9 @@ const BucketReader = struct {
 const MergeOutput = struct {
     /// A null writer hashes and counts without producing bytes: two
     /// null-writer passes derive a merge's exact hash with no writes.
+    /// v2 mode feeds each record to the block hasher for the name instead.
     writer: ?*std.Io.Writer,
+    v2: ?*V2Hasher = null,
     hash: std.crypto.hash.sha2.Sha256 = .init(.{}),
     size: u64 = 0,
     limit: u64,
@@ -1146,6 +1165,7 @@ const MergeOutput = struct {
     }
 
     fn record(self: *MergeOutput, row: StreamRecord) Error!void {
+        if (self.v2) |hasher| hasher.record(row.table, row.key, row.value);
         var header: [8]u8 = undefined;
         std.mem.writeInt(u32, header[0..4], row.table, .big);
         std.mem.writeInt(u32, header[4..8], @intCast(row.key.len), .big);
@@ -2086,6 +2106,41 @@ test "v2 buckets verify under the block format and match the independent model" 
         defer flipped.deinit();
         try testing.expectError(error.CorruptBlob, flipped.finish());
     }
+}
+
+test "v2 merges produce block-hashed outputs and verify without writes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    const even = try manyRecords(testing.allocator, 100, 0);
+    defer testing.allocator.free(even);
+    const odd = try manyRecords(testing.allocator, 100, 1);
+    defer testing.allocator.free(odd);
+    const limits: MergeLimits = .{
+        .max_key_bytes = 4,
+        .max_value_bytes = 4,
+        .format = .{ .v2 = .{ .target_block_bytes = 128 } },
+    };
+    const older = try store.putBucketV2(even, limits);
+    const newer = try store.putBucketV2(odd, limits);
+    const merged = try store.mergeBuckets(older, newer, false, limits);
+    // Independent literal: the merged stream (keys 0..199, value == key)
+    // under target 128, from tools/v2-vectors.py.
+    var expected: Hash = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "2edc9550776d4138b5dc846f5230052740037a5c30ac3808344239327b7804b6");
+    try testing.expectEqualSlices(u8, &expected, &merged);
+    // Write-free verification accepts the true output and rejects a forgery.
+    try store.mergeBucketsVerify(older, newer, false, limits, merged);
+    try testing.expectError(error.MergeMismatch, store.mergeBucketsVerify(older, newer, false, limits, older));
+    var drain = try store.scanBucket(merged, limits);
+    defer drain.deinit();
+    try drain.finish();
+    try testing.expectEqual(@as(u64, 200), drain.recordCount());
+    // The v1 interpretation of the v2-named output fails closed.
+    var flat = try store.scanBucket(merged, .{ .max_key_bytes = 4, .max_value_bytes = 4 });
+    defer flat.deinit();
+    try testing.expectError(error.CorruptBlob, flat.finish());
 }
 
 test "one store supports concurrent immutable puts merges and independent cursors" {
