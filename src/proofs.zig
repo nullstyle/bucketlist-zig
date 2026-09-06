@@ -202,10 +202,10 @@ pub fn blockPath(gpa: std.mem.Allocator, leaves: []const Hash, index: usize) err
 
 pub const PathError = error{InvalidPath};
 
-/// Verify that `leaf` at `index` within `leaf_count` leaves reaches `root`
-/// through exactly the siblings `path` claims, with the side and structure
-/// the canonical peak reduction demands for that leaf count.
-pub fn verifyBlockPath(leaf: Hash, index: usize, leaf_count: usize, path: BlockPath, root: Hash) PathError!void {
+/// Derive the tree root from `leaf` at `index` within `leaf_count` leaves
+/// and the claimed sibling `path`, enforcing the exact side structure the
+/// canonical peak reduction demands for that leaf count.
+pub fn foldBlockPath(leaf: Hash, index: usize, leaf_count: usize, path: BlockPath) PathError!Hash {
     if (leaf_count == 0 or index >= leaf_count) return error.InvalidPath;
     // Reconstruct the peak shape: binary decomposition of leaf_count,
     // spans largest first.
@@ -256,7 +256,13 @@ pub fn verifyBlockPath(leaf: Hash, index: usize, leaf_count: usize, path: BlockP
         step += 1;
     }
     if (step != path.steps.len) return error.InvalidPath;
-    if (!std.mem.eql(u8, &root, &self_hash)) return error.InvalidPath;
+    return self_hash;
+}
+
+/// Verify a derived root against a trusted one.
+pub fn verifyBlockPath(leaf: Hash, index: usize, leaf_count: usize, path: BlockPath, root: Hash) PathError!void {
+    const derived = try foldBlockPath(leaf, index, leaf_count, path);
+    if (!std.mem.eql(u8, &root, &derived)) return error.InvalidPath;
 }
 
 /// One frontier level as carried in a proof: the committed current,
@@ -301,6 +307,113 @@ pub fn chainCommitment(schema_hash: Hash, profile_hash: Hash, advance: u64, leve
     database.update(&list.finalResult());
     database.update(&continuation.finalResult());
     return database.finalResult();
+}
+
+/// Hash one block: binds its position and exact bytes.
+pub fn blockHash(index: u64, block_bytes: []const u8) Hash {
+    var h = Sha256.init(.{});
+    h.update(block_domain);
+    hashInt(u64, &h, index);
+    h.update(block_bytes);
+    return h.finalResult();
+}
+
+/// The v2 bucket hash over its counted contents and block root.
+pub fn bucketHash(record_count: u64, block_count: u64, block_root: Hash) Hash {
+    var h = Sha256.init(.{});
+    h.update(bucket_domain);
+    hashInt(u64, &h, record_count);
+    hashInt(u64, &h, block_count);
+    h.update(&block_root);
+    return h.finalResult();
+}
+
+/// One bucket's authenticated content and position: the block bytes, their
+/// index and the bucket's counts, and the sibling path to the block root.
+pub const BucketProof = struct {
+    block: []const u8,
+    block_index: u64,
+    block_count: u64,
+    record_count: u64,
+    path: BlockPath,
+};
+
+/// A single-bucket membership proof: the claimed visible record inside one
+/// block, that block's position in one bucket, and the frontier state that
+/// binds the bucket into the committed digest. Verifying establishes the
+/// record's presence and the frontier chain; proving that no younger level
+/// shadows it additionally requires the absence composition of the next
+/// stage, documented in format-v2.md.
+pub const MembershipProof = struct {
+    table: u32,
+    key: []const u8,
+    /// null claims a deletion marker.
+    value: ?[]const u8,
+    slot_level: usize,
+    /// true places the bucket in the level's snapshot, false in its current.
+    slot_snapshot: bool,
+    schema_hash: Hash,
+    profile_hash: Hash,
+    advance: u64,
+    levels: []const ChainLevel,
+    bucket: BucketProof,
+};
+
+pub const ProofError = error{ InvalidProof, UnknownRecord };
+
+/// Fully verify a membership proof against a trusted commitment digest.
+pub fn verifyMembership(proof: *const MembershipProof, expected_digest: Hash) error{ InvalidProof, UnknownRecord }!void {
+    const b = &proof.bucket;
+    if (b.block_count == 0 or b.block_index >= b.block_count or proof.slot_level >= proof.levels.len)
+        return error.InvalidProof;
+    // The block must parse in canonical order and contain the target.
+    var position: usize = 0;
+    var found = false;
+    var previous: ?[]const u8 = null;
+    var previous_table: u32 = 0;
+    while (position < b.block.len) {
+        if (position + 8 > b.block.len) return error.InvalidProof;
+        const table = std.mem.readInt(u32, b.block[position..][0..4], .big);
+        const key_len = std.mem.readInt(u32, b.block[position + 4 ..][0..4], .big);
+        if (key_len > b.block.len or position + 8 + key_len > b.block.len) return error.InvalidProof;
+        const key = b.block[position + 8 ..][0..key_len];
+        position += 8 + key_len;
+        if (position + 1 > b.block.len) return error.InvalidProof;
+        const tag = b.block[position];
+        position += 1;
+        var value: ?[]const u8 = null;
+        if (tag == 1) {
+            if (position + 4 > b.block.len) return error.InvalidProof;
+            const value_len = std.mem.readInt(u32, b.block[position..][0..4], .big);
+            if (value_len > b.block.len or position + 4 + value_len > b.block.len) return error.InvalidProof;
+            value = b.block[position + 4 ..][0..value_len];
+            position += 4 + value_len;
+        } else if (tag != 0) return error.InvalidProof;
+        if (previous) |prev| {
+            if (previous_table == table and std.mem.order(u8, prev, key) != .lt) return error.InvalidProof;
+            if (previous_table > table) return error.InvalidProof;
+        }
+        previous = key;
+        previous_table = table;
+        if (table == proof.table and std.mem.eql(u8, key, proof.key)) {
+            if (found) return error.InvalidProof;
+            found = true;
+            const has_value = value != null;
+            if (has_value != (proof.value != null)) return error.UnknownRecord;
+            if (proof.value) |claimed| {
+                if (!std.mem.eql(u8, claimed, value.?)) return error.UnknownRecord;
+            }
+        }
+    }
+    if (position != b.block.len or !found) return error.UnknownRecord;
+    // Block hash -> path -> root -> bucket hash -> claimed slot -> digest.
+    const leaf = blockHash(b.block_index, b.block);
+    const root = foldBlockPath(leaf, @intCast(b.block_index), @intCast(b.block_count), b.path) catch return error.InvalidProof;
+    const bucket = bucketHash(b.record_count, b.block_count, root);
+    const slot_hash = if (proof.slot_snapshot) &proof.levels[proof.slot_level].snap else &proof.levels[proof.slot_level].curr;
+    if (!std.mem.eql(u8, slot_hash, &bucket)) return error.InvalidProof;
+    const digest = chainCommitment(proof.schema_hash, proof.profile_hash, proof.advance, proof.levels);
+    if (!std.mem.eql(u8, &digest, &expected_digest)) return error.InvalidProof;
 }
 
 fn hashInt(comptime T: type, h: *Sha256, value: T) void {
@@ -477,4 +590,120 @@ test "chain commitment matches the independent model" {
         level.* = .{ .curr = curr, .snap = snap, .next = if (i == 4) pending else null };
     }
     try expectLiteral(chainCommitment(schema, profile, 70, &levels), "2c409e9107d8614fc1bd34b99d705ef0791148ad67d20846f7580b13aafde554");
+}
+
+test "membership proof verifies and rejects every mutation class" {
+    const gpa = testing.allocator;
+    var block0: [42]u8 = undefined;
+    var block1: [21]u8 = undefined;
+    {
+        var position: usize = 0;
+        for (0..3) |i| {
+            const target: []u8 = if (i < 2) block0[position..] else block1[position - 42 ..];
+            std.mem.writeInt(u32, target[0..4], 1, .big);
+            std.mem.writeInt(u32, target[4..8], 4, .big);
+            std.mem.writeInt(u32, target[8..12], @intCast(2 * i), .big);
+            target[12] = 1;
+            std.mem.writeInt(u32, target[13..17], 4, .big);
+            std.mem.writeInt(u32, target[17..21], @intCast(i), .big);
+            position += 21;
+        }
+    }
+    const leaves = [_]Hash{ blockHash(0, &block0), blockHash(1, &block1) };
+    var tree: BlockTree = .{};
+    for (leaves) |leaf| tree.append(leaf);
+    const root = tree.root();
+    // Independent literal from tools/v2-vectors.py over this exact fixture.
+    const bucket = bucketHash(3, 2, root);
+    try expectLiteral(bucket, "adf7316823f6a0ffc11d3a406c7d22ecb81ca642b68c466f5b54108f5ef24c0d");
+    var schema: Hash = undefined;
+    var seed: [4]u8 = undefined;
+    std.mem.writeInt(u32, &seed, 900, .big);
+    Sha256.hash(&seed, &schema, .{});
+    const profile = profileHash(11, 42);
+    var levels: [11]ChainLevel = undefined;
+    for (&levels, 0..) |*level, i| {
+        var hash: Hash = undefined;
+        std.mem.writeInt(u32, &seed, @intCast(50 + i), .big);
+        Sha256.hash(&seed, &hash, .{});
+        level.* = .{ .curr = hash, .snap = hash };
+    }
+    levels[2].curr = bucket;
+    const expected = chainCommitment(schema, profile, 9, &levels);
+    const path = try blockPath(gpa, &leaves, 0);
+    defer gpa.free(path.steps);
+    var key: [4]u8 = undefined;
+    std.mem.writeInt(u32, &key, 2, .big);
+    var value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value, 1, .big);
+    var proof = MembershipProof{
+        .table = 1,
+        .key = &key,
+        .value = &value,
+        .slot_level = 2,
+        .slot_snapshot = false,
+        .schema_hash = schema,
+        .profile_hash = profile,
+        .advance = 9,
+        .levels = &levels,
+        .bucket = .{ .block = &block0, .block_index = 0, .block_count = 2, .record_count = 3, .path = path },
+    };
+    try verifyMembership(&proof, expected);
+    // Claim mutations.
+    var wrong_value = value;
+    wrong_value[0] ^= 0xff;
+    proof.value = &wrong_value;
+    try testing.expectError(error.UnknownRecord, verifyMembership(&proof, expected));
+    proof.value = &value;
+    proof.value = null;
+    try testing.expectError(error.UnknownRecord, verifyMembership(&proof, expected));
+    proof.value = &value;
+    var absent_key: [4]u8 = undefined;
+    std.mem.writeInt(u32, &absent_key, 6, .big);
+    proof.key = &absent_key;
+    try testing.expectError(error.UnknownRecord, verifyMembership(&proof, expected));
+    proof.key = &key;
+    // Structure mutations.
+    proof.bucket.block_index = 1;
+    try testing.expectError(error.InvalidProof, verifyMembership(&proof, expected));
+    proof.bucket.block_index = 0;
+    proof.bucket.record_count = 4;
+    try testing.expectError(error.InvalidProof, verifyMembership(&proof, expected));
+    proof.bucket.record_count = 3;
+    proof.bucket.block_count = 3;
+    try testing.expectError(error.InvalidProof, verifyMembership(&proof, expected));
+    proof.bucket.block_count = 2;
+    proof.slot_snapshot = true;
+    try testing.expectError(error.InvalidProof, verifyMembership(&proof, expected));
+    proof.slot_snapshot = false;
+    proof.slot_level = 3;
+    try testing.expectError(error.InvalidProof, verifyMembership(&proof, expected));
+    proof.slot_level = 2;
+    var tampered_levels = levels;
+    tampered_levels[5].curr[0] ^= 0xff;
+    proof.levels = &tampered_levels;
+    try testing.expectError(error.InvalidProof, verifyMembership(&proof, expected));
+    proof.levels = &levels;
+    proof.advance = 10;
+    try testing.expectError(error.InvalidProof, verifyMembership(&proof, expected));
+    proof.advance = 9;
+    var tampered_step = try gpa.dupe(BlockPath.Step, path.steps);
+    defer gpa.free(tampered_step);
+    tampered_step[0].hash[0] ^= 0xff;
+    proof.bucket.path = .{ .steps = tampered_step };
+    try testing.expectError(error.InvalidProof, verifyMembership(&proof, expected));
+    proof.bucket.path = path;
+    var wrong_digest = expected;
+    wrong_digest[0] ^= 0xff;
+    try testing.expectError(error.InvalidProof, verifyMembership(&proof, wrong_digest));
+    // Mutating another record's bytes leaves the claim intact but breaks
+    // the block hash; mutating the claimed record's value breaks the claim.
+    var tampered_block = block0;
+    tampered_block[17] ^= 0xff;
+    proof.bucket.block = &tampered_block;
+    try testing.expectError(error.InvalidProof, verifyMembership(&proof, expected));
+    tampered_block[17] ^= 0xff;
+    tampered_block[21 + 17] ^= 0xff;
+    proof.bucket.block = &tampered_block;
+    try testing.expectError(error.UnknownRecord, verifyMembership(&proof, expected));
 }
