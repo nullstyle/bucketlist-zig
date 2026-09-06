@@ -182,7 +182,7 @@ pub fn Frontier(comptime depth: usize) type {
             var h = Sha256.init(.{});
             h.update("bucketlist.database.v1\x00");
             h.update(&schema_hash);
-            h.update(&profileHash());
+            h.update(&self.profile_hash);
             hashInt(u64, &h, self.seq);
             h.update(&list_root);
             h.update(&continuation);

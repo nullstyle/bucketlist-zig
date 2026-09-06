@@ -563,6 +563,204 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             }
         };
 
+        /// A generated visible-state proof plus every allocation it owns.
+        pub const ProofBundle = struct {
+            proof: lib.proofs.VisibleProof,
+            levels: []lib.proofs.ChainLevel,
+            blocks: [][]u8,
+            steps: [][]const lib.proofs.BlockPath.Step,
+            gpa: Allocator,
+            pub fn deinit(self: *ProofBundle) void {
+                self.gpa.free(self.proof.key);
+                for (self.blocks) |block| self.gpa.free(block);
+                self.gpa.free(self.blocks);
+                for (self.steps) |list| self.gpa.free(list);
+                self.gpa.free(self.steps);
+                self.gpa.free(self.proof.younger);
+                self.gpa.free(self.levels);
+            }
+        };
+
+        const ScannedBucket = struct {
+            present: bool,
+            block: []u8,
+            block_index: u64,
+            block_count: u64,
+            record_count: u64,
+            leaves: []lib.proofs.Hash,
+            bracketed: bool,
+        };
+
+        /// Stream one bucket under the read index, re-deriving block bytes,
+        /// leaf hashes, and the block that contains or brackets the key.
+        fn scanForProof(self: *Self, gpa: Allocator, hash: Hash, table: u32, key: []const u8) !ScannedBucket {
+            const target: u32 = self.v2Target().?;
+            var cursor = try self.store.scanBucketIndexed(hash, self.mergeLimits());
+            defer cursor.deinit();
+            var leaves: std.ArrayList(lib.proofs.Hash) = .empty;
+            errdefer leaves.deinit(gpa);
+            var block: std.ArrayList(u8) = .empty;
+            errdefer block.deinit(gpa);
+            var block_size: u64 = 0;
+            var block_index: u64 = 0;
+            var record_count: u64 = 0;
+            var present = false;
+            var bracketed = false;
+            var chosen: ?struct { index: u64, bytes: []u8, leaves_at_close: usize } = null;
+            while (true) {
+                const record = try cursor.next() orelse break;
+                // Re-frame into the current block buffer.
+                var header: [8]u8 = undefined;
+                std.mem.writeInt(u32, header[0..4], record.table, .big);
+                std.mem.writeInt(u32, header[4..8], @intCast(record.key.len), .big);
+                try block.appendSlice(gpa, &header);
+                try block.appendSlice(gpa, record.key);
+                try block.append(gpa, @intFromBool(record.value != null));
+                if (record.value) |value| {
+                    var length: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &length, @intCast(value.len), .big);
+                    try block.appendSlice(gpa, &length);
+                    try block.appendSlice(gpa, value);
+                    block_size += 13 + record.key.len + value.len;
+                } else block_size += 9 + record.key.len;
+                record_count += 1;
+                const order: std.math.Order = if (record.table != table)
+                    (if (record.table < table) .lt else .gt)
+                else
+                    std.mem.order(u8, record.key, key);
+                if (order == .eq) present = true;
+                if (block_size >= target) {
+                    // Close this block: hash it over the re-framed bytes.
+                    const leaf = lib.proofs.blockHash(block_index, block.items);
+                    try leaves.append(gpa, leaf);
+                    if (present and chosen == null) {
+                        chosen = .{ .index = block_index, .bytes = try gpa.dupe(u8, block.items), .leaves_at_close = leaves.items.len };
+                    }
+                    if (!present and !bracketed and order == .gt) {
+                        bracketed = true;
+                        chosen = .{ .index = block_index, .bytes = try gpa.dupe(u8, block.items), .leaves_at_close = leaves.items.len };
+                    }
+                    block.clearRetainingCapacity();
+                    block_size = 0;
+                    block_index += 1;
+                }
+            }
+            if (block.items.len > 0) {
+                const leaf = lib.proofs.blockHash(block_index, block.items);
+                try leaves.append(gpa, leaf);
+                if (chosen == null) {
+                    chosen = .{ .index = block_index, .bytes = try gpa.dupe(u8, block.items), .leaves_at_close = leaves.items.len };
+                }
+            } else if (chosen == null) {
+                return error.NoBracketingBlock;
+            }
+            block.deinit(gpa);
+            const picked = chosen.?;
+            return .{
+                .present = present,
+                .block = picked.bytes,
+                .block_index = picked.index,
+                .block_count = block_index + @intFromBool(block.items.len > 0),
+                .record_count = record_count,
+                .leaves = try leaves.toOwnedSlice(gpa),
+                .bracketed = bracketed or present,
+            };
+        }
+
+        /// Generate the youngest-wins visible-state proof for one key from
+        /// the current frontier. Requires a v2 profile.
+        pub fn prove(self: *Self, comptime name: Name, key: Def.table(name).Key, gpa: Allocator) !ProofBundle {
+            const target = self.v2Target() orelse return error.ProfileMismatch;
+            _ = target;
+            const T = Def.table(name);
+            var buf: [lib.Codec(T.Key).max_size]u8 = undefined;
+            const key_bytes = try lib.Codec(T.Key).encode(key, &buf);
+            var blocks: std.ArrayList([]u8) = .empty;
+            errdefer {
+                for (blocks.items) |b| gpa.free(b);
+                blocks.deinit(gpa);
+            }
+            var steps: std.ArrayList([]const lib.proofs.BlockPath.Step) = .empty;
+            errdefer {
+                for (steps.items) |list| gpa.free(list);
+                steps.deinit(gpa);
+            }
+            var placements: std.ArrayList(lib.proofs.SlotPlacement) = .empty;
+            errdefer placements.deinit(gpa);
+            var scanned_leaves: std.ArrayList([]lib.proofs.Hash) = .empty;
+            errdefer {
+                for (scanned_leaves.items) |list| gpa.free(list);
+                scanned_leaves.deinit(gpa);
+            }
+            var deciding: ?lib.proofs.SlotPlacement = null;
+            var deciding_value: ?[]const u8 = null;
+            _ = &deciding_value;
+            var deciding_present = false;
+            generate: for (self.frontier.levels, 0..) |level, level_index| {
+                for ([_]struct { hash: Hash, snapshot: bool }{
+                    .{ .hash = level.curr, .snapshot = false },
+                    .{ .hash = level.snap, .snapshot = true },
+                }) |slot| {
+                    if (std.mem.eql(u8, &slot.hash, &self.frontier.empty)) continue;
+                    const scanned = try self.scanForProof(gpa, slot.hash, T.id, key_bytes);
+                    defer gpa.free(scanned.leaves);
+                    const path = try lib.proofs.blockPath(gpa, scanned.leaves, @intCast(scanned.block_index));
+                    const placement: lib.proofs.SlotPlacement = .{
+                        .slot_level = level_index,
+                        .slot_snapshot = slot.snapshot,
+                        .bucket = .{
+                            .block = scanned.block,
+                            .block_index = scanned.block_index,
+                            .block_count = scanned.block_count,
+                            .record_count = scanned.record_count,
+                            .path = path,
+                        },
+                    };
+                    try blocks.append(gpa, scanned.block);
+                    try steps.append(gpa, path.steps);
+                    if (scanned.present) {
+                        deciding = placement;
+                        deciding_present = true;
+                        deciding_value = valueInBlock(scanned.block, T.id, key_bytes);
+                        break :generate;
+                    }
+                    try placements.append(gpa, placement);
+                    deciding = placement;
+                }
+            }
+            const final_placement = deciding orelse return error.KeyNotFound;
+            if (!deciding_present) {
+                // The oldest non-empty bucket decides absence; drop its
+                // duplicated absence entry from the younger list.
+                if (placements.items.len > 0 and placements.items[placements.items.len - 1].slot_level == final_placement.slot_level and placements.items[placements.items.len - 1].slot_snapshot == final_placement.slot_snapshot) {
+                    _ = placements.pop();
+                }
+            }
+            const levels = try gpa.alloc(lib.proofs.ChainLevel, depth);
+            errdefer gpa.free(levels);
+            for (self.frontier.levels, 0..) |level, i| {
+                levels[i] = .{ .curr = level.curr, .snap = level.snap, .next = level.next };
+            }
+            return .{
+                .proof = .{
+                    .table = T.id,
+                    .key = try gpa.dupe(u8, key_bytes),
+                    .value = deciding_value,
+                    .absent = !deciding_present,
+                    .younger = try placements.toOwnedSlice(gpa),
+                    .deciding = final_placement,
+                    .schema_hash = schema_hash,
+                    .profile_hash = self.frontier.profile_hash,
+                    .advance = self.frontier.seq,
+                    .levels = levels,
+                },
+                .levels = levels,
+                .blocks = try blocks.toOwnedSlice(gpa),
+                .steps = try steps.toOwnedSlice(gpa),
+                .gpa = gpa,
+            };
+        }
+
         /// Requires quiescent readers. Retains current, pinned views, and each
         /// explicit reference; authenticates all roots before deleting anything.
         pub fn collect(self: *Self, retained: []const Reference) !usize {
@@ -588,6 +786,29 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             }
         }
     };
+}
+
+/// Borrow the claimed value slice from inside a re-framed block copy.
+fn valueInBlock(block: []const u8, table: u32, key: []const u8) ?[]const u8 {
+    var position: usize = 0;
+    while (position + 8 <= block.len) {
+        const record_table = std.mem.readInt(u32, block[position..][0..4], .big);
+        const key_len = std.mem.readInt(u32, block[position + 4 ..][0..4], .big);
+        if (position + 8 + key_len + 1 > block.len) return null;
+        const record_key = block[position + 8 ..][0..key_len];
+        position += 8 + key_len;
+        const tag = block[position];
+        position += 1;
+        if (tag == 1) {
+            const value_len = std.mem.readInt(u32, block[position..][0..4], .big);
+            position += 4;
+            if (position + value_len > block.len) return null;
+            const value = block[position..][0..value_len];
+            position += value_len;
+            if (record_table == table and std.mem.eql(u8, record_key, key)) return value;
+        } else if (record_table == table and std.mem.eql(u8, record_key, key)) return null;
+    }
+    return null;
 }
 
 fn rowSize(row: Record) usize {

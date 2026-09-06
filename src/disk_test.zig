@@ -67,6 +67,65 @@ test "disk: point reads agree with and without the local read index" {
     }
 }
 
+test "disk: generated visible proofs verify against the live commitment" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try pathOf(&tmp, &buf);
+    const V2Disk = native.DatabaseWithDepth(Schema, 4);
+    const v2_format: store.BucketFormat = .{ .v2 = .{ .target_block_bytes = 96 } };
+    const reference = blk: {
+        var db = try V2Disk.open(gpa, io, path, .{ .merge_workers = 1, .format = v2_format });
+        defer db.deinit();
+        for (1..40) |seq| {
+            var batch = V2Disk.Batch.init(gpa);
+            defer batch.deinit();
+            try batch.put(.accounts, seq % 7, seq * 3);
+            if (seq % 3 == 0) try batch.delete(.flags, @intCast(seq % 5)) else try batch.put(.flags, @intCast(seq % 5), seq % 2 == 0);
+            var prepared = try db.prepare(seq, &batch, &.{@intCast(seq % 256)});
+            defer prepared.deinit();
+            try prepared.commit();
+        }
+        const digest = db.commitment().digest;
+        // Membership: a live key, proven and verified against the digest.
+        {
+            var bundle = try db.prove(.accounts, 0, gpa);
+            defer bundle.deinit();
+            try lib.proofs.verifyVisible(&bundle.proof, digest);
+            try std.testing.expect(!bundle.proof.absent);
+            try std.testing.expectEqual(@as(?u64, 35 * 3), try db.get(.accounts, 0));
+        }
+        // Absence: a key that never existed.
+        {
+            var bundle = try db.prove(.accounts, 12345, gpa);
+            defer bundle.deinit();
+            try lib.proofs.verifyVisible(&bundle.proof, digest);
+            try std.testing.expect(bundle.proof.absent);
+        }
+        // A deleted key proves as absent: flags table at a tombstoned slot.
+        {
+            var bundle = try db.prove(.flags, 0, gpa);
+            defer bundle.deinit();
+            try lib.proofs.verifyVisible(&bundle.proof, digest);
+        }
+        // Forged digest rejection.
+        {
+            var bundle = try db.prove(.accounts, 3, gpa);
+            defer bundle.deinit();
+            var wrong = digest;
+            wrong[0] ^= 0xff;
+            try std.testing.expectError(error.InvalidProof, lib.proofs.verifyVisible(&bundle.proof, wrong));
+        }
+        break :blk db.reference();
+    };
+    // The same proof verifies after reopen against the reopened digest.
+    var db = try V2Disk.open(gpa, io, path, .{ .merge_workers = 1, .format = v2_format, .expected = reference });
+    defer db.deinit();
+    var bundle = try db.prove(.accounts, 6, gpa);
+    defer bundle.deinit();
+    try lib.proofs.verifyVisible(&bundle.proof, db.commitment().digest);
+}
+
 test "disk: v2 profiles execute, reopen identically, and bind distinct digests" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
