@@ -63,6 +63,7 @@ TARGET_BY_SUFFIX = {
     "codec": "codec",
     "bucket": "bucket",
     "checkpoint": "checkpoint",
+    "proof": "proof",
     "synthetic failure": "probe",
 }
 

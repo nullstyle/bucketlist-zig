@@ -84,7 +84,7 @@ The same `Guided` oracle runs under Zig's integrated LLVM fuzzer on this
 repository's pinned compiler on macOS and native Linux ARM64 (the self-hosted
 AArch64 backend silently skips `std.testing.fuzz`, so the guided artifacts set
 `use_llvm`).
-Three fuzz tests — codec, bucket, and checkpoint — execute a fixed seed corpus
+Four fuzz tests — codec, bucket, checkpoint, and proof — execute a fixed seed corpus
 derived from the deterministic corpus above: codec boundary values, empty and
 framed buckets, all 39 checkpoint fixtures with a depth selector byte, and two
 deliberate >128-record seeds. The ordinary `guided-coverage` step (included in
@@ -123,6 +123,9 @@ mise exec -- just guided-self-test
 Replay tooling is shared, not duplicated: raw inputs take `--replay-raw`,
 Smith-framed inputs `--replay-smith`, and fuzzer cache files `--replay-mapped`;
 `--expect accepted|rejected|oom` or `--expect-error NAME` assert the outcome.
+The proof target shapes a deterministic v2 fixture from the input bytes,
+requires the honestly built membership proof to verify against its digest,
+and requires one of nine selector-picked forgeries to be rejected.
 A real finding is minimized by hand into a checked-in corpus entry with the
 replay command recorded; no automatic crash minimization exists on this pin.
 

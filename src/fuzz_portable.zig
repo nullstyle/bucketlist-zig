@@ -6,6 +6,7 @@ const codec = @import("codec.zig");
 const bucket = @import("bucket.zig");
 const database = @import("database.zig");
 const schema = @import("schema.zig");
+const proofs = @import("proofs.zig");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const Hash = [32]u8;
@@ -34,7 +35,7 @@ pub const Options = struct { iterations: usize = 1000, seed: u64 = 0x6275636b657
 /// frame of exactly that length. The mapped file is a fixed-size buffer, so
 /// trailing padding after the input is allowed and ignored.
 pub const ReplayFraming = enum { raw, smith, mapped };
-pub const ReplayTarget = enum { codec, bucket, checkpoint, probe };
+pub const ReplayTarget = enum { codec, bucket, checkpoint, proof, probe };
 pub const MappedHeader = struct { coverage: u64, instance: u32, test_index: u32, length: u32 };
 pub const Replay = struct {
     target: ReplayTarget = .codec,
@@ -716,7 +717,7 @@ fn runCase(corpus: *const Corpus, stats: *Stats, gpa: Allocator, index: usize, r
     }
 }
 
-pub const GuidedTarget = enum { codec, bucket, checkpoint };
+pub const GuidedTarget = enum { codec, bucket, checkpoint, proof };
 pub const GuidedOutcome = enum { accepted, rejected, oom };
 pub const GuidedResult = struct { outcome: GuidedOutcome, peak_case_bytes: usize };
 pub const max_guided_input_bytes = max_input;
@@ -732,7 +733,7 @@ var guided_executions: usize = 0;
 pub const Guided = struct {
     gpa: Allocator,
     corpus: Corpus,
-    seeds: [3]Seeds = .{ .{}, .{}, .{} },
+    seeds: [4]Seeds = .{ .{}, .{}, .{}, .{} },
 
     const Seeds = struct {
         raw: std.ArrayList([]const u8) = .empty,
@@ -827,6 +828,7 @@ pub const Guided = struct {
         const checkpoint = try db.checkpoint(self.gpa);
         defer self.gpa.free(checkpoint);
         try self.addSeed(.checkpoint, 0, checkpoint);
+        try self.addSeed(.proof, null, &.{ 0, 3, 40, 2, 5, 9, 1, 7, 4, 8, 6 });
     }
 
     pub fn replay(self: *const Guided, target: GuidedTarget, input: []const u8) !GuidedResult {
@@ -856,6 +858,10 @@ pub const Guided = struct {
 
     fn checkInput(self: *const Guided, target: GuidedTarget, gpa: Allocator, input: []const u8) !GuidedOutcome {
         switch (target) {
+            .proof => {
+                if (input.len < 10) return .rejected;
+                return try self.checkProofOracle(gpa, input);
+            },
             .codec => {
                 if (input.len == 0) return .rejected;
                 const bytes = input[1..];
@@ -910,6 +916,136 @@ pub const Guided = struct {
         return .accepted;
     }
 
+    /// Deterministic v2 proof oracle: Smith bytes shape a small fixture,
+    /// the honestly built membership proof must verify against its digest,
+    /// and one of nine selector-picked forgeries must be rejected.
+    fn checkProofOracle(self: *const Guided, gpa: Allocator, input: []const u8) !GuidedOutcome {
+        _ = self;
+        const count: usize = 2 + input[1] % 7;
+        const target: u32 = 21 + input[3] % 44;
+        // Frame sorted distinct records: table 1, u16 keys, 2-byte values.
+        var blocks: [8][80]u8 = undefined;
+        var block_lens: [8]usize = @splat(0);
+        var block_sizes: [8]u64 = @splat(0);
+        var block_count: usize = 0;
+        var keys: [8]u16 = undefined;
+        for (0..count) |i| {
+            if (block_lens[block_count] == 0 and block_count > 0 and false) unreachable;
+            const key: u16 = @intCast(i * 2 + input[2] % 2 * 0);
+            keys[i] = key;
+            const value = [2]u8{ input[(4 + i * 2) % input.len], input[(5 + i * 2) % input.len] };
+            var record: [9 + 2 + 4 + 2]u8 = undefined;
+            std.mem.writeInt(u32, record[0..4], 1, .big);
+            std.mem.writeInt(u32, record[4..8], 2, .big);
+            std.mem.writeInt(u16, record[8..10], key, .big);
+            record[10] = 1;
+            std.mem.writeInt(u32, record[11..15], 2, .big);
+            record[15] = value[0];
+            record[16] = value[1];
+            const b = &blocks[block_count];
+            @memcpy(b[block_lens[block_count]..][0..17], &record);
+            block_lens[block_count] += 17;
+            block_sizes[block_count] += 17;
+            if (block_sizes[block_count] >= target) block_count += 1;
+        }
+        if (block_lens[block_count] > 0) block_count += 1;
+        var leaves: [8][32]u8 = undefined;
+        var tree: proofs.BlockTree = .{};
+        for (0..block_count) |i| {
+            leaves[i] = proofs.blockHash(@intCast(i), blocks[i][0..block_lens[i]]);
+            tree.append(leaves[i]);
+        }
+        const bucket_hash = proofs.bucketHash(@intCast(count), @intCast(block_count), tree.root());
+        var schema_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(input[0..8], &schema_hash, .{});
+        const profile = proofs.profileHash(4, target);
+        var levels: [4]proofs.ChainLevel = undefined;
+        const empty_bucket = proofs.emptyBucketHash();
+        for (&levels, 0..) |*level, i| {
+            var hash: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(&[_]u8{input[6], input[7], @intCast(i)}, &hash, .{});
+            level.* = .{ .curr = hash, .snap = empty_bucket };
+        }
+        levels[0].curr = empty_bucket;
+        levels[0].snap = empty_bucket;
+        levels[1].curr = bucket_hash;
+        const advance_number: u64 = std.mem.readInt(u16, input[8..10], .big);
+        const digest = proofs.chainCommitment(schema_hash, profile, advance_number, &levels);
+        // Locate the chosen record's block.
+        const chosen = input[4] % count;
+        var block_index: usize = 0;
+        {
+            var seen: usize = 0;
+            for (0..block_count) |i| {
+                const records_here = block_lens[i] / 17;
+                if (chosen < seen + records_here) {
+                    block_index = i;
+                    break;
+                }
+                seen += records_here;
+            }
+        }
+        var key_bytes: [2]u8 = undefined;
+        std.mem.writeInt(u16, &key_bytes, keys[chosen], .big);
+        var value_bytes: [2]u8 = undefined;
+        {
+            const offset = block_index * 17 * 0 + block_lens[0..].len * 0; // value lives inside the record
+            _ = offset;
+            // Recompute the record's value from the same input derivation.
+            value_bytes[0] = input[(4 + chosen * 2) % input.len];
+            value_bytes[1] = input[(5 + chosen * 2) % input.len];
+        }
+        const path = try proofs.blockPath(gpa, leaves[0..block_count], block_index);
+        defer gpa.free(path.steps);
+        var proof = proofs.MembershipProof{
+            .table = 1,
+            .key = &key_bytes,
+            .value = &value_bytes,
+            .slot_level = 1,
+            .slot_snapshot = false,
+            .schema_hash = schema_hash,
+            .profile_hash = profile,
+            .advance = advance_number,
+            .levels = &levels,
+            .bucket = .{
+                .block = blocks[block_index][0..block_lens[block_index]],
+                .block_index = @intCast(block_index),
+                .block_count = @intCast(block_count),
+                .record_count = @intCast(count),
+                .path = path,
+            },
+        };
+        try proofs.verifyMembership(&proof, digest);
+        // Selector-picked forgery must fail.
+        const selector = input[0] % 9;
+        var wrong_digest = digest;
+        switch (selector) {
+            0 => wrong_digest[0] ^= 0xFF,
+            1 => proof.bucket.record_count += 1,
+            2 => proof.bucket.block_count += 1,
+            3 => proof.bucket.block_index +%= 1,
+            4 => {
+                var mutated = try gpa.dupe(u8, proof.bucket.block);
+                defer gpa.free(mutated);
+                mutated[mutated.len - 1] ^= 0xFF;
+                proof.bucket.block = mutated;
+                if (proofs.verifyMembership(&proof, wrong_digest)) |_| return error.ForgedProofAccepted else |_| {}
+                return .accepted;
+            },
+            5 => proof.slot_snapshot = true,
+            6 => proof.advance +%= 1,
+            7 => {
+                var flipped: [2]u8 = value_bytes;
+                flipped[0] ^= 0xFF;
+                proof.value = &flipped;
+            },
+            8 => proof.slot_level = 2,
+            else => {},
+        }
+        if (proofs.verifyMembership(&proof, wrong_digest)) |_| return error.ForgedProofAccepted else |_| {}
+        return .accepted;
+    }
+
     fn fuzzCodec(self: *const Guided, smith: *std.testing.Smith) anyerror!void {
         _ = try self.fromSmith(.codec, smith);
     }
@@ -918,6 +1054,9 @@ pub const Guided = struct {
     }
     fn fuzzCheckpoint(self: *const Guided, smith: *std.testing.Smith) anyerror!void {
         _ = try self.fromSmith(.checkpoint, smith);
+    }
+    fn fuzzProof(self: *const Guided, smith: *std.testing.Smith) anyerror!void {
+        _ = try self.fromSmith(.proof, smith);
     }
 };
 
@@ -936,6 +1075,15 @@ test "portable guided: bucket" {
     const corpus = guided.smithCorpus(.bucket);
     const executed = guided_executions;
     try std.testing.fuzz(@as(*const Guided, &guided), Guided.fuzzBucket, .{ .corpus = corpus });
+    try std.testing.expect(guided_executions >= executed + corpus.len + 1);
+}
+
+test "portable guided: proof" {
+    var guided = try Guided.init(std.testing.allocator);
+    defer guided.deinit();
+    const corpus = guided.smithCorpus(.proof);
+    const executed = guided_executions;
+    try std.testing.fuzz(@as(*const Guided, &guided), Guided.fuzzProof, .{ .corpus = corpus });
     try std.testing.expect(guided_executions >= executed + corpus.len + 1);
 }
 
@@ -1137,6 +1285,7 @@ fn guidedTarget(target: ReplayTarget) GuidedTarget {
         .codec => .codec,
         .bucket => .bucket,
         .checkpoint => .checkpoint,
+        .proof => .proof,
         .probe => unreachable,
     };
 }
