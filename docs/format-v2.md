@@ -78,10 +78,33 @@ and the profile, computable in the existing two-pass bounded-memory merge.
 
 ## Proofs (Stage 2 preview)
 
-A membership proof carries the record's block bytes, that block's index and
-leaf count context, the sibling-hash path through the block tree (sibling
-per paired round; pass-through rounds contribute no sibling), the level
-placement leading to the list root, and the schema/profile/advance binding
-to the database digest. Absence classes — tombstone membership,
-absence-between-neighbors inside a block, and terminal-drop absence — each
-receive an exact tested definition before any proof API is advertised.
+## Proof semantics (final)
+
+A **membership proof** carries the record's block bytes, block index, the
+bucket's counts, the sibling path through the peak structure, the slot
+placement, the full frontier levels, and the schema/profile/advance
+binding; the verifier re-derives block hash, path fold, bucket hash, slot,
+and commitment digest, predicting every path side from the leaf count.
+
+**Absence classes**, each exactly defined and tested:
+
+1. **Tombstone membership.** A deletion marker is an ordinary record: a
+   membership proof with a null value claim. Provable like any value.
+2. **Absence between neighbors.** Inside the bracketing block, the key
+   sorts strictly between two adjacent records — or before the first
+   record of block zero, or after the last record of the final block.
+   Any other placement could hide the key in a sibling block.
+3. **Terminal-drop absence.** At the terminal level the engine enforces
+   the v1 invariant that no tombstones survive (reopen validation
+   rejects violations), so an absence proof over the terminal bucket is
+   complete: nothing can hide there. A key deleted and dropped at
+   terminal depth is therefore *deliberately indistinguishable* from a
+   key that never existed — deleted history is not committed state, and
+   no proof can or should recover it.
+
+**Youngest-wins composition.** A visible-state proof lists younger slots
+youngest-first (level ascending, current before snapshot, the engine's
+own lookup order), each proving class-2/3 absence, and requires every
+strictly younger slot to be covered or hold the computable empty-bucket
+hash; the deciding slot carries the class-1 or class-2 result. This is
+what `Database.prove` generates and `verifyVisible` checks.
