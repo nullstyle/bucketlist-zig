@@ -258,6 +258,22 @@ pub fn build(b: *std.Build) void {
     disk_bench_run.addPassthruArgs();
     b.step("disk-bench", "Measure file execution; -- fresh-path [MiB] [batch-rows] [read-samples] [trials]").dependOn(&disk_bench_run.step);
     check.dependOn(&disk_bench.step);
+    const workload_bench = b.addExecutable(.{
+        .name = "workload-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/workload-bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "bucketlist", .module = lib },
+                .{ .name = "bucketlist-disk", .module = disk },
+            },
+        }),
+    });
+    const workload_bench_run = b.addRunArtifact(workload_bench);
+    workload_bench_run.addPassthruArgs();
+    b.step("workload-bench", "Production workload qualification; -- ledger|zipf|catchup fresh-path [params]").dependOn(&workload_bench_run.step);
+    check.dependOn(&workload_bench.step);
     const read_bench = b.addExecutable(.{
         .name = "read-bench",
         .root_module = b.createModule(.{

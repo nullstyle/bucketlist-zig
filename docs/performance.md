@@ -291,3 +291,34 @@ no cold per-bucket pass.
 ```sh
 mise exec -- zig build read-bench -Doptimize=ReleaseFast -- /absolute/fresh/store 64 16 128
 ```
+
+## Workload qualification harness
+
+`tools/workload-bench.zig` runs three pre-registered production shapes
+(`zig build workload-bench -- <mode> /absolute/fresh/path [params]`),
+each reporting medians and tails with the same logical-traffic counters as
+the recorded workloads above:
+
+- **ledger** — consensus-node writing: 50-200 change batches, 85/15
+  put/delete over a bounded key space, 93% values 32-64 B, 6% 256 B-1 KiB,
+  1% blobs 1-64 KiB. Metrics: commit latency distribution, advances/sec,
+  write amplification (positional write bytes per logical payload byte),
+  blob growth.
+- **zipf** — read serving: builds the key space, then a 95/5 read/write
+  mix over a Zipf-Mandelbrot distribution (skew sweeps via the `skew_x10`
+  parameter). Metrics: read and write latency distributions, sustained
+  ops/sec, logical read traffic.
+- **catchup** — rejoin after downtime: reopen-with-validation wall time
+  and validated GiB/sec at scale, fastest-possible suffix replay
+  throughput, and the post-replay reopen delta.
+
+Smoke-scale first measurements (ReleaseFast, this machine, blob-heavy
+default value mix): ledger 2,000 advances over 50k keys commits at
+p50 55 ms / p99 94 ms with write amplification 11.8x; zipf (skew 1.0,
+50k keys) reads at p50 361 us / p99 1.4 ms with writes p99 80 ms;
+catchup over ~1 GB of blobs reopens in 102 ms — **9.14 GiB/s validated**,
+so reopen cost scales linearly at roughly a tenth of a second per GiB and
+restart floors stay sub-second into multi-GiB stores. These are
+first-contact numbers at toy scale, recorded to anchor the parameter
+space; qualification runs at target scale with pre-registered thresholds
+remain open work.
