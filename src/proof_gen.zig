@@ -32,7 +32,6 @@ pub const Hash = struct {
             if (self._reader.isPointerNull(0)) return &[_]u8{};
             return try self._reader.readData(0);
         }
-
     };
 
     pub const Builder = struct {
@@ -54,7 +53,6 @@ pub const Hash = struct {
         pub fn setBytes(self: *Builder, value: []const u8) !void {
             try self._builder.writeData(0, value);
         }
-
     };
 };
 
@@ -84,7 +82,6 @@ pub const Step = struct {
         pub fn getRight(self: Reader) !bool {
             return self._reader.readBool(0, 0) != false;
         }
-
     };
 
     pub const Builder = struct {
@@ -111,7 +108,6 @@ pub const Step = struct {
         pub fn setRight(self: *Builder, value: bool) !void {
             self._builder.writeBool(0, 0, value != false);
         }
-
     };
 };
 
@@ -161,7 +157,6 @@ pub const BucketProof = struct {
             const raw = try self._reader.readStructList(1);
             return StructListReader(Step){ ._list = raw };
         }
-
     };
 
     pub const Builder = struct {
@@ -204,7 +199,6 @@ pub const BucketProof = struct {
             const raw = try self._builder.writeStructList(1, element_count, 1, 1);
             return StructListBuilder(Step){ ._list = raw };
         }
-
     };
 };
 
@@ -250,7 +244,6 @@ pub const ChainLevel = struct {
             const value = try self._reader.readStruct(2);
             return Hash.Reader{ ._reader = value };
         }
-
     };
 
     pub const Builder = struct {
@@ -291,7 +284,6 @@ pub const ChainLevel = struct {
             const builder = try self._builder.initStruct(2, 0, 1);
             return Hash.Builder{ ._builder = builder };
         }
-
     };
 };
 
@@ -325,7 +317,6 @@ pub const SlotPlacement = struct {
             const value = try self._reader.readStruct(0);
             return BucketProof.Reader{ ._reader = value };
         }
-
     };
 
     pub const Builder = struct {
@@ -356,7 +347,6 @@ pub const SlotPlacement = struct {
             const builder = try self._builder.initStruct(0, 3, 2);
             return BucketProof.Builder{ ._builder = builder };
         }
-
     };
 };
 
@@ -455,7 +445,6 @@ pub const VisibleProof = struct {
             const raw = try self._reader.readStructList(6);
             return StructListReader(ChainLevel){ ._list = raw };
         }
-
     };
 
     pub const Builder = struct {
@@ -542,7 +531,5 @@ pub const VisibleProof = struct {
             const raw = try self._builder.writeStructList(6, element_count, 0, 3);
             return StructListBuilder(ChainLevel){ ._list = raw };
         }
-
     };
 };
-

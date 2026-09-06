@@ -38,9 +38,24 @@ pub fn build(b: *std.Build) void {
             .{ .name = "bucketlist-store", .module = store },
         },
     });
+    const capnp_dep = b.dependency("capnp", .{});
+    const capnp_core = capnp_dep.module("capnpc-zig-core");
+    const proofs_wire = b.addModule("bucketlist-proofs", .{
+        .root_source_file = b.path("src/proofs_wire.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "bucketlist", .module = lib },
+            .{ .name = "capnpc-zig", .module = capnp_core },
+        },
+    });
+    const proofs_wire_tests = b.addTest(.{ .root_module = proofs_wire });
+
     const tests = b.addTest(.{ .root_module = lib });
     const test_step = b.step("test", "Run library tests, seeded parser cases, and consumer examples");
     const check = b.step("check", "Compile native tests, examples, and validation tools without running them");
+    check.dependOn(&proofs_wire_tests.step);
+    test_step.dependOn(&b.addRunArtifact(proofs_wire_tests).step);
     check.dependOn(&tests.step);
     test_step.dependOn(&b.addRunArtifact(tests).step);
     const store_tests = b.addTest(.{ .root_module = store });

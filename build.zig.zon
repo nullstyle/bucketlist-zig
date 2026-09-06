@@ -4,7 +4,11 @@
     .version = "0.1.0-dev",
     .minimum_zig_version = "0.17.0-dev.1786",
     .dependencies = .{
-        .none = .{
+        .capnp = .{
+            .url = "git+https://github.com/nullstyle/capnp-zig.git?ref=v0.18.0#51e6da819fa2eb1e646c0d4157c11a4108348b76",
+            .hash = "capnpc_zig-0.18.0-nUduFTdRNwBzlJgTt6x9lUwRGmpWzSVXrMSE-xFj_dND",
+        },
+        .capnpc_zig = .{
             .url = "git+https://github.com/nullstyle/capnp-zig.git?ref=v0.18.0#51e6da819fa2eb1e646c0d4157c11a4108348b76",
             .hash = "capnpc_zig-0.18.0-nUduFTdRNwBzlJgTt6x9lUwRGmpWzSVXrMSE-xFj_dND",
         },
