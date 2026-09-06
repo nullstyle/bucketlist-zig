@@ -96,3 +96,54 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def h32(hexstr):
+    return bytes.fromhex(hexstr)
+
+
+def chain_digest(schema_hex, profile_hex, seq, levels):
+    """The v1-chain commitment recomputation: identical composition for v1 and
+    v2 profiles given the profile hash. levels = [(curr, snap, next|None)]."""
+    schema, profile = h32(schema_hex), h32(profile_hex)
+    level_hashes = [
+        sha(b"bucketlist.level.v1\x00", i.to_bytes(4, "big"), h32(c), h32(s))
+        for i, (c, s, _) in enumerate(levels)
+    ]
+    list_root = sha(b"bucketlist.list.v1\x00", profile, *level_hashes)
+    cont = hashlib.sha256()
+    cont.update(b"bucketlist.continuation.v1\x00")
+    cont.update(profile)
+    for i, (_, _, nxt) in enumerate(levels):
+        cont.update(i.to_bytes(4, "big"))
+        cont.update(b"\x01" if nxt is not None else b"\x00")
+        if nxt is not None:
+            cont.update(h32(nxt))
+    db = hashlib.sha256()
+    db.update(b"bucketlist.database.v1\x00")
+    db.update(schema)
+    db.update(profile)
+    db.update(seq.to_bytes(8, "big"))
+    db.update(list_root)
+    db.update(cont.digest())
+    return db.digest()
+
+
+def chain_cases():
+    """Deterministic level fixtures for the Zig parity test."""
+    import hashlib as _h
+
+    def fake(seed):
+        return _h.sha256(seed.to_bytes(4, "big")).hexdigest()
+
+    case_a = [(fake(10 * i + 1), fake(10 * i + 2), None) for i in range(11)]
+    case_b = [(fake(20 * i + 1), fake(20 * i + 2), fake(20 * i + 3) if i == 4 else None) for i in range(11)]
+    schema = fake(900)
+    profile = fake(901)
+    for name, seq, levels in (("a", 5, case_a), ("b", 70, case_b)):
+        print(f"chain {name}: {chain_digest(schema, profile, seq, levels).hex()}")
+
+
+if __name__ == "__main__":
+    main()
+    chain_cases()

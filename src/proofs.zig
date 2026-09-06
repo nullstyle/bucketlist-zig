@@ -259,6 +259,50 @@ pub fn verifyBlockPath(leaf: Hash, index: usize, leaf_count: usize, path: BlockP
     if (!std.mem.eql(u8, &root, &self_hash)) return error.InvalidPath;
 }
 
+/// One frontier level as carried in a proof: the committed current,
+/// snapshot, and optional pending-output hashes.
+pub const ChainLevel = struct {
+    curr: Hash,
+    snap: Hash,
+    next: ?Hash = null,
+};
+
+const level_domain = "bucketlist.level.v1\x00";
+const list_domain = "bucketlist.list.v1\x00";
+const continuation_domain = "bucketlist.continuation.v1\x00";
+const database_domain = "bucketlist.database.v1\x00";
+
+/// Recompute the database commitment from carried level state. The chain
+/// composition is identical for v1 and v2 profiles; the profile hash itself
+/// distinguishes them. Parity-pinned against tools/v2-vectors.py.
+pub fn chainCommitment(schema_hash: Hash, profile_hash: Hash, advance: u64, levels: []const ChainLevel) Hash {
+    var list = Sha256.init(.{});
+    list.update(list_domain);
+    list.update(&profile_hash);
+    var continuation = Sha256.init(.{});
+    continuation.update(continuation_domain);
+    continuation.update(&profile_hash);
+    for (levels, 0..) |level, i| {
+        var level_hash = Sha256.init(.{});
+        level_hash.update(level_domain);
+        hashInt(u32, &level_hash, @intCast(i));
+        level_hash.update(&level.curr);
+        level_hash.update(&level.snap);
+        list.update(&level_hash.finalResult());
+        hashInt(u32, &continuation, @intCast(i));
+        continuation.update(&[1]u8{@intFromBool(level.next != null)});
+        if (level.next) |pending| continuation.update(&pending);
+    }
+    var database = Sha256.init(.{});
+    database.update(database_domain);
+    database.update(&schema_hash);
+    database.update(&profile_hash);
+    hashInt(u64, &database, advance);
+    database.update(&list.finalResult());
+    database.update(&continuation.finalResult());
+    return database.finalResult();
+}
+
 fn hashInt(comptime T: type, h: *Sha256, value: T) void {
     var bytes: [@sizeOf(T)]u8 = undefined;
     std.mem.writeInt(T, &bytes, value, .big);
@@ -389,4 +433,48 @@ test "block paths verify and reject every mutation class" {
             }
         }
     }
+}
+
+test "chain commitment matches the independent model" {
+    const schema: Hash = blk: {
+        var digest: Hash = undefined;
+        var schema_seed: [4]u8 = undefined;
+        std.mem.writeInt(u32, &schema_seed, 900, .big);
+        Sha256.hash(&schema_seed, &digest, .{});
+        break :blk digest;
+    };
+    const profile: Hash = blk: {
+        var digest: Hash = undefined;
+        var profile_seed: [4]u8 = undefined;
+        std.mem.writeInt(u32, &profile_seed, 901, .big);
+        Sha256.hash(&profile_seed, &digest, .{});
+        break :blk digest;
+    };
+    var levels: [11]ChainLevel = undefined;
+    for (&levels, 0..) |*level, i| {
+        var curr: Hash = undefined;
+        var seed: [4]u8 = undefined;
+        std.mem.writeInt(u32, &seed, 10 * @as(u32, @intCast(i)) + 1, .big);
+        Sha256.hash(&seed, &curr, .{});
+        var snap: Hash = undefined;
+        std.mem.writeInt(u32, &seed, 10 * @as(u32, @intCast(i)) + 2, .big);
+        Sha256.hash(&seed, &snap, .{});
+        level.* = .{ .curr = curr, .snap = snap };
+    }
+    try expectLiteral(chainCommitment(schema, profile, 5, &levels), "0b055fabc93fb93fc2b89f6f5ae00c2f339ade44bbad48d064eb39dffce64d65");
+    var pending: Hash = undefined;
+    var pending_seed: [4]u8 = undefined;
+    std.mem.writeInt(u32, &pending_seed, 83, .big);
+    Sha256.hash(&pending_seed, &pending, .{});
+    for (&levels, 0..) |*level, i| {
+        var curr: Hash = undefined;
+        var seed: [4]u8 = undefined;
+        std.mem.writeInt(u32, &seed, 20 * @as(u32, @intCast(i)) + 1, .big);
+        Sha256.hash(&seed, &curr, .{});
+        var snap: Hash = undefined;
+        std.mem.writeInt(u32, &seed, 20 * @as(u32, @intCast(i)) + 2, .big);
+        Sha256.hash(&seed, &snap, .{});
+        level.* = .{ .curr = curr, .snap = snap, .next = if (i == 4) pending else null };
+    }
+    try expectLiteral(chainCommitment(schema, profile, 70, &levels), "2c409e9107d8614fc1bd34b99d705ef0791148ad67d20846f7580b13aafde554");
 }
