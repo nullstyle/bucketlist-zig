@@ -406,14 +406,86 @@ pub fn verifyMembership(proof: *const MembershipProof, expected_digest: Hash) er
         }
     }
     if (position != b.block.len or !found) return error.UnknownRecord;
-    // Block hash -> path -> root -> bucket hash -> claimed slot -> digest.
+    try verifyPlacement(&proof.bucket, proof.slot_level, proof.slot_snapshot, proof.levels, proof.schema_hash, proof.profile_hash, proof.advance, expected_digest);
+}
+
+/// Block hash -> path -> root -> bucket hash -> claimed slot -> digest.
+fn verifyPlacement(b: *const BucketProof, slot_level: usize, slot_snapshot: bool, levels: []const ChainLevel, schema_hash: Hash, profile_hash: Hash, advance: u64, expected_digest: Hash) error{InvalidProof}!void {
+    if (slot_level >= levels.len) return error.InvalidProof;
     const leaf = blockHash(b.block_index, b.block);
     const root = foldBlockPath(leaf, @intCast(b.block_index), @intCast(b.block_count), b.path) catch return error.InvalidProof;
     const bucket = bucketHash(b.record_count, b.block_count, root);
-    const slot_hash = if (proof.slot_snapshot) &proof.levels[proof.slot_level].snap else &proof.levels[proof.slot_level].curr;
+    const slot_hash = if (slot_snapshot) &levels[slot_level].snap else &levels[slot_level].curr;
     if (!std.mem.eql(u8, slot_hash, &bucket)) return error.InvalidProof;
-    const digest = chainCommitment(proof.schema_hash, proof.profile_hash, proof.advance, proof.levels);
+    const digest = chainCommitment(schema_hash, profile_hash, advance, levels);
     if (!std.mem.eql(u8, &digest, &expected_digest)) return error.InvalidProof;
+}
+
+/// A single-bucket absence proof: the key does not exist in this bucket.
+/// The carried block must bracket the key -- strictly between two adjacent
+/// records, before the first record of block zero, or after the last record
+/// of the final block; anything else could hide the key in another block.
+pub const AbsenceProof = struct {
+    table: u32,
+    key: []const u8,
+    slot_level: usize,
+    slot_snapshot: bool,
+    schema_hash: Hash,
+    profile_hash: Hash,
+    advance: u64,
+    levels: []const ChainLevel,
+    bucket: BucketProof,
+};
+
+pub fn verifyAbsence(proof: *const AbsenceProof, expected_digest: Hash) error{ InvalidProof, PresentRecord }!void {
+    const b = &proof.bucket;
+    if (b.block_count == 0 or b.block_index >= b.block_count) return error.InvalidProof;
+    var position: usize = 0;
+    var before_first = true;
+    var after_last = true;
+    var previous_key: ?[]const u8 = null;
+    var previous_table: u32 = 0;
+    while (position < b.block.len) {
+        if (position + 8 > b.block.len) return error.InvalidProof;
+        const table = std.mem.readInt(u32, b.block[position..][0..4], .big);
+        const key_len = std.mem.readInt(u32, b.block[position + 4 ..][0..4], .big);
+        if (key_len > b.block.len or position + 8 + key_len > b.block.len) return error.InvalidProof;
+        const key = b.block[position + 8 ..][0..key_len];
+        position += 8 + key_len;
+        if (position + 1 > b.block.len) return error.InvalidProof;
+        const tag = b.block[position];
+        position += 1;
+        if (tag == 1) {
+            if (position + 4 > b.block.len) return error.InvalidProof;
+            const value_len = std.mem.readInt(u32, b.block[position..][0..4], .big);
+            if (value_len > b.block.len or position + 4 + value_len > b.block.len) return error.InvalidProof;
+            position += 4 + value_len;
+        } else if (tag != 0) return error.InvalidProof;
+        if (previous_key) |prev| {
+            if (previous_table == table and std.mem.order(u8, prev, key) != .lt) return error.InvalidProof;
+            if (previous_table > table) return error.InvalidProof;
+        }
+        const order: std.math.Order = if (table != proof.table)
+            (if (table < proof.table) .lt else .gt)
+        else
+            std.mem.order(u8, key, proof.key);
+        switch (order) {
+            .eq => return error.PresentRecord,
+            // This record sorts after the target, so the target is not
+            // after-everything; vice versa for .lt.
+            .gt => after_last = false,
+            .lt => before_first = false,
+        }
+        previous_key = key;
+        previous_table = table;
+    }
+    if (position != b.block.len) return error.InvalidProof;
+    // Between adjacent records is the default valid bracket. Sorting before
+    // every record is valid only for block zero; after every record only
+    // for the final block; otherwise the key could hide in another block.
+    if (before_first and b.block_index != 0) return error.InvalidProof;
+    if (after_last and b.block_index + 1 != b.block_count) return error.InvalidProof;
+    try verifyPlacement(b, proof.slot_level, proof.slot_snapshot, proof.levels, proof.schema_hash, proof.profile_hash, proof.advance, expected_digest);
 }
 
 fn hashInt(comptime T: type, h: *Sha256, value: T) void {
@@ -706,4 +778,89 @@ test "membership proof verifies and rejects every mutation class" {
     tampered_block[21 + 17] ^= 0xff;
     proof.bucket.block = &tampered_block;
     try testing.expectError(error.UnknownRecord, verifyMembership(&proof, expected));
+}
+
+test "absence proof brackets the key and rejects boundary lies" {
+    const gpa = testing.allocator;
+    var block0: [42]u8 = undefined;
+    var block1: [21]u8 = undefined;
+    {
+        var position: usize = 0;
+        for (0..3) |i| {
+            const target: []u8 = if (i < 2) block0[position..] else block1[position - 42 ..];
+            std.mem.writeInt(u32, target[0..4], 1, .big);
+            std.mem.writeInt(u32, target[4..8], 4, .big);
+            std.mem.writeInt(u32, target[8..12], @intCast(2 * i), .big);
+            target[12] = 1;
+            std.mem.writeInt(u32, target[13..17], 4, .big);
+            std.mem.writeInt(u32, target[17..21], @intCast(i), .big);
+            position += 21;
+        }
+    }
+    const leaves = [_]Hash{ blockHash(0, &block0), blockHash(1, &block1) };
+    const root = combine(leaves[0], leaves[1]);
+    const bucket = bucketHash(3, 2, root);
+    var schema: Hash = undefined;
+    var seed: [4]u8 = undefined;
+    std.mem.writeInt(u32, &seed, 900, .big);
+    Sha256.hash(&seed, &schema, .{});
+    const profile = profileHash(11, 42);
+    var levels: [11]ChainLevel = undefined;
+    for (&levels, 0..) |*level, i| {
+        var hash: Hash = undefined;
+        std.mem.writeInt(u32, &seed, @intCast(50 + i), .big);
+        Sha256.hash(&seed, &hash, .{});
+        level.* = .{ .curr = hash, .snap = hash };
+    }
+    levels[2].snap = bucket;
+    const expected = chainCommitment(schema, profile, 9, &levels);
+    const path0 = try blockPath(gpa, &leaves, 0);
+    defer gpa.free(path0.steps);
+    const path1 = try blockPath(gpa, &leaves, 1);
+    defer gpa.free(path1.steps);
+    // Key 1 sits strictly between block zero's records (keys 0 and 2).
+    var between: [4]u8 = undefined;
+    std.mem.writeInt(u32, &between, 1, .big);
+    var proof = AbsenceProof{
+        .table = 1,
+        .key = &between,
+        .slot_level = 2,
+        .slot_snapshot = true,
+        .schema_hash = schema,
+        .profile_hash = profile,
+        .advance = 9,
+        .levels = &levels,
+        .bucket = .{ .block = &block0, .block_index = 0, .block_count = 2, .record_count = 3, .path = path0 },
+    };
+    try verifyAbsence(&proof, expected);
+    // A present key cannot be proven absent.
+    var present: [4]u8 = undefined;
+    std.mem.writeInt(u32, &present, 2, .big);
+    proof.key = &present;
+    try testing.expectError(error.PresentRecord, verifyAbsence(&proof, expected));
+    // Key 5 sorts after block one's last record (final block): absent.
+    var beyond: [4]u8 = undefined;
+    std.mem.writeInt(u32, &beyond, 5, .big);
+    proof.key = &beyond;
+    proof.bucket = .{ .block = &block1, .block_index = 1, .block_count = 2, .record_count = 3, .path = path1 };
+    try verifyAbsence(&proof, expected);
+    // The same after-last key via block ZERO (not the final block) is a
+    // boundary lie: the key could hide in block one.
+    proof.bucket = .{ .block = &block0, .block_index = 0, .block_count = 2, .record_count = 3, .path = path0 };
+    try testing.expectError(error.InvalidProof, verifyAbsence(&proof, expected));
+    // Before-first is valid only in block zero; via block one it is a lie.
+    var before: [4]u8 = undefined;
+    std.mem.writeInt(u32, &before, 3, .big);
+    proof.key = &before;
+    proof.bucket = .{ .block = &block1, .block_index = 1, .block_count = 2, .record_count = 3, .path = path1 };
+    try testing.expectError(error.InvalidProof, verifyAbsence(&proof, expected));
+    // Placement and digest forgeries still fail.
+    proof.key = &between;
+    proof.bucket = .{ .block = &block0, .block_index = 0, .block_count = 2, .record_count = 3, .path = path0 };
+    proof.advance = 10;
+    try testing.expectError(error.InvalidProof, verifyAbsence(&proof, expected));
+    proof.advance = 9;
+    var wrong_digest = expected;
+    wrong_digest[0] ^= 0xff;
+    try testing.expectError(error.InvalidProof, verifyAbsence(&proof, wrong_digest));
 }
