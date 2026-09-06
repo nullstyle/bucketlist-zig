@@ -538,10 +538,15 @@ pub const Store = struct {
         errdefer result.deinit(gpa);
         while (try cursor.next()) |record| {
             if (record.table != table or !std.mem.eql(u8, record.key, key)) continue;
-            result = if (record.value) |value|
-                .{ .value = gpa.dupe(u8, value) catch return error.OutOfMemory }
-            else
-                .tombstone;
+            result.deinit(gpa);
+            // Assign the union only after the allocation succeeds: this
+            // compiler can set the tag before evaluating a failing payload
+            // expression, which once left a .value tag over an undefined
+            // pointer on x86_64 (freed by the errdefer below).
+            result = if (record.value) |value| blk: {
+                const copy = try gpa.dupe(u8, value);
+                break :blk BucketLookup{ .value = copy };
+            } else .tombstone;
         }
         return result;
     }
@@ -606,10 +611,10 @@ pub const Store = struct {
             }
             if (record.table == table and std.mem.eql(u8, record.key, key)) {
                 result.deinit(gpa);
-                result = if (record.value) |value|
-                    .{ .value = gpa.dupe(u8, value) catch return error.OutOfMemory }
-                else
-                    .tombstone;
+                result = if (record.value) |value| blk: {
+                    const copy = try gpa.dupe(u8, value);
+                    break :blk BucketLookup{ .value = copy };
+                } else .tombstone;
             }
         }
         if (cache) |c| {
@@ -685,10 +690,11 @@ pub const Store = struct {
             else
                 std.mem.order(u8, record_key, key);
             switch (order) {
-                .eq => return if (tag[0] == 0)
-                    .tombstone
-                else
-                    .{ .value = gpa.dupe(u8, value) catch return error.OutOfMemory },
+                .eq => {
+                    if (tag[0] == 0) return .tombstone;
+                    const copy = try gpa.dupe(u8, value);
+                    return BucketLookup{ .value = copy };
+                },
                 .gt => return .absent,
                 .lt => {},
             }
