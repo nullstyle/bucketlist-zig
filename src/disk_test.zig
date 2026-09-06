@@ -67,6 +67,66 @@ test "disk: point reads agree with and without the local read index" {
     }
 }
 
+test "disk: v2 profiles execute, reopen identically, and bind distinct digests" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try pathOf(&tmp, &buf);
+    const V2Disk = native.DatabaseWithDepth(Schema, 4);
+    const v2_format: store.BucketFormat = .{ .v2 = .{ .target_block_bytes = 96 } };
+    const reference = blk: {
+        var db = try V2Disk.open(gpa, io, path, .{ .merge_workers = 1, .format = v2_format });
+        defer db.deinit();
+        for (1..40) |seq| {
+            var batch = V2Disk.Batch.init(gpa);
+            defer batch.deinit();
+            try batch.put(.accounts, seq % 7, seq * 3);
+            if (seq % 3 == 0) try batch.delete(.flags, @intCast(seq % 5)) else try batch.put(.flags, @intCast(seq % 5), seq % 2 == 0);
+            var prepared = try db.prepare(seq, &batch, &.{@intCast(seq % 256)});
+            defer prepared.deinit();
+            try prepared.commit();
+        }
+        try std.testing.expectEqual(@as(?u64, 35 * 3), try db.get(.accounts, 0));
+        try std.testing.expectEqual(@as(?u64, 34 * 3), try db.get(.accounts, 6));
+        break :blk db.reference();
+    };
+    {
+        var db = try V2Disk.open(gpa, io, path, .{ .merge_workers = 1, .format = v2_format, .expected = reference });
+        defer db.deinit();
+        try std.testing.expectEqual(@as(?u64, 35 * 3), try db.get(.accounts, 0));
+        try std.testing.expectEqual(@as(?u64, 34 * 3), try db.get(.accounts, 6));
+        try std.testing.expectEqual(@as(?u64, null), try db.get(.accounts, 999));
+    }
+    // The same operations under v1 commit to different digests, and a v1
+    // open of a v2 store is rejected by the manifest profile bytes.
+    var v1_tmp = std.testing.tmpDir(.{});
+    defer v1_tmp.cleanup();
+    var v1_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const V1Disk = native.DatabaseWithDepth(Schema, 4);
+    const v1_digest = blk: {
+        var db = try V1Disk.open(gpa, io, try pathOf(&v1_tmp, &v1_buf), .{ .merge_workers = 1 });
+        defer db.deinit();
+        for (1..40) |seq| {
+            var batch = V1Disk.Batch.init(gpa);
+            defer batch.deinit();
+            try batch.put(.accounts, seq % 7, seq * 3);
+            if (seq % 3 == 0) try batch.delete(.flags, @intCast(seq % 5)) else try batch.put(.flags, @intCast(seq % 5), seq % 2 == 0);
+            var prepared = try db.prepare(seq, &batch, &.{@intCast(seq % 256)});
+            defer prepared.deinit();
+            try prepared.commit();
+        }
+        break :blk db.commitment().digest;
+    };
+    var v2_digest: [32]u8 = undefined;
+    {
+        var db = try V2Disk.open(gpa, io, path, .{ .merge_workers = 1, .format = v2_format, .expected = reference });
+        defer db.deinit();
+        v2_digest = db.commitment().digest;
+    }
+    try std.testing.expect(!std.mem.eql(u8, &v1_digest, &v2_digest));
+    try std.testing.expectError(error.ProfileMismatch, V1Disk.open(gpa, io, path, .{ .merge_workers = 1 }));
+}
+
 test "disk: typed file execution matches portable commitments and durable reopen" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

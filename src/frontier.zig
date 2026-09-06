@@ -46,9 +46,22 @@ pub fn Frontier(comptime depth: usize) type {
 
         seq: u64 = 0,
         levels: [depth]Level = @splat(.{}),
+        /// The profile hash committed through every level/list/database
+        /// hash; v1 by default. v2 profiles bind the block target and use
+        /// the v2 empty-bucket sentinel.
+        profile_hash: Hash = profileHash(),
+        empty: Hash = empty_hash,
 
         pub fn init() Self {
             return .{};
+        }
+
+        /// A frontier under a non-v1 profile: every empty slot holds that
+        /// profile's empty-bucket hash.
+        pub fn initProfile(profile: Hash, empty_bucket: Hash) Self {
+            var self: Self = .{ .profile_hash = profile, .empty = empty_bucket };
+            for (&self.levels) |*level| level.* = .{ .curr = empty_bucket, .snap = empty_bucket };
+            return self;
         }
 
         /// A plan is incomplete state, not a publishable frontier. All inputs
@@ -92,7 +105,7 @@ pub fn Frontier(comptime depth: usize) type {
                 // Capture the old current before this source level receives
                 // its own promotion later in the descending traversal.
                 source.snap = source.curr;
-                source.curr = empty_hash;
+                source.curr = self.empty;
                 const dest = &result.candidate.levels[i];
                 if (dest.next) |pending| {
                     dest.curr = pending;
@@ -100,7 +113,7 @@ pub fn Frontier(comptime depth: usize) type {
                 }
                 result.jobs[result.count] = .{
                     .level = i,
-                    .older = if (mergeWithEmpty(next_seq, i)) empty_hash else dest.curr,
+                    .older = if (mergeWithEmpty(next_seq, i)) self.empty else dest.curr,
                     .newer = source.snap,
                     .drop_tombstones = i == depth - 1,
                 };
@@ -128,6 +141,7 @@ pub fn Frontier(comptime depth: usize) type {
         }
 
         pub fn profileHash() Hash {
+            @setEvalBranchQuota(20000);
             var h = Sha256.init(.{});
             h.update("bucketlist.profile.v1\x00");
             hashInt(u32, &h, depth);
@@ -138,7 +152,7 @@ pub fn Frontier(comptime depth: usize) type {
         pub fn root(self: *const Self) Hash {
             var h = Sha256.init(.{});
             h.update("bucketlist.list.v1\x00");
-            h.update(&profileHash());
+            h.update(&self.profile_hash);
             for (self.levels, 0..) |level, i| {
                 var lh = Sha256.init(.{});
                 lh.update("bucketlist.level.v1\x00");
@@ -153,7 +167,7 @@ pub fn Frontier(comptime depth: usize) type {
         pub fn continuationHash(self: *const Self) Hash {
             var h = Sha256.init(.{});
             h.update("bucketlist.continuation.v1\x00");
-            h.update(&profileHash());
+            h.update(&self.profile_hash);
             for (self.levels, 0..) |level, i| {
                 hashInt(u32, &h, @intCast(i));
                 h.update(&.{@intFromBool(level.next != null)});
@@ -186,10 +200,10 @@ pub fn Frontier(comptime depth: usize) type {
         pub fn validateShape(self: *const Self) Error!void {
             for (self.levels, 0..) |level, i| {
                 if ((self.seq == 0 or (i > 0 and self.seq < 2 * half(i - 1))) and
-                    !std.mem.eql(u8, &level.curr, &empty_hash))
+                    !std.mem.eql(u8, &level.curr, &self.empty))
                     return error.InvalidTopology;
                 if ((i == depth - 1 or self.seq < half(i)) and
-                    !std.mem.eql(u8, &level.snap, &empty_hash))
+                    !std.mem.eql(u8, &level.snap, &self.empty))
                     return error.InvalidTopology;
                 const has_pending = i != 0 and self.seq >= half(i - 1);
                 if ((level.next != null) != has_pending) return error.InvalidTopology;
@@ -203,7 +217,7 @@ pub fn Frontier(comptime depth: usize) type {
             if (level == 0 or self.levels[level].next == null) return null;
             return .{
                 .level = level,
-                .older = if (mergeWithEmpty(self.seq, level)) empty_hash else self.levels[level].curr,
+                .older = if (mergeWithEmpty(self.seq, level)) self.empty else self.levels[level].curr,
                 .newer = self.levels[level - 1].snap,
                 .drop_tombstones = level == depth - 1,
             };

@@ -34,6 +34,9 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             max_bucket_bytes: u64 = 1 << 40,
             max_bucket_records: u64 = 1 << 32,
             max_read_views: usize = 64,
+            /// Bucket hash format for every blob this database writes and
+            /// verifies; null keeps v1 flat hashing (docs/format-v2.md).
+            format: ?storage.BucketFormat = null,
             /// Local read index for point reads: after one fully verified
             /// bucket pass, warm lookups read only the sampled span instead
             /// of rehashing the whole blob. `null` keeps per-read whole-bucket
@@ -65,6 +68,7 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             self.* = .{ .gpa = gpa, .io = io, .store = try storage.Store.open(gpa, io, path), .options = options, .current_metadata = &.{} };
             errdefer self.store.deinit();
             if (options.read_index) |read_index| try self.store.enableReadIndex(read_index);
+            if (self.v2Target()) |target| self.frontier = Frontier.initProfile(lib.proofs.profileHash(@intCast(depth), target), lib.proofs.emptyBucketHash());
             const catalog = try self.store.readManifest(gpa, catalog_domain.len + 64);
             defer if (catalog) |bytes| gpa.free(bytes);
             if (catalog) |bytes| {
@@ -86,7 +90,12 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
                 var genesis_hash: Hash = undefined;
                 std.crypto.hash.sha2.Sha256.hash(genesis, &genesis_hash, .{});
                 try self.requireGenesisOnly(genesis_hash);
-                _ = try self.store.putBlob(bucket_domain ++ "\x00\x00\x00\x00\x00\x00\x00\x00");
+                const empty_bytes = bucket_domain ++ "\x00\x00\x00\x00\x00\x00\x00\x00";
+                if (self.v2Target() != null) {
+                    _ = try self.store.putBucketV2(empty_bytes, self.mergeLimits());
+                } else {
+                    _ = try self.store.putBlob(empty_bytes);
+                }
                 const ref: Reference = .{ .manifest_hash = try self.store.putBlob(genesis), .database_digest = self.commitment().digest };
                 try self.publish(ref);
                 self.current_reference = ref;
@@ -270,7 +279,10 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             defer rows.deinit(self.gpa);
             const fresh = try encodeBucket(self.gpa, rows.items);
             defer self.gpa.free(fresh);
-            const hash = try self.store.putBlob(fresh);
+            const hash = if (self.v2Target() != null)
+                try self.store.putBucketV2(fresh, self.mergeLimits())
+            else
+                try self.store.putBlob(fresh);
             const plan = try self.frontier.plan(next, hash);
             var results: [depth]Hash = undefined;
             try self.runMerges(plan.merges(), results[0..plan.count]);
@@ -370,6 +382,13 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             }
         }
 
+        fn v2Target(self: *const Self) ?u32 {
+            return switch (self.options.format orelse .v1) {
+                .v1 => null,
+                .v2 => |v2| v2.target_block_bytes,
+            };
+        }
+
         fn mergeLimits(self: *const Self) storage.MergeLimits {
             comptime var max_key: u32 = 0;
             comptime var max_value: u32 = 0;
@@ -378,7 +397,7 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
                 max_key = @max(max_key, lib.Codec(T.Key).max_size);
                 max_value = @max(max_value, lib.Codec(T.Value).max_size);
             }
-            return .{ .max_key_bytes = max_key, .max_value_bytes = max_value, .max_records = self.options.max_bucket_records, .max_bucket_bytes = self.options.max_bucket_bytes };
+            return .{ .max_key_bytes = max_key, .max_value_bytes = max_value, .max_records = self.options.max_bucket_records, .max_bucket_bytes = self.options.max_bucket_bytes, .format = self.options.format orelse .v1 };
         }
 
         fn validateRecord(row: Record) !void {
@@ -448,7 +467,7 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
                 if (!canonical) continue;
                 var hash: Hash = undefined;
                 _ = std.fmt.hexToBytes(&hash, entry.name) catch unreachable;
-                if (!std.mem.eql(u8, &hash, &frontiers.emptyHash()) and !std.mem.eql(u8, &hash, &genesis_hash)) return error.MissingManifest;
+                if (!std.mem.eql(u8, &hash, &self.frontier.empty) and !std.mem.eql(u8, &hash, &genesis_hash)) return error.MissingManifest;
             }
         }
         fn writeManifest(self: *Self, state: *const Frontier, meta: []const u8) !Reference {
@@ -461,7 +480,7 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             errdefer bytes.deinit(self.gpa);
             try bytes.appendSlice(self.gpa, manifest_domain);
             try bytes.appendSlice(self.gpa, &schema_hash);
-            try bytes.appendSlice(self.gpa, &Frontier.profileHash());
+            try bytes.appendSlice(self.gpa, &state.profile_hash);
             try appendInt(u64, &bytes, self.gpa, state.seq);
             for (state.levels) |level| {
                 try bytes.appendSlice(self.gpa, &level.curr);
@@ -479,8 +498,11 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             var reader: Reader = .{ .bytes = bytes };
             if (!std.mem.eql(u8, try reader.take(manifest_domain.len), manifest_domain)) return error.InvalidManifest;
             if (!std.mem.eql(u8, try reader.take(32), &schema_hash)) return error.SchemaMismatch;
-            if (!std.mem.eql(u8, try reader.take(32), &Frontier.profileHash())) return error.ProfileMismatch;
-            var state: Frontier = .init();
+            var state: Frontier = if (self.v2Target()) |target|
+                Frontier.initProfile(lib.proofs.profileHash(@intCast(depth), target), lib.proofs.emptyBucketHash())
+            else
+                .init();
+            if (!std.mem.eql(u8, try reader.take(32), &state.profile_hash)) return error.ProfileMismatch;
             state.seq = try reader.int(u64);
             for (&state.levels) |*level| {
                 level.curr = try reader.hash();

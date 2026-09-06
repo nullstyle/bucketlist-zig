@@ -740,7 +740,15 @@ pub const Store = struct {
         name = std.fmt.bytesToHex(hash, .lower);
         try fullSync(self.io, atomic.file);
         atomic.link(self.io) catch |err| switch (err) {
-            error.PathAlreadyExists => try verifyFile(self.blobs, self.io, &name, hash, first.size),
+            error.PathAlreadyExists => switch (limits.format) {
+                .v1 => try verifyFile(self.blobs, self.io, &name, hash, first.size),
+                .v2 => |v2| {
+                    const existing = try readBounded(self.blobs, self.io, &name, self.gpa, @intCast(first.size));
+                    defer self.gpa.free(existing);
+                    if (!std.mem.eql(u8, &(try v2BucketHash(existing, v2.target_block_bytes, limits)), &hash))
+                        return error.CorruptBlob;
+                },
+            },
             else => return error.IoFailed,
         };
         try syncDir(self.io, self.blobs);
