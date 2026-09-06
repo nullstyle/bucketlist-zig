@@ -134,8 +134,14 @@ instead of rewriting durable blobs; recorded reopen time fell from 71 ms to
 Local gates passed all 104 tests on macOS ARM64 and Linux ARM64 in Debug and
 ReleaseSafe (including the fixed guided corpus through LLVM), plus the checks
 below. Linux runs in a disposable native ARM container; x86_64 Linux is
-separately cross-compiled. The first emulated x86 container could not run this
-Zig toolchain under Rosetta and is not counted as runtime validation.
+separately cross-compiled and now also executed: pushed CI runs the full
+suite on macOS and Linux x86_64 runners, green on both since the union
+assignment fix (the first x86_64 execution exposed a compiler-ordering
+defect where a tagged union's tag was set before its payload allocation,
+leaving an undefined pointer under the errdefer; allocations now precede
+union assignment). The first emulated x86 container could not run this
+Zig toolchain under Rosetta; emulated execution of cross-built test
+binaries later provided the local reproduction loop for that fix.
 
 | Check | Evidence |
 | --- | --- |

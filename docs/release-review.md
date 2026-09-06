@@ -19,6 +19,7 @@ a separate decision with its own conditions listed at the end.
 | `just package-preflight` | Pass: fresh extracted archive builds and runs portable, persistent, and disk-host standalone consumers without any sibling checkout (M6 exit criterion). |
 | `just linux-check` | Pass: native Linux ARM64 container gate with repo-pinned mise tools. |
 | `zig build check -Dtarget=x86_64-linux` | Pass: full cross-compile of native tests and examples. |
+| Pushed CI (macos-latest, ubuntu-latest) | Green on both runners since the union-assignment fix; the first-ever x86_64 execution of the suite exposed and then validated the fix for a compiler-ordering defect (pre-dating this review), closing x86_64 runtime validation. |
 | Fuzzing evidence | Bounded guided campaigns and 10M-cycle-per-test soaks on macOS and Linux ARM64: 360M+ recorded runs, zero failure diagnostics ([fuzzing.md](fuzzing.md)). |
 
 Skip audit: exactly one `error.SkipZigTest` exists — the FIFO helper on
@@ -88,8 +89,9 @@ without a local sibling.
 
 ## Promotion conditions for `0.1.0`
 
-1. Pushed CI green on macOS and Linux x86_64 runners (also closes runtime
-   validation on x86_64).
+1. Pushed CI green on macOS and Linux x86_64 runners -- met: green on
+   both since the union-assignment fix, closing x86_64 runtime
+   validation.
 2. A multi-day guided soak on the frozen revision with no findings.
 3. Release review refresh if `docs/api.txt` moved since this review.
 4. The tag drops `-dev` from `0.1.0-dev` only with the classification above
