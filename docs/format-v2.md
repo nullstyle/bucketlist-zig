@@ -36,16 +36,24 @@ block_hash(i) = SHA-256("bucketlist.block.v2\x00" || u64(i) || block_bytes)
 ## Block tree
 
 The ordered leaf list `block_hash(0) .. block_hash(n-1)` reduces to one root
-by rounds: each round pairs consecutive nodes left-to-right, hashing
+by the canonical peak structure. Each leaf is appended as a rightmost peak of
+span one; while the two rightmost peaks have equal span they are replaced by
 
 ```
 node = SHA-256("bucketlist.blocknode.v2\x00" || left || right)
 ```
 
-and an unpaired trailing node passes to the next round unchanged. The last
-remaining node is the block root. With `n == 0` blocks the root is the
-constant `SHA-256("bucketlist.block.v2.empty\x00")`. The reduction is
-deterministic and independent of any padding or salt.
+with doubled span. After all leaves, the remaining peaks (spans strictly
+decreasing, the binary decomposition of `n`) fold left-to-right with the same
+node hash into the block root. At powers of two this is the classic balanced
+binary Merkle tree; `O(log n)` state computes it streaming. With `n == 0`
+blocks the root is the constant `SHA-256("bucketlist.block.v2.empty\x00")`.
+The reduction is deterministic and independent of any padding or salt.
+
+A leaf's proof path covers the balanced span inside its own peak, then — if
+earlier peaks exist — one left sibling equal to their whole fold, then every
+later peak as a right sibling. The leaf count fixes the shape, so a verifier
+predicts every side and the exact step count.
 
 ## Bucket, profile, and chain hashes
 

@@ -151,6 +151,114 @@ pub const BucketHasher = struct {
     }
 };
 
+/// One sibling hop from a block leaf toward the tree root. Siblings cover
+/// the balanced path inside the leaf's own peak, then the left fold of all
+/// earlier peaks (one step, if any), then every later peak, right side.
+pub const BlockPath = struct {
+    pub const Step = struct { hash: Hash, right: bool };
+    steps: []const Step,
+};
+
+/// Extract the sibling path for leaf `index` from the ordered leaf list
+/// under the canonical peak reduction (equal-span merging with a final
+/// left-to-right fold of the peaks). Caller owns the steps allocation.
+pub fn blockPath(gpa: std.mem.Allocator, leaves: []const Hash, index: usize) error{ OutOfMemory, IndexOutOfBounds }!BlockPath {
+    if (index >= leaves.len) return error.IndexOutOfBounds;
+    const Peak = struct { span: u64, hash: Hash };
+    var peaks: [64]Peak = undefined;
+    var count: usize = 0;
+    var ours: ?usize = null;
+    var steps: std.ArrayList(BlockPath.Step) = .empty;
+    errdefer steps.deinit(gpa);
+    for (leaves, 0..) |leaf, i| {
+        peaks[count] = .{ .span = 1, .hash = leaf };
+        if (i == index) ours = count;
+        count += 1;
+        while (count >= 2) {
+            const left = peaks[count - 2];
+            const right = peaks[count - 1];
+            if (left.span != right.span) break;
+            if (ours != null and ours.? == count - 1) {
+                try steps.append(gpa, .{ .hash = left.hash, .right = false });
+                ours = count - 2;
+            } else if (ours != null and ours.? == count - 2) {
+                try steps.append(gpa, .{ .hash = right.hash, .right = true });
+            }
+            peaks[count - 2] = .{ .span = left.span * 2, .hash = combine(left.hash, right.hash) };
+            count -= 1;
+        }
+    }
+    const slot = ours orelse return error.IndexOutOfBounds;
+    if (slot > 0) {
+        var acc = peaks[0].hash;
+        for (peaks[1..slot]) |peak| acc = combine(acc, peak.hash);
+        try steps.append(gpa, .{ .hash = acc, .right = false });
+    }
+    for (peaks[slot + 1 .. count]) |peak| {
+        try steps.append(gpa, .{ .hash = peak.hash, .right = true });
+    }
+    return .{ .steps = try steps.toOwnedSlice(gpa) };
+}
+
+pub const PathError = error{InvalidPath};
+
+/// Verify that `leaf` at `index` within `leaf_count` leaves reaches `root`
+/// through exactly the siblings `path` claims, with the side and structure
+/// the canonical peak reduction demands for that leaf count.
+pub fn verifyBlockPath(leaf: Hash, index: usize, leaf_count: usize, path: BlockPath, root: Hash) PathError!void {
+    if (leaf_count == 0 or index >= leaf_count) return error.InvalidPath;
+    // Reconstruct the peak shape: binary decomposition of leaf_count,
+    // spans largest first.
+    var peak_count: usize = 0;
+    var offset: u64 = 0;
+    var local: u64 = 0;
+    var ours: usize = 0;
+    var span: u64 = 0;
+    var slot: u6 = 63;
+    while (true) : (slot -= 1) {
+        const bit = @as(u64, 1) << slot;
+        if (leaf_count & bit != 0) {
+            if (span == 0) {
+                if (index < offset + bit) {
+                    local = index - offset;
+                    ours = peak_count;
+                    span = bit;
+                } else offset += bit;
+            }
+            peak_count += 1;
+        }
+        if (slot == 0) break;
+    }
+    if (span == 0) return error.InvalidPath;
+    var self_hash = leaf;
+    var step: usize = 0;
+    const balanced: u6 = @intCast(@ctz(span));
+    var level: u6 = 0;
+    while (level < balanced) : (level += 1) {
+        if (step >= path.steps.len) return error.InvalidPath;
+        const hop = path.steps[step];
+        const right = (local >> @intCast(level)) & 1 == 0;
+        if (hop.right != right) return error.InvalidPath;
+        self_hash = if (right) combine(self_hash, hop.hash) else combine(hop.hash, self_hash);
+        step += 1;
+    }
+    if (ours > 0) {
+        if (step >= path.steps.len) return error.InvalidPath;
+        if (path.steps[step].right) return error.InvalidPath;
+        self_hash = combine(path.steps[step].hash, self_hash);
+        step += 1;
+    }
+    var later: usize = ours + 1;
+    while (later < peak_count) : (later += 1) {
+        if (step >= path.steps.len) return error.InvalidPath;
+        if (!path.steps[step].right) return error.InvalidPath;
+        self_hash = combine(self_hash, path.steps[step].hash);
+        step += 1;
+    }
+    if (step != path.steps.len) return error.InvalidPath;
+    if (!std.mem.eql(u8, &root, &self_hash)) return error.InvalidPath;
+}
+
 fn hashInt(comptime T: type, h: *Sha256, value: T) void {
     var bytes: [@sizeOf(T)]u8 = undefined;
     std.mem.writeInt(T, &bytes, value, .big);
@@ -234,4 +342,51 @@ test "v2 block tree matches the balanced tree at powers of two" {
         combine(level1[2], level1[3]),
     };
     try testing.expectEqualSlices(u8, &combine(level2[0], level2[1]), &tree.root());
+}
+test "block paths verify and reject every mutation class" {
+    const gpa = testing.allocator;
+    for ([_]usize{ 1, 2, 3, 7, 8, 100 }) |count| {
+        var leaves: [100]Hash = undefined;
+        for (&leaves, 0..) |*leaf, i| {
+            var source: Hash = undefined;
+            Sha256.hash(std.mem.asBytes(&[_]usize{ count, i }), &source, .{});
+            leaf.* = source;
+        }
+        var tree: BlockTree = .{};
+        for (leaves[0..count]) |leaf| tree.append(leaf);
+        const root = tree.root();
+        for (0..count) |index| {
+            const path = try blockPath(gpa, leaves[0..count], index);
+            defer gpa.free(path.steps);
+            try verifyBlockPath(leaves[index], index, count, path, root);
+            // Wrong index, flipped side, bad sibling, extra step, and wrong
+            // root must all fail. Leaf counts whose shape still admits this
+            // path (3 vs 4 at an early index) are disambiguated one level
+            // up: the bucket hash binds block_count. The last leaf's tail
+            // shape differs under count+1, so it must fail here.
+            if (count > 1) {
+                try testing.expectError(error.InvalidPath, verifyBlockPath(leaves[index], (index + 1) % count, count, path, root));
+                if (index == count - 1) {
+                    try testing.expectError(error.InvalidPath, verifyBlockPath(leaves[index], index, count + 1, path, root));
+                }
+                var flipped = try gpa.dupe(BlockPath.Step, path.steps);
+                defer gpa.free(flipped);
+                flipped[0].right = !flipped[0].right;
+                try testing.expectError(error.InvalidPath, verifyBlockPath(leaves[index], index, count, .{ .steps = flipped }, root));
+                flipped[0].right = !flipped[0].right;
+                flipped[0].hash[0] ^= 0xff;
+                try testing.expectError(error.InvalidPath, verifyBlockPath(leaves[index], index, count, .{ .steps = flipped }, root));
+            }
+            var bad_root = root;
+            bad_root[0] ^= 0xff;
+            try testing.expectError(error.InvalidPath, verifyBlockPath(leaves[index], index, count, path, bad_root));
+            if (path.steps.len > 0) {
+                const longer = try gpa.alloc(BlockPath.Step, path.steps.len + 1);
+                defer gpa.free(longer);
+                @memcpy(longer[0..path.steps.len], path.steps);
+                longer[path.steps.len] = path.steps[path.steps.len - 1];
+                try testing.expectError(error.InvalidPath, verifyBlockPath(leaves[index], index, count, .{ .steps = longer }, root));
+            }
+        }
+    }
 }
