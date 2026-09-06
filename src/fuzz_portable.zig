@@ -963,7 +963,7 @@ pub const Guided = struct {
         const empty_bucket = proofs.emptyBucketHash();
         for (&levels, 0..) |*level, i| {
             var hash: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(&[_]u8{input[6], input[7], @intCast(i)}, &hash, .{});
+            std.crypto.hash.sha2.Sha256.hash(&[_]u8{ input[6], input[7], @intCast(i) }, &hash, .{});
             level.* = .{ .curr = hash, .snap = empty_bucket };
         }
         levels[0].curr = empty_bucket;
