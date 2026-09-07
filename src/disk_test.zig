@@ -992,20 +992,27 @@ test "disk: scans pin read views across advances and survive bounded failures" {
     }
     view.deinit();
     // Every construction allocation failure cleans up completely and a
-    // retry on the same state succeeds.
+    // retry on the same state succeeds. Cursor scratch bills the store's
+    // allocator, so swap it for the walk: every participating slot's
+    // scratch and the cursor array become deterministic failure points.
     var failures: usize = 0;
+    var induced: usize = 0;
+    defer db.store.gpa = gpa;
     while (failures < 200) : (failures += 1) {
         var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = failures });
+        db.store.gpa = failing.allocator();
         var scan = db.scan(.accounts, 0, 1000, failing.allocator()) catch |err| {
             try std.testing.expectEqual(error.OutOfMemory, err);
             try std.testing.expect(failing.has_induced_failure);
+            induced += 1;
             failing.fail_index = std.math.maxInt(usize);
             var retry = try db.scan(.accounts, 0, 1000, failing.allocator());
             retry.deinit();
             continue;
         };
         scan.deinit();
+        db.store.gpa = gpa;
         if (!failing.has_induced_failure) break;
     }
-    try std.testing.expect(failures > 1 and failures < 200);
+    try std.testing.expect(induced > 4 and failures < 200);
 }
