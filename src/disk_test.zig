@@ -635,3 +635,165 @@ test "disk: proofs pin retained references and read views across later advances"
     // its history and collection remains a no-op for it.
     try std.testing.expectEqual(@as(usize, 0), try db.collect(&.{historical}));
 }
+
+test "disk: range proofs cover boundary cases and match point reads" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try pathOf(&tmp, &buf);
+    const V2Disk = native.DatabaseWithDepth(Schema, 4);
+    const v2_format: store.BucketFormat = .{ .v2 = .{ .target_block_bytes = 96 } };
+    var db = try V2Disk.open(gpa, io, path, .{ .merge_workers = 1, .format = v2_format });
+    defer db.deinit();
+    for (1..41) |seq| {
+        var batch = V2Disk.Batch.init(gpa);
+        defer batch.deinit();
+        try batch.put(.accounts, seq - 1, seq * 100);
+        if (seq % 4 == 0) try batch.delete(.accounts, seq - 2); // tombstones inside the space
+        if (seq % 5 == 0) try batch.put(.flags, @intCast(seq % 8), seq % 2 == 0); // second table interleaved
+        var prepared = try db.prepare(seq, &batch, "range-build");
+        defer prepared.deinit();
+        try prepared.commit();
+    }
+    const digest = db.commitment().digest;
+    const Case = struct { start: u64, end: u64 };
+    const cases = [_]Case{
+        .{ .start = 0, .end = 40 }, // the whole key space
+        .{ .start = 0, .end = 1 }, // first key
+        .{ .start = 39, .end = 40 }, // last key
+        .{ .start = 3, .end = 4 }, // single present key
+        .{ .start = 2, .end = 3 }, // single tombstoned key
+        .{ .start = 0, .end = 20 }, // half space
+        .{ .start = 19, .end = 21 }, // straddles deletes
+        .{ .start = 100, .end = 200 }, // entirely beyond every key
+        .{ .start = 1 << 60, .end = (1 << 60) + 5 },
+        .{ .start = 5, .end = 6 }, // deleted early, rewritten later
+    };
+    for (cases) |case| {
+        var bundle = try db.proveRange(.accounts, case.start, case.end, gpa);
+        defer bundle.deinit();
+        try lib.proofs.verifyRange(&bundle.proof, digest);
+        var expected: usize = 0;
+        var cursor: u64 = case.start;
+        while (cursor < case.end) : (cursor += 1) {
+            const value = try db.get(.accounts, cursor);
+            if (value == null) continue;
+            try std.testing.expect(expected < bundle.proof.entries.len);
+            const entry = bundle.proof.entries[expected];
+            try std.testing.expectEqual(cursor, try lib.Codec(u64).decode(entry.key));
+            try std.testing.expectEqual(value.?, try lib.Codec(u64).decode(entry.value));
+            expected += 1;
+        }
+        try std.testing.expectEqual(expected, bundle.proof.entries.len);
+        var wrong = digest;
+        wrong[1] ^= 0xff;
+        try std.testing.expectError(error.InvalidProof, lib.proofs.verifyRange(&bundle.proof, wrong));
+    }
+    // Dropping one claimed entry breaks verification, as does editing one.
+    {
+        var bundle = try db.proveRange(.accounts, 0, 40, gpa);
+        defer bundle.deinit();
+        var shortened = bundle.proof;
+        shortened.entries = shortened.entries[0 .. shortened.entries.len - 1];
+        try std.testing.expectError(error.InvalidProof, lib.proofs.verifyRange(&shortened, digest));
+        var edited = bundle.proof;
+        var entries = try gpa.dupe(lib.proofs.RangeEntry, edited.entries);
+        defer gpa.free(entries);
+        entries[0].value = entries[0].value[0..0];
+        edited.entries = entries;
+        try std.testing.expectError(error.InvalidProof, lib.proofs.verifyRange(&edited, digest));
+    }
+    // Degenerate and inverted intervals are rejected up front.
+    try std.testing.expectError(error.InvalidRange, db.proveRange(.accounts, 7, 7, gpa));
+    try std.testing.expectError(error.InvalidRange, db.proveRange(.accounts, 9, 2, gpa));
+    // A v1 profile cannot range-prove.
+    {
+        var v1_tmp = std.testing.tmpDir(.{});
+        defer v1_tmp.cleanup();
+        var v1_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var plain = try V2Disk.open(gpa, io, try pathOf(&v1_tmp, &v1_buf), .{ .merge_workers = 1 });
+        defer plain.deinit();
+        try std.testing.expectError(error.ProfileMismatch, plain.proveRange(.accounts, 0, 10, gpa));
+    }
+}
+
+test "disk: range proofs match an independent model across a random workload" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try pathOf(&tmp, &buf);
+    const V2Disk = native.DatabaseWithDepth(Schema, 4);
+    const v2_format: store.BucketFormat = .{ .v2 = .{ .target_block_bytes = 96 } };
+    var db = try V2Disk.open(gpa, io, path, .{ .merge_workers = 1, .format = v2_format });
+    defer db.deinit();
+    var model = std.AutoHashMap(u64, u64).init(gpa);
+    defer model.deinit();
+    var prng = std.Random.DefaultPrng.init(0x5eed_1234);
+    const random = prng.random();
+    var seq: u64 = 0;
+    var checked: usize = 0;
+    var stale_checks: usize = 0;
+    while (seq < 90) : (seq += 1) {
+        {
+            var batch = V2Disk.Batch.init(gpa);
+            defer batch.deinit();
+            for (0..8) |_| {
+                const key = random.uintAtMost(u64, 63);
+                if (random.uintLessThan(u32, 100) < 25) {
+                    try batch.delete(.accounts, key);
+                    _ = model.remove(key);
+                } else {
+                    const value = random.int(u64);
+                    try batch.put(.accounts, key, value);
+                    try model.put(key, value);
+                }
+                if (random.uintLessThan(u32, 100) < 20) {
+                    const flag = random.uintAtMost(u8, 7);
+                    try batch.put(.flags, flag, random.boolean());
+                }
+            }
+            var prepared = try db.prepare(seq + 1, &batch, "range-random");
+            defer prepared.deinit();
+            try prepared.commit();
+        }
+        if (seq % 7 != 3) continue;
+        // A stale digest from an earlier round stays valid for proofs made
+        // against it and invalid for the live frontier.
+        const digest = db.commitment().digest;
+        for (0..3) |_| {
+            const a = random.uintAtMost(u64, 68);
+            const b = a + 1 + random.uintAtMost(u64, 6);
+            var bundle = try db.proveRange(.accounts, a, b, gpa);
+            defer bundle.deinit();
+            try lib.proofs.verifyRange(&bundle.proof, digest);
+            var expected: usize = 0;
+            var cursor: u64 = a;
+            while (cursor < b) : (cursor += 1) {
+                const value = model.get(cursor) orelse continue;
+                try std.testing.expect(expected < bundle.proof.entries.len);
+                try std.testing.expectEqual(cursor, try lib.Codec(u64).decode(bundle.proof.entries[expected].key));
+                try std.testing.expectEqual(value, try lib.Codec(u64).decode(bundle.proof.entries[expected].value));
+                expected += 1;
+            }
+            try std.testing.expectEqual(expected, bundle.proof.entries.len);
+            checked += 1;
+        }
+        // Advance once more, then the round's proofs fail the new digest.
+        {
+            var batch = V2Disk.Batch.init(gpa);
+            defer batch.deinit();
+            try batch.put(.accounts, 64, 1);
+            try model.put(64, 1);
+            var prepared = try db.prepare(seq + 2, &batch, "range-stale");
+            defer prepared.deinit();
+            try prepared.commit();
+            var bundle = try db.proveRange(.accounts, 0, 60, gpa);
+            defer bundle.deinit();
+            try lib.proofs.verifyRange(&bundle.proof, db.commitment().digest);
+            try std.testing.expectError(error.InvalidProof, lib.proofs.verifyRange(&bundle.proof, digest));
+            stale_checks += 1;
+            seq += 1;
+        }
+    }
+    try std.testing.expect(checked > 24 and stale_checks > 8);
+}

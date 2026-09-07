@@ -648,6 +648,244 @@ pub fn verifyVisible(proof: *const VisibleProof, expected_digest: Hash) error{ I
     try verifyPlacement(&proof.deciding.bucket, proof.deciding.slot_level, proof.deciding.slot_snapshot, proof.levels, proof.schema_hash, proof.profile_hash, proof.advance, expected_digest);
 }
 
+/// Iterate a block's records, enforcing canonical framing and strict
+/// (table, key) order while borrowing every slice from the block.
+const BlockIterator = struct {
+    block: []const u8,
+    position: usize = 0,
+    previous_table: u32 = 0,
+    previous_key: ?[]const u8 = null,
+
+    const Record = struct { table: u32, key: []const u8, value: ?[]const u8 };
+
+    fn next(self: *BlockIterator) error{InvalidProof}!?Record {
+        if (self.position == self.block.len) return null;
+        if (self.position + 8 > self.block.len) return error.InvalidProof;
+        const table = std.mem.readInt(u32, self.block[self.position..][0..4], .big);
+        const key_len = std.mem.readInt(u32, self.block[self.position + 4 ..][0..4], .big);
+        if (key_len > self.block.len or self.position + 8 + key_len > self.block.len) return error.InvalidProof;
+        const key = self.block[self.position + 8 ..][0..key_len];
+        self.position += 8 + key_len;
+        if (self.position + 1 > self.block.len) return error.InvalidProof;
+        const tag = self.block[self.position];
+        self.position += 1;
+        var value: ?[]const u8 = null;
+        if (tag == 1) {
+            if (self.position + 4 > self.block.len) return error.InvalidProof;
+            const value_len = std.mem.readInt(u32, self.block[self.position..][0..4], .big);
+            if (value_len > self.block.len or self.position + 4 + value_len > self.block.len) return error.InvalidProof;
+            value = self.block[self.position + 4 ..][0..value_len];
+            self.position += 4 + value_len;
+        } else if (tag != 0) return error.InvalidProof;
+        if (self.previous_key) |prev| {
+            if (self.previous_table == table and std.mem.order(u8, prev, key) != .lt) return error.InvalidProof;
+            if (self.previous_table > table) return error.InvalidProof;
+        }
+        self.previous_table = table;
+        self.previous_key = key;
+        return .{ .table = table, .key = key, .value = value };
+    }
+};
+
+/// Order one record against a (table, key) bound.
+fn boundOrder(table: u32, key: []const u8, bound_table: u32, bound_key: []const u8) std.math.Order {
+    if (table != bound_table) return if (table < bound_table) .lt else .gt;
+    return std.mem.order(u8, key, bound_key);
+}
+
+/// One authenticated block within a range run.
+pub const RangeBlock = struct {
+    block: []const u8,
+    block_index: u64,
+    path: BlockPath,
+};
+
+/// One slot's covering run: consecutive authenticated blocks holding every
+/// record of the proven table inside [start, end) that this slot contains.
+/// The first block is block zero or ends strictly before (table, start);
+/// the last block is final or starts at/after (table, end); because record
+/// order is global across blocks, no in-range record can hide outside the
+/// run. Runs for empty buckets (the computable empty hash) do not exist.
+pub const RangeRun = struct {
+    slot_level: usize,
+    slot_snapshot: bool,
+    block_count: u64,
+    record_count: u64,
+    blocks: []const RangeBlock,
+};
+
+/// One claimed visible record inside the range.
+pub const RangeEntry = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+/// The composite range proof: for one table and key interval [start, end),
+/// the complete visible record list under youngest-wins resolution. Every
+/// non-empty slot contributes a covering run; slots holding the empty
+/// bucket are exempt because that hash is computable by any verifier.
+pub const RangeProof = struct {
+    table: u32,
+    start: []const u8,
+    end: []const u8,
+    /// The live visible records, keys strictly ascending, youngest value
+    /// per key; keys decided by a tombstone anywhere younger are omitted.
+    entries: []const RangeEntry,
+    /// Covering runs ordered youngest-first (level ascending, current
+    /// before snapshot), matching the database's lookup order.
+    runs: []const RangeRun,
+    schema_hash: Hash,
+    profile_hash: Hash,
+    advance: u64,
+    levels: []const ChainLevel,
+};
+
+/// Verification keeps its cursors on the stack; deeper chains than this
+/// cannot be range-proven (the checkpoint format caps depth at 31).
+pub const max_range_runs = 64;
+
+/// The youngest-wins cursor over one run's in-range records.
+const RangeCursor = struct {
+    run: usize,
+    block: usize,
+    iter: BlockIterator,
+    hit: ?BlockIterator.Record,
+};
+
+fn rangeAdvance(proof: *const RangeProof, cursor: *RangeCursor) error{InvalidProof}!void {
+    const run = &proof.runs[cursor.run];
+    while (true) {
+        while (try cursor.iter.next()) |record| {
+            if (record.table != proof.table) continue;
+            if (std.mem.order(u8, record.key, proof.start) == .lt) continue;
+            if (std.mem.order(u8, record.key, proof.end) != .lt) break;
+            cursor.hit = record;
+            return;
+        }
+        if (cursor.block + 1 == run.blocks.len) {
+            cursor.hit = null;
+            return;
+        }
+        cursor.block += 1;
+        cursor.iter = .{ .block = run.blocks[cursor.block].block };
+    }
+}
+
+/// Fully verify a range proof against a trusted commitment digest: every
+/// run's blocks authenticate against their slot's committed bucket hash,
+/// the completeness brackets hold, every non-empty slot is covered, the
+/// chain recomputes the digest, and the claimed entries are exactly the
+/// youngest-wins live records inside the interval.
+pub fn verifyRange(proof: *const RangeProof, expected_digest: Hash) error{InvalidProof}!void {
+    if (std.mem.order(u8, proof.start, proof.end) != .lt) return error.InvalidProof;
+    if (proof.runs.len > max_range_runs) return error.InvalidProof;
+    var previous_ordinal: ?usize = null;
+    for (proof.runs) |*run| {
+        if (run.slot_level >= proof.levels.len) return error.InvalidProof;
+        const ordinal = slotOrdinal(run.slot_level, run.slot_snapshot);
+        if (previous_ordinal != null and ordinal <= previous_ordinal.?) return error.InvalidProof;
+        previous_ordinal = ordinal;
+        if (run.blocks.len == 0 or run.block_count == 0) return error.InvalidProof;
+        if (run.blocks[0].block_index >= run.block_count or
+            run.blocks.len > run.block_count - run.blocks[0].block_index) return error.InvalidProof;
+        var root: ?Hash = null;
+        var previous_last: ?BlockIterator.Record = null;
+        var first_block_last: ?BlockIterator.Record = null;
+        var last_block_first: ?BlockIterator.Record = null;
+        for (run.blocks, 0..) |*range_block, i| {
+            if (i > 0 and range_block.block_index != run.blocks[i - 1].block_index + 1) return error.InvalidProof;
+            var iter = BlockIterator{ .block = range_block.block };
+            var records: usize = 0;
+            var first: ?BlockIterator.Record = null;
+            var last: ?BlockIterator.Record = null;
+            while (try iter.next()) |record| {
+                records += 1;
+                if (first == null) first = record;
+                last = record;
+            }
+            if (records == 0) return error.InvalidProof;
+            // Record order is global across blocks: the previous included
+            // block's last record sorts strictly before this one's first.
+            if (previous_last) |prev| {
+                if (boundOrder(prev.table, prev.key, first.?.table, first.?.key) != .lt) return error.InvalidProof;
+            }
+            previous_last = last;
+            if (i == 0) first_block_last = last;
+            if (i + 1 == run.blocks.len) last_block_first = first;
+            const leaf = blockHash(range_block.block_index, range_block.block);
+            const derived = foldBlockPath(leaf, @intCast(range_block.block_index), @intCast(run.block_count), range_block.path) catch return error.InvalidProof;
+            if (root) |existing| {
+                if (!std.mem.eql(u8, &existing, &derived)) return error.InvalidProof;
+            } else root = derived;
+        }
+        const slot_hash = if (run.slot_snapshot) &proof.levels[run.slot_level].snap else &proof.levels[run.slot_level].curr;
+        const bucket = bucketHash(run.record_count, run.block_count, root.?);
+        if (!std.mem.eql(u8, slot_hash, &bucket)) return error.InvalidProof;
+        const first_block = &run.blocks[0];
+        const last_block = &run.blocks[run.blocks.len - 1];
+        if (first_block.block_index != 0 and
+            boundOrder(first_block_last.?.table, first_block_last.?.key, proof.table, proof.start) != .lt) return error.InvalidProof;
+        if (last_block.block_index + 1 != run.block_count and
+            boundOrder(last_block_first.?.table, last_block_first.?.key, proof.table, proof.end) == .lt) return error.InvalidProof;
+    }
+    // Every non-empty slot must contribute a run; empty slots are exempt.
+    const empty = emptyBucketHash();
+    for (proof.levels, 0..) |level, level_index| {
+        for ([_]struct { hash: Hash, snapshot: bool }{
+            .{ .hash = level.curr, .snapshot = false },
+            .{ .hash = level.snap, .snapshot = true },
+        }) |slot| {
+            if (std.mem.eql(u8, &slot.hash, &empty)) continue;
+            var covered = false;
+            for (proof.runs) |*run| {
+                if (run.slot_level == level_index and run.slot_snapshot == slot.snapshot) covered = true;
+            }
+            if (!covered) return error.InvalidProof;
+        }
+    }
+    const digest = chainCommitment(proof.schema_hash, proof.profile_hash, proof.advance, proof.levels);
+    if (!std.mem.eql(u8, &digest, &expected_digest)) return error.InvalidProof;
+    // Youngest-wins resolution over the authenticated in-range records.
+    var cursors: [max_range_runs]RangeCursor = undefined;
+    var active: usize = 0;
+    for (proof.runs, 0..) |*run, r| {
+        var cursor: RangeCursor = .{ .run = r, .block = 0, .iter = .{ .block = run.blocks[0].block }, .hit = null };
+        try rangeAdvance(proof, &cursor);
+        if (cursor.hit != null) {
+            cursors[active] = cursor;
+            active += 1;
+        }
+    }
+    var claimed: usize = 0;
+    while (active > 0) {
+        var best: usize = 0;
+        for (1..active) |i| {
+            const order = boundOrder(cursors[i].hit.?.table, cursors[i].hit.?.key, cursors[best].hit.?.table, cursors[best].hit.?.key);
+            if (order == .lt or (order == .eq and cursors[i].run < cursors[best].run)) best = i;
+        }
+        const winner = cursors[best].hit.?;
+        if (winner.value) |value| {
+            if (claimed >= proof.entries.len) return error.InvalidProof;
+            const entry = proof.entries[claimed];
+            if (!std.mem.eql(u8, entry.key, winner.key) or !std.mem.eql(u8, entry.value, value)) return error.InvalidProof;
+            claimed += 1;
+        }
+        var i: usize = 0;
+        while (i < active) {
+            if (cursors[i].hit != null and std.mem.eql(u8, cursors[i].hit.?.key, winner.key)) {
+                try rangeAdvance(proof, &cursors[i]);
+                if (cursors[i].hit == null) {
+                    active -= 1;
+                    cursors[i] = cursors[active];
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+    if (claimed != proof.entries.len) return error.InvalidProof;
+}
+
 fn hashInt(comptime T: type, h: *Sha256, value: T) void {
     var bytes: [@sizeOf(T)]u8 = undefined;
     std.mem.writeInt(T, &bytes, value, .big);
@@ -1236,4 +1474,223 @@ test "every single-byte mutation of a proof component is rejected" {
     }
     proof.levels = &levels;
     try verifyMembership(&proof, expected);
+}
+
+test "range proof composes covering runs, youngest wins, and completeness" {
+    const gpa = testing.allocator;
+    // One scenario, table 1, interval ["b", "k"):
+    //   L0.curr  (youngest): "c"->"c2", "d" tombstone          one block
+    //   L1.curr  (older):    "a","b","e","f","k","x"           blocks [a b][e f][k x]
+    //   L1.snap:             no hits; prefix, mixed, suffix    blocks [a0 a1][az z1][z2 z3]
+    //   every other slot: the computable empty-bucket hash
+    // Visible records: b,c,e,f (d is tombstoned by L0). The L1.curr run
+    // needs its trailing boundary block ([k x]); the L1.snap run needs the
+    // mixed block plus both brackets.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const Record = struct { key: []const u8, value: ?[]const u8 };
+    const Built = struct { blocks: [][]u8, leaves: []Hash, record_count: u64 };
+    const build = struct {
+        fn call(a: std.mem.Allocator, records: []const Record) !Built {
+            var blocks: std.ArrayList([]u8) = .empty;
+            var leaves: std.ArrayList(Hash) = .empty;
+            var current: std.ArrayList(u8) = .empty;
+            var bytes: u64 = 0;
+            var count: u64 = 0;
+            var index: u64 = 0;
+            for (records) |record| {
+                var header: [8]u8 = undefined;
+                std.mem.writeInt(u32, header[0..4], 1, .big);
+                std.mem.writeInt(u32, header[4..8], @intCast(record.key.len), .big);
+                try current.appendSlice(a, &header);
+                try current.appendSlice(a, record.key);
+                if (record.value) |value| {
+                    try current.append(a, 1);
+                    var length: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &length, @intCast(value.len), .big);
+                    try current.appendSlice(a, &length);
+                    try current.appendSlice(a, value);
+                    bytes += 13 + record.key.len + value.len;
+                } else {
+                    try current.append(a, 0);
+                    bytes += 9 + record.key.len;
+                }
+                count += 1;
+                if (bytes >= 40) {
+                    try leaves.append(a, blockHash(index, current.items));
+                    try blocks.append(a, try current.toOwnedSlice(a));
+                    index += 1;
+                    bytes = 0;
+                }
+            }
+            if (current.items.len > 0) {
+                try leaves.append(a, blockHash(index, current.items));
+                try blocks.append(a, try current.toOwnedSlice(a));
+            }
+            return .{ .blocks = try blocks.toOwnedSlice(a), .leaves = try leaves.toOwnedSlice(a), .record_count = count };
+        }
+    }.call;
+
+    const young = try build(arena, &.{ .{ .key = "c", .value = "val-c2" }, .{ .key = "d", .value = null } });
+    const older = try build(arena, &.{
+        .{ .key = "a", .value = "val-a1" }, .{ .key = "b", .value = "val-b1" }, .{ .key = "e", .value = "val-e1" },
+        .{ .key = "f", .value = "val-f1" }, .{ .key = "k", .value = "val-k1" }, .{ .key = "x", .value = "val-x1" },
+    });
+    const bracket = try build(arena, &.{
+        .{ .key = "a0", .value = "val-00" }, .{ .key = "a1", .value = "val-01" }, .{ .key = "az", .value = "val-02" },
+        .{ .key = "z1", .value = "val-03" }, .{ .key = "z2", .value = "val-04" }, .{ .key = "z3", .value = "val-05" },
+    });
+
+    var tree: BlockTree = .{};
+    for (young.leaves) |leaf| tree.append(leaf);
+    const young_bucket = bucketHash(young.record_count, young.leaves.len, tree.root());
+    tree = .{};
+    for (older.leaves) |leaf| tree.append(leaf);
+    const older_bucket = bucketHash(older.record_count, older.leaves.len, tree.root());
+    tree = .{};
+    for (bracket.leaves) |leaf| tree.append(leaf);
+    const bracket_bucket = bucketHash(bracket.record_count, bracket.leaves.len, tree.root());
+
+    var schema: Hash = undefined;
+    var seed: [4]u8 = undefined;
+    std.mem.writeInt(u32, &seed, 900, .big);
+    Sha256.hash(&seed, &schema, .{});
+    const profile = profileHash(3, 40);
+    var levels: [3]ChainLevel = undefined;
+    const empty = emptyBucketHash();
+    for (&levels, 0..) |*level, i| {
+        var hash: Hash = undefined;
+        std.mem.writeInt(u32, &seed, @intCast(70 + i), .big);
+        Sha256.hash(&seed, &hash, .{});
+        level.* = .{
+            .curr = if (i == 0) young_bucket else if (i == 1) older_bucket else empty,
+            .snap = if (i == 1) bracket_bucket else empty,
+        };
+    }
+    const digest = chainCommitment(schema, profile, 4, &levels);
+
+    const runBlocks = struct {
+        fn call(a: std.mem.Allocator, built: Built, from: usize, to: usize) ![]RangeBlock {
+            var out: std.ArrayList(RangeBlock) = .empty;
+            for (from..to + 1) |i| {
+                const path = try blockPath(a, built.leaves, i);
+                try out.append(a, .{ .block = built.blocks[i], .block_index = i, .path = path });
+            }
+            return out.toOwnedSlice(a);
+        }
+    }.call;
+
+    const runs = [_]RangeRun{
+        .{ .slot_level = 0, .slot_snapshot = false, .block_count = young.leaves.len, .record_count = young.record_count, .blocks = try runBlocks(arena, young, 0, 0) },
+        .{ .slot_level = 1, .slot_snapshot = false, .block_count = older.leaves.len, .record_count = older.record_count, .blocks = try runBlocks(arena, older, 0, 2) },
+        .{ .slot_level = 1, .slot_snapshot = true, .block_count = bracket.leaves.len, .record_count = bracket.record_count, .blocks = try runBlocks(arena, bracket, 0, 2) },
+    };
+    const entries = [_]RangeEntry{
+        .{ .key = "b", .value = "val-b1" },
+        .{ .key = "c", .value = "val-c2" },
+        .{ .key = "e", .value = "val-e1" },
+        .{ .key = "f", .value = "val-f1" },
+    };
+    var proof = RangeProof{
+        .table = 1,
+        .start = "b",
+        .end = "k",
+        .entries = &entries,
+        .runs = &runs,
+        .schema_hash = schema,
+        .profile_hash = profile,
+        .advance = 4,
+        .levels = &levels,
+    };
+    try verifyRange(&proof, digest);
+    var wrong = digest;
+    wrong[0] ^= 0xff;
+    try testing.expectError(error.InvalidProof, verifyRange(&proof, wrong));
+
+    // Claim tampering: value edit, dropped entry, resurrected tombstone.
+    var bad_entries = entries;
+    bad_entries[0].value = "val-fg";
+    proof.entries = &bad_entries;
+    try testing.expectError(error.InvalidProof, verifyRange(&proof, digest));
+    proof.entries = entries[0..3];
+    try testing.expectError(error.InvalidProof, verifyRange(&proof, digest));
+    var resurrect = [_]RangeEntry{ .{ .key = "b", .value = "val-b1" }, .{ .key = "c", .value = "val-c2" }, .{ .key = "d", .value = "val-no" }, .{ .key = "e", .value = "val-e1" }, .{ .key = "f", .value = "val-f1" } };
+    proof.entries = &resurrect;
+    try testing.expectError(error.InvalidProof, verifyRange(&proof, digest));
+    proof.entries = &entries;
+
+    // Dropping a covering run leaves a non-empty slot uncovered.
+    proof.runs = runs[0..2];
+    try testing.expectError(error.InvalidProof, verifyRange(&proof, digest));
+    proof.runs = runs[1..3];
+    try testing.expectError(error.InvalidProof, verifyRange(&proof, digest));
+    proof.runs = &runs;
+
+    // Dropping the older run's trailing boundary block breaks completeness.
+    var short_runs = runs;
+    short_runs[1].blocks = short_runs[1].blocks[0..2];
+    proof.runs = &short_runs;
+    try testing.expectError(error.InvalidProof, verifyRange(&proof, digest));
+    // Non-consecutive blocks are rejected.
+    var gapped = [2]RangeBlock{ runs[1].blocks[0], runs[1].blocks[2] };
+    short_runs[1].blocks = &gapped;
+    try testing.expectError(error.InvalidProof, verifyRange(&proof, digest));
+    short_runs[1].blocks = runs[1].blocks;
+    proof.runs = &runs;
+
+    // The mixed-block run without its suffix bracket fails the right rule.
+    var mixed_short = runs;
+    mixed_short[2].blocks = mixed_short[2].blocks[1..2];
+    proof.runs = &mixed_short;
+    try testing.expectError(error.InvalidProof, verifyRange(&proof, digest));
+    // A flipped path step anywhere fails the fold.
+    var flipped_steps = try arena.dupe(BlockPath.Step, runs[1].blocks[2].path.steps);
+    flipped_steps[0].right = !flipped_steps[0].right;
+    var flipped_runs = runs;
+    var flipped_block = runs[1].blocks[2];
+    flipped_block.path = .{ .steps = flipped_steps };
+    var flipped_block_list = [3]RangeBlock{ runs[1].blocks[0], runs[1].blocks[1], flipped_block };
+    flipped_runs[1].blocks = &flipped_block_list;
+    proof.runs = &flipped_runs;
+    try testing.expectError(error.InvalidProof, verifyRange(&proof, digest));
+    proof.runs = &runs;
+
+    // A lying block_count changes the tree shape and the bucket hash.
+    var lied = runs;
+    lied[1].block_count += 1;
+    proof.runs = &lied;
+    try testing.expectError(error.InvalidProof, verifyRange(&proof, digest));
+    // Duplicate slot coverage is rejected.
+    var dup = runs;
+    dup[2].slot_level = 1;
+    dup[2].slot_snapshot = false;
+    proof.runs = &dup;
+    try testing.expectError(error.InvalidProof, verifyRange(&proof, digest));
+    proof.runs = &runs;
+
+    // An all-empty frontier proves the empty range with no runs at all.
+    var empty_levels: [3]ChainLevel = @splat(.{ .curr = empty, .snap = empty });
+    const empty_digest = chainCommitment(schema, profile, 0, &empty_levels);
+    const empty_proof = RangeProof{
+        .table = 1,
+        .start = "b",
+        .end = "k",
+        .entries = &.{},
+        .runs = &.{},
+        .schema_hash = schema,
+        .profile_hash = profile,
+        .advance = 0,
+        .levels = &empty_levels,
+    };
+    try verifyRange(&empty_proof, empty_digest);
+    const some_entry = [_]RangeEntry{.{ .key = "c", .value = "val-c2" }};
+    var overclaim = empty_proof;
+    overclaim.entries = &some_entry;
+    try testing.expectError(error.InvalidProof, verifyRange(&overclaim, empty_digest));
+    // Degenerate interval.
+    var degenerate = proof;
+    degenerate.end = "b";
+    try testing.expectError(error.InvalidProof, verifyRange(&degenerate, digest));
 }

@@ -798,6 +798,278 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             return self.proveState(&loaded.frontier, name, key, gpa);
         }
 
+        /// Every allocation a generated range proof owns; record bytes are
+        /// borrowed from `blocks` through `proof.entries`.
+        pub const RangeBundle = struct {
+            proof: lib.proofs.RangeProof,
+            levels: []lib.proofs.ChainLevel,
+            runs: []lib.proofs.RangeRun,
+            blocks: [][]u8,
+            steps: [][]const lib.proofs.BlockPath.Step,
+            gpa: Allocator,
+
+            pub fn deinit(self: *RangeBundle) void {
+                self.gpa.free(self.proof.start);
+                self.gpa.free(self.proof.end);
+                self.gpa.free(self.proof.entries);
+                for (self.blocks) |block| self.gpa.free(block);
+                self.gpa.free(self.blocks);
+                for (self.steps) |list| self.gpa.free(list);
+                self.gpa.free(self.steps);
+                for (self.runs) |run| self.gpa.free(run.blocks);
+                self.gpa.free(self.runs);
+                self.gpa.free(self.levels);
+            }
+        };
+
+        /// Per-block metadata from a bucket's first verified pass: whether
+        /// the block holds an in-range record, ends before (table, start),
+        /// or starts at/after (table, end).
+        const RunMeta = struct { hit: bool, prefix: bool, suffix: bool };
+
+        /// Choose the covering run [from, to] a range proof must include
+        /// (see lib.proofs.verifyRange's completeness rules): the inner
+        /// blocks plus one bracket on each unbounded side, or for a bucket
+        /// with no in-range records the last prefix block through the first
+        /// block starting at/after end (a mixed block needs one more).
+        fn selectRun(meta: []const RunMeta) struct { from: usize, to: usize } {
+            const count = meta.len;
+            var first: ?usize = null;
+            var last: usize = 0;
+            for (meta, 0..) |m, index| {
+                if (!m.hit) continue;
+                if (first == null) first = index;
+                last = index;
+            }
+            if (first) |inner| {
+                return .{
+                    .from = if (inner > 0) inner - 1 else 0,
+                    .to = if (last + 1 < count) last + 1 else count - 1,
+                };
+            }
+            var anchor: ?usize = null;
+            for (meta, 0..) |m, index| {
+                if (m.prefix) anchor = index;
+            }
+            const from = anchor orelse 0;
+            if (anchor == null) {
+                // No block ends before start: block zero is mixed or the
+                // whole bucket starts at/after end.
+                if (count > 1 and !meta[0].suffix) return .{ .from = 0, .to = 1 };
+                return .{ .from = 0, .to = 0 };
+            }
+            if (from + 1 < count and !meta[from + 1].suffix and from + 2 < count)
+                return .{ .from = from, .to = from + 2 };
+            return .{ .from = from, .to = @min(from + 1, count - 1) };
+        }
+
+        /// Generate the visible-range proof for one table over encoded key
+        /// interval [start, end) from the current frontier (youngest-wins
+        /// across every non-empty slot). Requires a v2 profile.
+        pub fn proveRange(self: *Self, comptime name: Name, start: Def.table(name).Key, end: Def.table(name).Key, gpa: Allocator) !RangeBundle {
+            return self.proveRangeState(&self.frontier, name, start, end, gpa);
+        }
+
+        fn proveRangeState(self: *Self, state: *const Frontier, comptime name: Name, start_key: Def.table(name).Key, end_key: Def.table(name).Key, gpa: Allocator) !RangeBundle {
+            const target = self.v2Target() orelse return error.ProfileMismatch;
+            const T = Def.table(name);
+            var start_buf: [lib.Codec(T.Key).max_size]u8 = undefined;
+            var end_buf: [lib.Codec(T.Key).max_size]u8 = undefined;
+            const start = try lib.Codec(T.Key).encode(start_key, &start_buf);
+            const end = try lib.Codec(T.Key).encode(end_key, &end_buf);
+            if (std.mem.order(u8, start, end) != .lt) return error.InvalidRange;
+
+            var runs: std.ArrayList(lib.proofs.RangeRun) = .empty;
+            errdefer {
+                for (runs.items) |run| gpa.free(run.blocks);
+                runs.deinit(gpa);
+            }
+            var blocks: std.ArrayList([]u8) = .empty;
+            errdefer {
+                for (blocks.items) |block| gpa.free(block);
+                blocks.deinit(gpa);
+            }
+            var steps: std.ArrayList([]const lib.proofs.BlockPath.Step) = .empty;
+            errdefer {
+                for (steps.items) |list| gpa.free(list);
+                steps.deinit(gpa);
+            }
+            var entries: std.ArrayList(lib.proofs.RangeEntry) = .empty;
+            errdefer entries.deinit(gpa);
+            var decided: std.StringHashMapUnmanaged(void) = .empty;
+            defer decided.deinit(gpa);
+
+            for (state.levels, 0..) |level, level_index| {
+                for ([_]struct { hash: Hash, snapshot: bool }{
+                    .{ .hash = level.curr, .snapshot = false },
+                    .{ .hash = level.snap, .snapshot = true },
+                }) |slot| {
+                    if (std.mem.eql(u8, &slot.hash, &state.empty)) continue;
+                    var run = try self.rangeRunForSlot(gpa, slot.hash, T.id, start, end, target, &blocks, &steps);
+                    errdefer gpa.free(run.blocks);
+                    run.slot_level = level_index;
+                    run.slot_snapshot = slot.snapshot;
+                    // Youngest-wins: this slot decides every in-range key it
+                    // holds that no younger slot has decided yet.
+                    for (run.blocks) |*range_block| {
+                        var position: usize = 0;
+                        const bytes = range_block.block;
+                        while (position + 8 <= bytes.len) {
+                            const record_table = std.mem.readInt(u32, bytes[position..][0..4], .big);
+                            const key_len = std.mem.readInt(u32, bytes[position + 4 ..][0..4], .big);
+                            if (position + 8 + key_len + 1 > bytes.len) return error.InvalidBucket;
+                            const record_key = bytes[position + 8 ..][0..key_len];
+                            position += 8 + key_len;
+                            const tag = bytes[position];
+                            position += 1;
+                            var value: ?[]const u8 = null;
+                            if (tag == 1) {
+                                if (position + 4 > bytes.len) return error.InvalidBucket;
+                                const value_len = std.mem.readInt(u32, bytes[position..][0..4], .big);
+                                if (position + 4 + value_len > bytes.len) return error.InvalidBucket;
+                                value = bytes[position + 4 ..][0..value_len];
+                                position += 4 + value_len;
+                            } else if (tag != 0) return error.InvalidBucket;
+                            if (record_table != T.id) continue;
+                            if (std.mem.order(u8, record_key, start) == .lt) continue;
+                            if (std.mem.order(u8, record_key, end) != .lt) break;
+                            const seen = (try decided.getOrPut(gpa, record_key)).found_existing;
+                            if (!seen and value != null) try entries.append(gpa, .{ .key = record_key, .value = value.? });
+                        }
+                    }
+                    try runs.append(gpa, run);
+                }
+            }
+            std.mem.sort(lib.proofs.RangeEntry, entries.items, {}, struct {
+                fn less(_: void, a: lib.proofs.RangeEntry, b: lib.proofs.RangeEntry) bool {
+                    return std.mem.order(u8, a.key, b.key) == .lt;
+                }
+            }.less);
+            const levels = try gpa.alloc(lib.proofs.ChainLevel, depth);
+            errdefer gpa.free(levels);
+            for (state.levels, 0..) |level, i| {
+                levels[i] = .{ .curr = level.curr, .snap = level.snap, .next = level.next };
+            }
+            const owned_runs = try runs.toOwnedSlice(gpa);
+            errdefer gpa.free(owned_runs);
+            return .{
+                .proof = .{
+                    .table = T.id,
+                    .start = try gpa.dupe(u8, start),
+                    .end = try gpa.dupe(u8, end),
+                    .entries = try entries.toOwnedSlice(gpa),
+                    .runs = owned_runs,
+                    .schema_hash = schema_hash,
+                    .profile_hash = state.profile_hash,
+                    .advance = state.seq,
+                    .levels = levels,
+                },
+                .levels = levels,
+                .runs = owned_runs,
+                .blocks = try blocks.toOwnedSlice(gpa),
+                .steps = try steps.toOwnedSlice(gpa),
+                .gpa = gpa,
+            };
+        }
+
+        /// Two verified passes over one slot's bucket: the first derives
+        /// per-block metadata and the covering run, the second retains only
+        /// the run's block bytes and every leaf; paths are computed after
+        /// the tree is complete. Block bytes are appended to `blocks` and
+        /// step slices to `steps`; the returned run borrows both.
+        fn rangeRunForSlot(self: *Self, gpa: Allocator, hash: Hash, table: u32, start: []const u8, end: []const u8, target: u32, blocks: *std.ArrayList([]u8), steps: *std.ArrayList([]const lib.proofs.BlockPath.Step)) !lib.proofs.RangeRun {
+            var meta: std.ArrayList(RunMeta) = .empty;
+            defer meta.deinit(gpa);
+            var record_count: u64 = 0;
+            {
+                var cursor = try self.store.scanBucketIndexed(hash, self.mergeLimits());
+                defer cursor.deinit();
+                var block_size: u64 = 0;
+                var hit = false;
+                var last_below_start = false;
+                var first_at_or_after_end = false;
+                var seen = false;
+                while (try cursor.next()) |record| {
+                    if (!seen) {
+                        seen = true;
+                        first_at_or_after_end = record.table > table or (record.table == table and std.mem.order(u8, record.key, end) != .lt);
+                    }
+                    if (record.table == table and std.mem.order(u8, record.key, start) != .lt and std.mem.order(u8, record.key, end) == .lt) hit = true;
+                    last_below_start = record.table < table or (record.table == table and std.mem.order(u8, record.key, start) == .lt);
+                    block_size += 9 + record.key.len + if (record.value) |value| 4 + value.len else 0;
+                    record_count += 1;
+                    if (block_size >= target) {
+                        try meta.append(gpa, .{ .hit = hit, .prefix = last_below_start, .suffix = first_at_or_after_end });
+                        block_size = 0;
+                        hit = false;
+                        seen = false;
+                    }
+                }
+                if (seen) try meta.append(gpa, .{ .hit = hit, .prefix = last_below_start, .suffix = first_at_or_after_end });
+            }
+            const selection = selectRun(meta.items);
+            var run_blocks: std.ArrayList(lib.proofs.RangeBlock) = .empty;
+            errdefer run_blocks.deinit(gpa);
+            {
+                var cursor = try self.store.scanBucketIndexed(hash, self.mergeLimits());
+                defer cursor.deinit();
+                var leaves: std.ArrayList(lib.proofs.Hash) = .empty;
+                defer leaves.deinit(gpa);
+                var block: std.ArrayList(u8) = .empty;
+                defer block.deinit(gpa);
+                var kept: std.ArrayList(u64) = .empty;
+                defer kept.deinit(gpa);
+                var block_size: u64 = 0;
+                var block_index: u64 = 0;
+                while (try cursor.next()) |record| {
+                    var header: [8]u8 = undefined;
+                    std.mem.writeInt(u32, header[0..4], record.table, .big);
+                    std.mem.writeInt(u32, header[4..8], @intCast(record.key.len), .big);
+                    try block.appendSlice(gpa, &header);
+                    try block.appendSlice(gpa, record.key);
+                    try block.append(gpa, @intFromBool(record.value != null));
+                    if (record.value) |value| {
+                        var length: [4]u8 = undefined;
+                        std.mem.writeInt(u32, &length, @intCast(value.len), .big);
+                        try block.appendSlice(gpa, &length);
+                        try block.appendSlice(gpa, value);
+                        block_size += 13 + record.key.len + value.len;
+                    } else block_size += 9 + record.key.len;
+                    if (block_size >= target) {
+                        try leaves.append(gpa, lib.proofs.blockHash(block_index, block.items));
+                        if (block_index >= selection.from and block_index <= selection.to) {
+                            try blocks.append(gpa, try gpa.dupe(u8, block.items));
+                            try kept.append(gpa, block_index);
+                        }
+                        block.clearRetainingCapacity();
+                        block_size = 0;
+                        block_index += 1;
+                    }
+                }
+                if (block.items.len > 0) {
+                    try leaves.append(gpa, lib.proofs.blockHash(block_index, block.items));
+                    if (block_index >= selection.from and block_index <= selection.to) {
+                        try blocks.append(gpa, try gpa.dupe(u8, block.items));
+                        try kept.append(gpa, block_index);
+                    }
+                }
+                // Paths need the complete tree; compute them only now.
+                const first_kept = blocks.items.len - kept.items.len;
+                for (kept.items, 0..) |index, i| {
+                    const path = try lib.proofs.blockPath(gpa, leaves.items, @intCast(index));
+                    try steps.append(gpa, path.steps);
+                    try run_blocks.append(gpa, .{ .block = blocks.items[first_kept + i], .block_index = index, .path = path });
+                }
+            }
+            return .{
+                .slot_level = 0,
+                .slot_snapshot = false,
+                .block_count = meta.items.len,
+                .record_count = record_count,
+                .blocks = try run_blocks.toOwnedSlice(gpa),
+            };
+        }
+
         /// Requires quiescent readers. Retains current, pinned views, and each
         /// explicit reference; authenticates all roots before deleting anything.
         pub fn collect(self: *Self, retained: []const Reference) !usize {
