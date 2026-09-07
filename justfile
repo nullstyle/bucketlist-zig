@@ -27,6 +27,10 @@ vectors-check:
 wasm-diff:
     mise exec -- zig build wasm-diff
 
+# Build and gate the standalone wasm proof verifier artifact.
+wasm-verify:
+    mise exec -- zig build wasm-verify
+
 # Fast seeded cases are also part of the ordinary test target.
 fuzz-smoke:
     mise exec -- zig build fuzz-smoke
@@ -82,7 +86,7 @@ linux-check:
 core-oracle:
     mise exec -- python3 tools/check-core-oracle.py
 
-preflight: doctor fmt-check ci-lint vectors-check test wasm-diff guided-self-test
+preflight: doctor fmt-check ci-lint vectors-check test wasm-diff wasm-verify guided-self-test
     mise exec -- zig build test -Doptimize=ReleaseSafe --summary all
     mise exec -- zig build check -Dtarget=x86_64-linux --summary all
     mise exec -- python3 tools/package-preflight.py

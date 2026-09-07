@@ -6,7 +6,7 @@ const capnpc = @import("capnpc-zig");
 const message = capnpc.message;
 const schema = capnpc.schema;
 
-pub const CAPNP_SCHEMA_MANIFEST_JSON: []const u8 = "{\"schema\":\"proof.capnp\",\"module\":\"proof\",\"serde\":[{\"id\":14694040388961476695,\"type_name\":\"BucketProof\",\"to_json_export\":\"capnp_proof_bucket_proof_to_json\",\"from_json_export\":\"capnp_proof_bucket_proof_from_json\"},{\"id\":16183530348409898003,\"type_name\":\"ChainLevel\",\"to_json_export\":\"capnp_proof_chain_level_to_json\",\"from_json_export\":\"capnp_proof_chain_level_from_json\"},{\"id\":18350906904536974067,\"type_name\":\"Hash\",\"to_json_export\":\"capnp_proof_hash_to_json\",\"from_json_export\":\"capnp_proof_hash_from_json\"},{\"id\":11040269344464418071,\"type_name\":\"SlotPlacement\",\"to_json_export\":\"capnp_proof_slot_placement_to_json\",\"from_json_export\":\"capnp_proof_slot_placement_from_json\"},{\"id\":9360191887109431276,\"type_name\":\"Step\",\"to_json_export\":\"capnp_proof_step_to_json\",\"from_json_export\":\"capnp_proof_step_from_json\"},{\"id\":9877308517675603538,\"type_name\":\"VisibleProof\",\"to_json_export\":\"capnp_proof_visible_proof_to_json\",\"from_json_export\":\"capnp_proof_visible_proof_from_json\"}]}";
+pub const CAPNP_SCHEMA_MANIFEST_JSON: []const u8 = "{\"schema\":\"proof.capnp\",\"module\":\"proof\",\"serde\":[{\"id\":14694040388961476695,\"type_name\":\"BucketProof\",\"to_json_export\":\"capnp_proof_bucket_proof_to_json\",\"from_json_export\":\"capnp_proof_bucket_proof_from_json\"},{\"id\":16183530348409898003,\"type_name\":\"ChainLevel\",\"to_json_export\":\"capnp_proof_chain_level_to_json\",\"from_json_export\":\"capnp_proof_chain_level_from_json\"},{\"id\":18350906904536974067,\"type_name\":\"Hash\",\"to_json_export\":\"capnp_proof_hash_to_json\",\"from_json_export\":\"capnp_proof_hash_from_json\"},{\"id\":17986299139702585111,\"type_name\":\"RangeBlock\",\"to_json_export\":\"capnp_proof_range_block_to_json\",\"from_json_export\":\"capnp_proof_range_block_from_json\"},{\"id\":10286157164586854131,\"type_name\":\"RangeEntry\",\"to_json_export\":\"capnp_proof_range_entry_to_json\",\"from_json_export\":\"capnp_proof_range_entry_from_json\"},{\"id\":11664545859640674737,\"type_name\":\"RangeProof\",\"to_json_export\":\"capnp_proof_range_proof_to_json\",\"from_json_export\":\"capnp_proof_range_proof_from_json\"},{\"id\":14922724864438947245,\"type_name\":\"RangeRun\",\"to_json_export\":\"capnp_proof_range_run_to_json\",\"from_json_export\":\"capnp_proof_range_run_from_json\"},{\"id\":11040269344464418071,\"type_name\":\"SlotPlacement\",\"to_json_export\":\"capnp_proof_slot_placement_to_json\",\"from_json_export\":\"capnp_proof_slot_placement_from_json\"},{\"id\":9360191887109431276,\"type_name\":\"Step\",\"to_json_export\":\"capnp_proof_step_to_json\",\"from_json_export\":\"capnp_proof_step_from_json\"},{\"id\":9877308517675603538,\"type_name\":\"VisibleProof\",\"to_json_export\":\"capnp_proof_visible_proof_to_json\",\"from_json_export\":\"capnp_proof_visible_proof_from_json\"}]}";
 pub fn capnpSchemaManifestJson() []const u8 {
     return CAPNP_SCHEMA_MANIFEST_JSON;
 }
@@ -499,6 +499,401 @@ pub const VisibleProof = struct {
         pub fn initDeciding(self: *Builder) !SlotPlacement.Builder {
             const builder = try self._builder.initStruct(3, 1, 1);
             return SlotPlacement.Builder{ ._builder = builder };
+        }
+
+        pub fn hasSchemaHash(self: Builder) bool {
+            return !self._builder.isPointerNull(4);
+        }
+
+        pub fn initSchemaHash(self: *Builder) !Hash.Builder {
+            const builder = try self._builder.initStruct(4, 0, 1);
+            return Hash.Builder{ ._builder = builder };
+        }
+
+        pub fn hasProfileHash(self: Builder) bool {
+            return !self._builder.isPointerNull(5);
+        }
+
+        pub fn initProfileHash(self: *Builder) !Hash.Builder {
+            const builder = try self._builder.initStruct(5, 0, 1);
+            return Hash.Builder{ ._builder = builder };
+        }
+
+        pub fn setAdvance(self: *Builder, value: u64) !void {
+            self._builder.writeU64(8, @bitCast(value));
+        }
+
+        pub fn hasLevels(self: Builder) bool {
+            return !self._builder.isPointerNull(6);
+        }
+
+        pub fn initLevels(self: *Builder, element_count: u32) !StructListBuilder(ChainLevel) {
+            const raw = try self._builder.writeStructList(6, element_count, 0, 3);
+            return StructListBuilder(ChainLevel){ ._list = raw };
+        }
+    };
+};
+
+pub const RangeBlock = struct {
+    const StructListReader = message.typed_list_helpers.StructListReader;
+    const StructListBuilder = message.typed_list_helpers.StructListBuilder;
+
+    pub const Reader = struct {
+        _reader: message.StructReader,
+
+        pub fn init(msg: *const message.Message) !Reader {
+            const root = try msg.getRootStruct();
+            return .{ ._reader = root };
+        }
+
+        pub fn wrap(reader: message.StructReader) Reader {
+            return .{ ._reader = reader };
+        }
+
+        pub fn hasBlock(self: Reader) bool {
+            return !self._reader.isPointerNull(0);
+        }
+
+        pub fn getBlock(self: Reader) ![]const u8 {
+            if (self._reader.isPointerNull(0)) return &[_]u8{};
+            return try self._reader.readData(0);
+        }
+
+        pub fn getBlockIndex(self: Reader) !u64 {
+            return self._reader.readU64(0);
+        }
+
+        pub fn hasPath(self: Reader) bool {
+            return !self._reader.isPointerNull(1);
+        }
+
+        pub fn getPath(self: Reader) !StructListReader(Step) {
+            if (self._reader.isPointerNull(1)) return StructListReader(Step){ ._list = self._reader.emptyStructList() };
+            const raw = try self._reader.readStructList(1);
+            return StructListReader(Step){ ._list = raw };
+        }
+    };
+
+    pub const Builder = struct {
+        _builder: message.StructBuilder,
+
+        pub fn init(msg: *message.MessageBuilder) !Builder {
+            const builder = try msg.allocateStruct(1, 2);
+            return .{ ._builder = builder };
+        }
+
+        pub fn wrap(builder: message.StructBuilder) Builder {
+            return .{ ._builder = builder };
+        }
+
+        pub fn hasBlock(self: Builder) bool {
+            return !self._builder.isPointerNull(0);
+        }
+
+        pub fn setBlock(self: *Builder, value: []const u8) !void {
+            try self._builder.writeData(0, value);
+        }
+
+        pub fn setBlockIndex(self: *Builder, value: u64) !void {
+            self._builder.writeU64(0, @bitCast(value));
+        }
+
+        pub fn hasPath(self: Builder) bool {
+            return !self._builder.isPointerNull(1);
+        }
+
+        pub fn initPath(self: *Builder, element_count: u32) !StructListBuilder(Step) {
+            const raw = try self._builder.writeStructList(1, element_count, 1, 1);
+            return StructListBuilder(Step){ ._list = raw };
+        }
+    };
+};
+
+pub const RangeRun = struct {
+    const StructListReader = message.typed_list_helpers.StructListReader;
+    const StructListBuilder = message.typed_list_helpers.StructListBuilder;
+
+    pub const Reader = struct {
+        _reader: message.StructReader,
+
+        pub fn init(msg: *const message.Message) !Reader {
+            const root = try msg.getRootStruct();
+            return .{ ._reader = root };
+        }
+
+        pub fn wrap(reader: message.StructReader) Reader {
+            return .{ ._reader = reader };
+        }
+
+        pub fn getSlotLevel(self: Reader) !u32 {
+            return self._reader.readU32(0);
+        }
+
+        pub fn getSlotSnapshot(self: Reader) !bool {
+            return self._reader.readBool(4, 0) != false;
+        }
+
+        pub fn getBlockCount(self: Reader) !u64 {
+            return self._reader.readU64(8);
+        }
+
+        pub fn getRecordCount(self: Reader) !u64 {
+            return self._reader.readU64(16);
+        }
+
+        pub fn hasBlocks(self: Reader) bool {
+            return !self._reader.isPointerNull(0);
+        }
+
+        pub fn getBlocks(self: Reader) !StructListReader(RangeBlock) {
+            if (self._reader.isPointerNull(0)) return StructListReader(RangeBlock){ ._list = self._reader.emptyStructList() };
+            const raw = try self._reader.readStructList(0);
+            return StructListReader(RangeBlock){ ._list = raw };
+        }
+    };
+
+    pub const Builder = struct {
+        _builder: message.StructBuilder,
+
+        pub fn init(msg: *message.MessageBuilder) !Builder {
+            const builder = try msg.allocateStruct(3, 1);
+            return .{ ._builder = builder };
+        }
+
+        pub fn wrap(builder: message.StructBuilder) Builder {
+            return .{ ._builder = builder };
+        }
+
+        pub fn setSlotLevel(self: *Builder, value: u32) !void {
+            self._builder.writeU32(0, @bitCast(value));
+        }
+
+        pub fn setSlotSnapshot(self: *Builder, value: bool) !void {
+            self._builder.writeBool(4, 0, value != false);
+        }
+
+        pub fn setBlockCount(self: *Builder, value: u64) !void {
+            self._builder.writeU64(8, @bitCast(value));
+        }
+
+        pub fn setRecordCount(self: *Builder, value: u64) !void {
+            self._builder.writeU64(16, @bitCast(value));
+        }
+
+        pub fn hasBlocks(self: Builder) bool {
+            return !self._builder.isPointerNull(0);
+        }
+
+        pub fn initBlocks(self: *Builder, element_count: u32) !StructListBuilder(RangeBlock) {
+            const raw = try self._builder.writeStructList(0, element_count, 1, 2);
+            return StructListBuilder(RangeBlock){ ._list = raw };
+        }
+    };
+};
+
+pub const RangeEntry = struct {
+    pub const Reader = struct {
+        _reader: message.StructReader,
+
+        pub fn init(msg: *const message.Message) !Reader {
+            const root = try msg.getRootStruct();
+            return .{ ._reader = root };
+        }
+
+        pub fn wrap(reader: message.StructReader) Reader {
+            return .{ ._reader = reader };
+        }
+
+        pub fn hasKey(self: Reader) bool {
+            return !self._reader.isPointerNull(0);
+        }
+
+        pub fn getKey(self: Reader) ![]const u8 {
+            if (self._reader.isPointerNull(0)) return &[_]u8{};
+            return try self._reader.readData(0);
+        }
+
+        pub fn hasValue(self: Reader) bool {
+            return !self._reader.isPointerNull(1);
+        }
+
+        pub fn getValue(self: Reader) ![]const u8 {
+            if (self._reader.isPointerNull(1)) return &[_]u8{};
+            return try self._reader.readData(1);
+        }
+    };
+
+    pub const Builder = struct {
+        _builder: message.StructBuilder,
+
+        pub fn init(msg: *message.MessageBuilder) !Builder {
+            const builder = try msg.allocateStruct(0, 2);
+            return .{ ._builder = builder };
+        }
+
+        pub fn wrap(builder: message.StructBuilder) Builder {
+            return .{ ._builder = builder };
+        }
+
+        pub fn hasKey(self: Builder) bool {
+            return !self._builder.isPointerNull(0);
+        }
+
+        pub fn setKey(self: *Builder, value: []const u8) !void {
+            try self._builder.writeData(0, value);
+        }
+
+        pub fn hasValue(self: Builder) bool {
+            return !self._builder.isPointerNull(1);
+        }
+
+        pub fn setValue(self: *Builder, value: []const u8) !void {
+            try self._builder.writeData(1, value);
+        }
+    };
+};
+
+pub const RangeProof = struct {
+    const StructListReader = message.typed_list_helpers.StructListReader;
+    const StructListBuilder = message.typed_list_helpers.StructListBuilder;
+
+    pub const Reader = struct {
+        _reader: message.StructReader,
+
+        pub fn init(msg: *const message.Message) !Reader {
+            const root = try msg.getRootStruct();
+            return .{ ._reader = root };
+        }
+
+        pub fn wrap(reader: message.StructReader) Reader {
+            return .{ ._reader = reader };
+        }
+
+        pub fn getTable(self: Reader) !u32 {
+            return self._reader.readU32(0);
+        }
+
+        pub fn hasStart(self: Reader) bool {
+            return !self._reader.isPointerNull(0);
+        }
+
+        pub fn getStart(self: Reader) ![]const u8 {
+            if (self._reader.isPointerNull(0)) return &[_]u8{};
+            return try self._reader.readData(0);
+        }
+
+        pub fn hasEnd(self: Reader) bool {
+            return !self._reader.isPointerNull(1);
+        }
+
+        pub fn getEnd(self: Reader) ![]const u8 {
+            if (self._reader.isPointerNull(1)) return &[_]u8{};
+            return try self._reader.readData(1);
+        }
+
+        pub fn hasEntries(self: Reader) bool {
+            return !self._reader.isPointerNull(2);
+        }
+
+        pub fn getEntries(self: Reader) !StructListReader(RangeEntry) {
+            if (self._reader.isPointerNull(2)) return StructListReader(RangeEntry){ ._list = self._reader.emptyStructList() };
+            const raw = try self._reader.readStructList(2);
+            return StructListReader(RangeEntry){ ._list = raw };
+        }
+
+        pub fn hasRuns(self: Reader) bool {
+            return !self._reader.isPointerNull(3);
+        }
+
+        pub fn getRuns(self: Reader) !StructListReader(RangeRun) {
+            if (self._reader.isPointerNull(3)) return StructListReader(RangeRun){ ._list = self._reader.emptyStructList() };
+            const raw = try self._reader.readStructList(3);
+            return StructListReader(RangeRun){ ._list = raw };
+        }
+
+        pub fn hasSchemaHash(self: Reader) bool {
+            return !self._reader.isPointerNull(4);
+        }
+
+        pub fn getSchemaHash(self: Reader) !Hash.Reader {
+            if (self._reader.isPointerNull(4)) return Hash.Reader{ ._reader = self._reader.emptyStruct() };
+            const value = try self._reader.readStruct(4);
+            return Hash.Reader{ ._reader = value };
+        }
+
+        pub fn hasProfileHash(self: Reader) bool {
+            return !self._reader.isPointerNull(5);
+        }
+
+        pub fn getProfileHash(self: Reader) !Hash.Reader {
+            if (self._reader.isPointerNull(5)) return Hash.Reader{ ._reader = self._reader.emptyStruct() };
+            const value = try self._reader.readStruct(5);
+            return Hash.Reader{ ._reader = value };
+        }
+
+        pub fn getAdvance(self: Reader) !u64 {
+            return self._reader.readU64(8);
+        }
+
+        pub fn hasLevels(self: Reader) bool {
+            return !self._reader.isPointerNull(6);
+        }
+
+        pub fn getLevels(self: Reader) !StructListReader(ChainLevel) {
+            if (self._reader.isPointerNull(6)) return StructListReader(ChainLevel){ ._list = self._reader.emptyStructList() };
+            const raw = try self._reader.readStructList(6);
+            return StructListReader(ChainLevel){ ._list = raw };
+        }
+    };
+
+    pub const Builder = struct {
+        _builder: message.StructBuilder,
+
+        pub fn init(msg: *message.MessageBuilder) !Builder {
+            const builder = try msg.allocateStruct(2, 7);
+            return .{ ._builder = builder };
+        }
+
+        pub fn wrap(builder: message.StructBuilder) Builder {
+            return .{ ._builder = builder };
+        }
+
+        pub fn setTable(self: *Builder, value: u32) !void {
+            self._builder.writeU32(0, @bitCast(value));
+        }
+
+        pub fn hasStart(self: Builder) bool {
+            return !self._builder.isPointerNull(0);
+        }
+
+        pub fn setStart(self: *Builder, value: []const u8) !void {
+            try self._builder.writeData(0, value);
+        }
+
+        pub fn hasEnd(self: Builder) bool {
+            return !self._builder.isPointerNull(1);
+        }
+
+        pub fn setEnd(self: *Builder, value: []const u8) !void {
+            try self._builder.writeData(1, value);
+        }
+
+        pub fn hasEntries(self: Builder) bool {
+            return !self._builder.isPointerNull(2);
+        }
+
+        pub fn initEntries(self: *Builder, element_count: u32) !StructListBuilder(RangeEntry) {
+            const raw = try self._builder.writeStructList(2, element_count, 0, 2);
+            return StructListBuilder(RangeEntry){ ._list = raw };
+        }
+
+        pub fn hasRuns(self: Builder) bool {
+            return !self._builder.isPointerNull(3);
+        }
+
+        pub fn initRuns(self: *Builder, element_count: u32) !StructListBuilder(RangeRun) {
+            const raw = try self._builder.writeStructList(3, element_count, 3, 1);
+            return StructListBuilder(RangeRun){ ._list = raw };
         }
 
         pub fn hasSchemaHash(self: Builder) bool {

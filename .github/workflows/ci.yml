@@ -27,3 +27,4 @@ jobs:
       - run: just test
       - run: zig build test -Doptimize=ReleaseSafe --summary all
       - run: just wasm-diff
+      - run: just wasm-verify

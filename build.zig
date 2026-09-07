@@ -355,4 +355,40 @@ pub fn build(b: *std.Build) void {
     diff.addArtifactArg(wasm);
     diff.addArtifactArg(differential);
     b.step("wasm-diff", "Compare native and WASM execution against independent fixtures").dependOn(&diff.step);
+
+    // The standalone verifier artifact: wasm32-freestanding, import-free,
+    // installed as zig-out/bin/bucketlist-verifier.wasm and gated on real
+    // generated proofs through node.
+    const wasm_verify = b.addExecutable(.{
+        .name = "bucketlist-verifier",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/wasm_verify.zig"),
+            .target = wasm_target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "bucketlist", .module = wasm_lib }},
+        }),
+    });
+    wasm_verify.entry = .disabled;
+    wasm_verify.rdynamic = true;
+    wasm_verify.stack_size = 4 * 1024 * 1024;
+    const wasm_fixtures = b.addExecutable(.{
+        .name = "wasm-verify-fixtures",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/wasm_verify_fixtures.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "bucketlist", .module = lib },
+                .{ .name = "bucketlist-disk", .module = disk },
+                .{ .name = "bucketlist-store", .module = store },
+            },
+        }),
+    });
+    const verify_gate = b.addSystemCommand(&.{ "node", "tools/wasm-verify.mjs" });
+    verify_gate.addArtifactArg(wasm_verify);
+    verify_gate.addArtifactArg(wasm_fixtures);
+    const wasm_verify_step = b.step("wasm-verify", "Gate the standalone wasm proof verifier on real generated proofs");
+    wasm_verify_step.dependOn(&verify_gate.step);
+    wasm_verify_step.dependOn(&b.addInstallArtifact(wasm_verify, .{}).step);
+    check.dependOn(&wasm_verify.step);
 }

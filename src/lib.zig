@@ -6,6 +6,7 @@ pub const Definition = @import("schema.zig").Definition;
 pub const Database = @import("database.zig").Database;
 pub const Commitment = @import("database.zig").Commitment;
 pub const proofs = @import("proofs.zig");
+pub const proof_flat = @import("proof_flat.zig");
 
 test {
     _ = @import("codec.zig");

@@ -43,3 +43,34 @@ struct VisibleProof {
   advance @8 :UInt64;
   levels @9 :List(ChainLevel);
 }
+
+struct RangeBlock {
+  block @0 :Data;
+  blockIndex @1 :UInt64;
+  path @2 :List(Step);
+}
+
+struct RangeRun {
+  slotLevel @0 :UInt32;
+  slotSnapshot @1 :Bool;
+  blockCount @2 :UInt64;
+  recordCount @3 :UInt64;
+  blocks @4 :List(RangeBlock);
+}
+
+struct RangeEntry {
+  key @0 :Data;
+  value @1 :Data;
+}
+
+struct RangeProof {
+  table @0 :UInt32;
+  start @1 :Data;
+  end @2 :Data;
+  entries @3 :List(RangeEntry);  # claimed live records, keys ascending
+  runs @4 :List(RangeRun);       # covering runs, youngest-first
+  schemaHash @5 :Hash;
+  profileHash @6 :Hash;
+  advance @7 :UInt64;
+  levels @8 :List(ChainLevel);
+}

@@ -6,6 +6,7 @@ export Definition
 export Database
 export Commitment
 export proofs
+export proof_flat
 Database.init: fn (mem.Allocator) database.DatabaseWithDepth(api.Schema,11)
 Database.deinit: fn (*database.DatabaseWithDepth(api.Schema,11)) void
 Database.commitment: fn (*const database.DatabaseWithDepth(api.Schema,11)) database.Commitment
@@ -109,6 +110,8 @@ HostStatus.failure: ?anyerror
 HostStatus.backpressure: u64
 ProofsWire.write: fn (mem.Allocator, *const proofs.VisibleProof, *serialization.message.MessageBuilder) @typeInfo(@typeInfo(@TypeOf(proofs_wire.write)).@"fn".return_type.?).error_union.error_set!void
 ProofsWire.read: fn (mem.Allocator, *const serialization.message.Message) error{InvalidMessage,InvalidProof,IoFailed,OutOfMemory,PresentRecord,UnknownRecord}!proofs.VisibleProof
+ProofsWire.writeRange: fn (*const proofs.RangeProof, *serialization.message.MessageBuilder) @typeInfo(@typeInfo(@TypeOf(proofs_wire.writeRange)).@"fn".return_type.?).error_union.error_set!void
+ProofsWire.readRange: fn (mem.Allocator, *const serialization.message.Message) error{InvalidMessage,InvalidProof,IoFailed,OutOfMemory,PresentRecord,UnknownRecord}!proofs.RangeProof
 Store.open: fn (mem.Allocator, Io, []const u8) error{CorruptBlob,CorruptManifest,InvalidBucket,InvalidPath,IoFailed,MergeMismatch,NotFound,NotRegularFile,OutOfMemory,StoreBusy,TooLarge,UnsupportedPlatform}!store.Store
 Store.deinit: fn (*store.Store) void
 Store.enableReadIndex: fn (*store.Store, store.ReadIndexOptions) error{CorruptBlob,CorruptManifest,InvalidBucket,InvalidPath,IoFailed,MergeMismatch,NotFound,NotRegularFile,OutOfMemory,StoreBusy,TooLarge,UnsupportedPlatform}!void

@@ -108,3 +108,39 @@ own lookup order), each proving class-2/3 absence, and requires every
 strictly younger slot to be covered or hold the computable empty-bucket
 hash; the deciding slot carries the class-1 or class-2 result. This is
 what `Database.prove` generates and `verifyVisible` checks.
+
+**Range proofs.** For one table and encoded key interval `[start, end)`
+with `start < end`, a **range proof** carries, for every frontier slot
+whose committed hash differs from the computable empty-bucket hash, a
+**covering run**: a consecutive, ascending list of authenticated blocks
+(`RangeRun`). Record order is global across blocks (blocks are prefix
+segments of the sorted stream), so completeness reduces to two brackets:
+the run's first block is block zero, or its last record sorts strictly
+before `(table, start)`; the run's last block is final, or its first
+record sorts at/after `(table, end)`. Under those rules no in-range
+record can exist outside the run, a run from a bucket with no in-range
+records degenerates to its boundary witnesses (a block ending before
+`start` through one starting at/after `end` — a block mixing records
+below `start` with records at/after `end` forces one more), and the
+verifier recomputes each run's block hashes, path folds (all blocks in a
+run must derive the same root), bucket hash, slot binding, and the chain
+digest exactly as the single-key proofs do. Runs are ordered
+youngest-first; the claimed entries must be exactly the youngest-wins
+live records inside the interval — keys strictly ascending, tombstones
+decided by a younger slot omitted — which `verifyRange` recomputes from
+the authenticated blocks. Verification keeps its cursors on the stack,
+so proofs with more than `max_range_runs` (64) slot runs are rejected;
+the checkpoint format caps depth at 31.
+
+**Wire and artifact encodings.** capnp (`schema/proof.capnp`) frames
+proof messages across process boundaries; range proofs use the
+`RangeProof`/`RangeRun`/`RangeBlock`/`RangeEntry` structs with the
+committed-codegen pattern. The standalone wasm verifier instead consumes
+the flat framing (`src/proof_flat.zig`): one linear buffer per proof —
+magic (`BKLFVIS1`/`BKLFRNG1`), then big-endian `u32`/`u64` counts,
+`u32`-length-prefixed byte fields, 32-byte hashes, and single-byte tags,
+with paths as `(right:u8 || hash:32)*`. Decoding bounds-charges every
+declared count against the remaining input before allocating, rejects
+truncated and trailing bytes, and allocates only from a caller-supplied
+allocator, so the freestanding artifact decodes into a fixed buffer over
+static memory.

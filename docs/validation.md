@@ -136,7 +136,25 @@ empty-slot rule. Proof components are covered by a byte-exhaustive
 mutation sweep, verification runs in the native+wasm32 differential,
 and the `bucketlist-proofs` capnp transport (capnp-zig v0.18.0, the
 package's first external dependency, serialization-only) roundtrips
-proofs through serialized bytes with forged digests rejected. Reopen validation now also seeds
+proofs through serialized bytes with forged digests rejected.
+
+Key-state proofs also generate against pinned read views and retained
+checkpoint references (`ReadView.prove`, `Database.proveReference`),
+each verifying against its own historical digest while the live frontier
+moves on, and retained references stay provable across collection.
+Range proofs (`proveRange`/`verifyRange`, docs/format-v2.md) extend the
+same authentication to key intervals: per-slot covering runs with
+boundary brackets, youngest-wins entry resolution, and slot coverage —
+verified by a hand-built fixture across eleven mutation classes,
+directed boundary cases against point reads, and a 90-advance random
+workload checked against an independent model over dozens of random
+ranges. The standalone wasm verifier artifact (`zig build wasm-verify`,
+`zig-out/bin/bucketlist-verifier.wasm`) is import-free wasm32-freestanding,
+consumes flat-framed proofs over a static scratch buffer, and is gated
+in CI on real generated evidence: true proofs accepted, tampered
+digests, tampered proof bodies, and truncations rejected.
+
+Reopen validation now also seeds
 the read index during those required scans (first reads after open are warm)
 and re-derives pending merge outputs with a write-free hash verification
 instead of rewriting durable blobs; recorded reopen time fell from 71 ms to
@@ -152,7 +170,14 @@ suite on macOS and Linux x86_64 runners, green on both since the union
 assignment fix (the first x86_64 execution exposed a compiler-ordering
 defect where a tagged union's tag was set before its payload allocation,
 leaving an undefined pointer under the errdefer; allocations now precede
-union assignment). The first emulated x86 container could not run this
+union assignment). A second instance of the same evaluation-ordering
+class surfaced on the native host: scanForProof's return literal mixed
+computed fields with a `try` expression, and a real fixture history
+produced a proof whose placement contradicted the values computed inside
+the callee (a one-block bucket certified as two). Every proof-path
+return now builds from locals — allocate first, assign after — with a
+depth-4/depth-11 regression test verifying both proof kinds. The first
+emulated x86 container could not run this
 Zig toolchain under Rosetta; emulated execution of cross-built test
 binaries later provided the local reproduction loop for that fix.
 
