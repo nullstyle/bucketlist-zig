@@ -114,6 +114,27 @@ to that external expectation. Without an external expectation, a valid older
 catalog can still pass local integrity checks. The manifest hash also binds
 opaque metadata, which the database digest alone does not authenticate.
 
+## Range scans
+
+`scan(table, start, end)` and `ReadView.scan` stream the visible live records
+of one table over the encoded key interval `[start, end)` in ascending key
+order — a k-way merge of the state's non-empty slot buckets with the same
+youngest-wins resolution as point reads and range proofs, so an iterator and a
+verified range proof over the same interval always agree. Each participating
+slot holds one verified streaming bucket cursor (bounded scratch from the
+database's allocator); slots contributing nothing to the interval are fully
+streamed to their authenticated EOF and released at open. Duplicate keys are
+resolved by slot order (younger wins; a tombstone decides absence and is not
+emitted), and the deciding cursor stays frozen until the caller is done
+borrowing its record slices — variable-size codec results are valid until the
+next `next`, `finish`, or `deinit` call. Rows are provisional until `finish`
+drains every cursor to its authenticated EOF, exactly like a raw bucket
+cursor; `deinit` without `finish` abandons tail verification. Scanning
+therefore always streams every non-empty bucket at least once — verification
+is whole-bucket by design — while holding memory only for participating
+slots. The caller's allocator owns the cursor array; invalid intervals
+(`start >= end`) are rejected up front.
+
 ## Host admission and durability
 
 The host owns one serialized advance stream and a bounded delivery backlog.

@@ -148,7 +148,11 @@ boundary brackets, youngest-wins entry resolution, and slot coverage —
 verified by a hand-built fixture across eleven mutation classes,
 directed boundary cases against point reads, and a 90-advance random
 workload checked against an independent model over dozens of random
-ranges. The standalone wasm verifier artifact (`zig build wasm-verify`,
+ranges. Streaming range scans (`scan`/`ReadView.scan`, a k-way merge of
+verified slot cursors) are checked against the same model, point reads,
+and the authenticated range-proof entries over identical intervals, and
+their construction failure points clean up completely with successful
+retries. The standalone wasm verifier artifact (`zig build wasm-verify`,
 `zig-out/bin/bucketlist-verifier.wasm`) is import-free wasm32-freestanding,
 consumes flat-framed proofs over a static scratch buffer, and is gated
 in CI on real generated evidence: true proofs accepted, tampered

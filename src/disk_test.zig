@@ -838,3 +838,174 @@ test "disk: proof generation survives struct-literal reordering across depths" {
     try Repro.run(4);
     try Repro.run(11);
 }
+
+test "disk: range scans match the model, point reads, and range proofs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try pathOf(&tmp, &buf);
+    const V2Disk = native.DatabaseWithDepth(Schema, 4);
+    const v2_format: store.BucketFormat = .{ .v2 = .{ .target_block_bytes = 96 } };
+    var db = try V2Disk.open(gpa, io, path, .{ .merge_workers = 1, .format = v2_format });
+    defer db.deinit();
+    var model = std.AutoHashMap(u64, u64).init(gpa);
+    defer model.deinit();
+    var prng = std.Random.DefaultPrng.init(0xb5c4_1111);
+    const random = prng.random();
+    var checked: usize = 0;
+    var seq: u64 = 0;
+    while (seq < 80) : (seq += 1) {
+        {
+            var batch = V2Disk.Batch.init(gpa);
+            defer batch.deinit();
+            for (0..7) |_| {
+                const key = random.uintAtMost(u64, 47);
+                if (random.uintLessThan(u32, 100) < 30) {
+                    try batch.delete(.accounts, key);
+                    _ = model.remove(key);
+                } else {
+                    const value = random.int(u64);
+                    try batch.put(.accounts, key, value);
+                    try model.put(key, value);
+                }
+                if (random.uintLessThan(u32, 100) < 15) {
+                    try batch.put(.flags, random.uintAtMost(u8, 3), random.boolean());
+                }
+            }
+            var prepared = try db.prepare(seq + 1, &batch, "scan-random");
+            defer prepared.deinit();
+            try prepared.commit();
+        }
+        if (seq % 9 != 4) continue;
+        const a = random.uintAtMost(u64, 44);
+        const b = a + 1 + random.uintAtMost(u64, 40);
+        var scan = try db.scan(.accounts, a, b, gpa);
+        defer scan.deinit();
+        var expected: usize = 0;
+        var cursor_key: u64 = a;
+        while (cursor_key < b) : (cursor_key += 1) {
+            const value = model.get(cursor_key) orelse continue;
+            const entry = try scan.next();
+            try std.testing.expect(entry != null);
+            try std.testing.expectEqual(cursor_key, entry.?.key);
+            try std.testing.expectEqual(value, entry.?.value);
+            try std.testing.expectEqual(value, (try db.get(.accounts, cursor_key)).?);
+            expected += 1;
+        }
+        try std.testing.expect(try scan.next() == null);
+        try scan.finish();
+        try std.testing.expect(try scan.next() == null);
+        // The authenticated range proof claims exactly the same records.
+        var bundle = try db.proveRange(.accounts, a, b, gpa);
+        defer bundle.deinit();
+        try lib.proofs.verifyRange(&bundle.proof, db.commitment().digest);
+        try std.testing.expectEqual(expected, bundle.proof.entries.len);
+        var index: usize = 0;
+        cursor_key = a;
+        while (cursor_key < b and index < bundle.proof.entries.len) : (cursor_key += 1) {
+            const value = model.get(cursor_key) orelse continue;
+            try std.testing.expectEqual(cursor_key, try lib.Codec(u64).decode(bundle.proof.entries[index].key));
+            try std.testing.expectEqual(value, try lib.Codec(u64).decode(bundle.proof.entries[index].value));
+            index += 1;
+        }
+        checked += 1;
+    }
+    try std.testing.expect(checked > 4);
+    // Degenerate intervals and a v1 profile are rejected up front.
+    try std.testing.expectError(error.InvalidRange, db.scan(.accounts, 7, 7, gpa));
+    try std.testing.expectError(error.InvalidRange, db.scan(.accounts, 9, 2, gpa));
+}
+
+test "disk: scans pin read views across advances and survive bounded failures" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try pathOf(&tmp, &buf);
+    const V2Disk = native.DatabaseWithDepth(Schema, 4);
+    const v2_format: store.BucketFormat = .{ .v2 = .{ .target_block_bytes = 96 } };
+    var db = try V2Disk.open(gpa, io, path, .{ .merge_workers = 1, .format = v2_format });
+    defer db.deinit();
+    {
+        var batch = V2Disk.Batch.init(gpa);
+        defer batch.deinit();
+        for (0..30) |key| try batch.put(.accounts, key, key * 5);
+        var prepared = try db.prepare(1, &batch, "scan-build");
+        defer prepared.deinit();
+        try prepared.commit();
+    }
+    // Spread data across levels so several slots participate in a scan.
+    for (2..6) |seq| {
+        var batch = V2Disk.Batch.init(gpa);
+        defer batch.deinit();
+        try batch.put(.accounts, seq * 40, seq);
+        try batch.delete(.accounts, seq - 1);
+        var prepared = try db.prepare(seq, &batch, "scan-spread");
+        defer prepared.deinit();
+        try prepared.commit();
+    }
+    var view = try db.readView();
+    {
+        var batch = V2Disk.Batch.init(gpa);
+        defer batch.deinit();
+        for (0..30) |key| try batch.delete(.accounts, key);
+        try batch.put(.accounts, 30, 300);
+        try batch.put(.accounts, 5, 55);
+        var prepared = try db.prepare(6, &batch, "scan-live");
+        defer prepared.deinit();
+        try prepared.commit();
+    }
+    // The pinned view sees keys 0 and 5..29 (at five-fold values; the
+    // spread advances deleted 1..4) plus the four spread keys.
+    {
+        var scan = try view.scan(.accounts, 0, 1000, gpa);
+        defer scan.deinit();
+        var count: u64 = 0;
+        while (try scan.next()) |entry| {
+            if (entry.key < 30) {
+                try std.testing.expect(entry.key == 0 or entry.key >= 5);
+                try std.testing.expectEqual(entry.key * 5, entry.value);
+            } else {
+                try std.testing.expectEqual(entry.key / 40, entry.value);
+            }
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(u64, 30), count);
+        try scan.finish();
+    }
+    // The live frontier sees the rewrite of key 5 and the spread keys that
+    // the delete-all batch never touched.
+    {
+        var scan = try db.scan(.accounts, 0, 1000, gpa);
+        defer scan.deinit();
+        var count: u64 = 0;
+        while (try scan.next()) |entry| {
+            switch (entry.key) {
+                5 => try std.testing.expectEqual(@as(u64, 55), entry.value),
+                30 => try std.testing.expectEqual(@as(u64, 300), entry.value),
+                80, 120, 160, 200 => {},
+                else => return error.TestUnexpectedResult,
+            }
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(u64, 6), count);
+        try scan.finish();
+    }
+    view.deinit();
+    // Every construction allocation failure cleans up completely and a
+    // retry on the same state succeeds.
+    var failures: usize = 0;
+    while (failures < 200) : (failures += 1) {
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = failures });
+        var scan = db.scan(.accounts, 0, 1000, failing.allocator()) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            failing.fail_index = std.math.maxInt(usize);
+            var retry = try db.scan(.accounts, 0, 1000, failing.allocator());
+            retry.deinit();
+            continue;
+        };
+        scan.deinit();
+        if (!failing.has_induced_failure) break;
+    }
+    try std.testing.expect(failures > 1 and failures < 200);
+}

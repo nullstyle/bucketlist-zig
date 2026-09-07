@@ -569,6 +569,11 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             pub fn prove(self: *ReadView, comptime name: Name, key: Def.table(name).Key, gpa: Allocator) !ProofBundle {
                 return self.owner.proveState(&self.state, name, key, gpa);
             }
+            /// Stream the visible records of one table over [start, end)
+            /// at this pinned view; invalid unless start < end.
+            pub fn scan(self: *ReadView, comptime name: Name, start: Def.table(name).Key, end: Def.table(name).Key, gpa: Allocator) !Scan(Def.table(name)) {
+                return self.owner.scanState(&self.state, name, start, end, gpa);
+            }
             pub fn deinit(self: *ReadView) void {
                 const owner = self.owner;
                 var link = &owner.views;
@@ -882,6 +887,178 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
         /// across every non-empty slot). Requires a v2 profile.
         pub fn proveRange(self: *Self, comptime name: Name, start: Def.table(name).Key, end: Def.table(name).Key, gpa: Allocator) !RangeBundle {
             return self.proveRangeState(&self.frontier, name, start, end, gpa);
+        }
+
+        /// Streaming visible-range iterator over one table: a k-way merge of
+        /// the state's non-empty slot buckets, youngest-wins, yielding the
+        /// live records with keys in [start, end) in ascending order — the
+        /// same resolution the range proof attests. Each participating slot
+        /// holds one verified streaming cursor (bounded scratch); slots that
+        /// contribute nothing to the interval are fully verified and closed
+        /// at open. Records are provisional until `finish` drains every
+        /// cursor to its authenticated EOF; `deinit` without `finish`
+        /// abandons tail verification like a raw bucket cursor. Borrowed
+        /// key/value slices (variable-size codecs) belong to the deciding
+        /// cursor and are valid until the next `next`, `finish`, or `deinit`.
+        pub fn Scan(comptime T: type) type {
+            return struct {
+                const Iter = @This();
+                pub const Entry = struct { key: T.Key, value: T.Value };
+                const SlotCursor = struct {
+                    cursor: storage.BucketCursor,
+                    current: ?Record,
+                    ordinal: usize,
+                };
+
+                gpa: Allocator,
+                cursors: []SlotCursor,
+                start: [lib.Codec(T.Key).max_size]u8,
+                start_len: usize,
+                end: [lib.Codec(T.Key).max_size]u8,
+                end_len: usize,
+                /// The cursor whose record the caller is still borrowing.
+                pending: ?usize = null,
+
+                /// Advance one cursor to its next in-range record (skipping
+                /// younger tables, earlier keys, and past-end records — all
+                /// still hash-verified by the stream).
+                fn position(self: *Iter, index: usize) !void {
+                    try positionSlot(&self.cursors[index], T.id, self.start[0..self.start_len], self.end[0..self.end_len]);
+                }
+
+                pub fn next(self: *Iter) !?Entry {
+                    if (self.pending) |index| {
+                        try self.position(index);
+                        self.pending = null;
+                    }
+                    while (true) {
+                        var best: ?usize = null;
+                        for (self.cursors, 0..) |*slot, i| {
+                            const record = slot.current orelse continue;
+                            const winner = &self.cursors[
+                                best orelse {
+                                    best = i;
+                                    continue;
+                                }
+                            ];
+                            const held = winner.current.?;
+                            const order = if (record.table != held.table)
+                                (if (record.table < held.table) std.math.Order.lt else std.math.Order.gt)
+                            else
+                                std.mem.order(u8, record.key, held.key);
+                            if (order == .lt or (order == .eq and slot.ordinal < winner.ordinal)) best = i;
+                        }
+                        const index = best orelse return null;
+                        const decided = self.cursors[index].current.?;
+                        // Youngest-wins: retire the duplicates, keep the
+                        // deciding cursor frozen until the caller is done
+                        // borrowing its slices.
+                        for (self.cursors, 0..) |*slot, i| {
+                            if (i == index) continue;
+                            const other = slot.current orelse continue;
+                            if (other.table == decided.table and std.mem.eql(u8, other.key, decided.key)) try self.position(i);
+                        }
+                        if (decided.value == null) {
+                            try self.position(index);
+                            continue;
+                        }
+                        const key = try lib.Codec(T.Key).decode(decided.key);
+                        const value = try lib.Codec(T.Value).decode(decided.value.?);
+                        self.pending = index;
+                        return .{ .key = key, .value = value };
+                    }
+                }
+
+                /// Drain every cursor to its authenticated EOF. Only after
+                /// this succeeds have the streamed records been verified.
+                pub fn finish(self: *Iter) !void {
+                    if (self.pending) |index| {
+                        try self.position(index);
+                        self.pending = null;
+                    }
+                    for (self.cursors) |*slot| {
+                        try slot.cursor.finish();
+                        slot.current = null;
+                    }
+                }
+
+                pub fn deinit(self: *Iter) void {
+                    for (self.cursors) |*slot| slot.cursor.deinit();
+                    self.gpa.free(self.cursors);
+                    self.* = undefined;
+                }
+            };
+        }
+
+        /// Position one slot cursor at its first record inside the interval.
+        fn positionSlot(slot: anytype, table: u32, start: []const u8, end: []const u8) !void {
+            while (true) {
+                const record = try slot.cursor.next() orelse {
+                    slot.current = null;
+                    return;
+                };
+                if (record.table != table) {
+                    if (record.table < table) continue;
+                    slot.current = null;
+                    return;
+                }
+                if (std.mem.order(u8, record.key, start) == .lt) continue;
+                if (std.mem.order(u8, record.key, end) != .lt) {
+                    slot.current = null;
+                    return;
+                }
+                slot.current = record;
+                return;
+            }
+        }
+
+        /// Stream the visible records of one table over [start, end) from
+        /// the current frontier. Invalid unless start < end.
+        pub fn scan(self: *Self, comptime name: Name, start: Def.table(name).Key, end: Def.table(name).Key, gpa: Allocator) !Scan(Def.table(name)) {
+            return self.scanState(&self.frontier, name, start, end, gpa);
+        }
+
+        fn scanState(self: *Self, state: *const Frontier, comptime name: Name, start_key: Def.table(name).Key, end_key: Def.table(name).Key, gpa: Allocator) !Scan(Def.table(name)) {
+            const T = Def.table(name);
+            const KeyCodec = lib.Codec(T.Key);
+            var result: Scan(T) = undefined;
+            const start = try KeyCodec.encode(start_key, &result.start);
+            const end = try KeyCodec.encode(end_key, &result.end);
+            if (std.mem.order(u8, start, end) != .lt) return error.InvalidRange;
+            result.start_len = start.len;
+            result.end_len = end.len;
+            var cursors: std.ArrayList(Scan(T).SlotCursor) = .empty;
+            errdefer {
+                for (cursors.items) |*slot| slot.cursor.deinit();
+                cursors.deinit(gpa);
+            }
+            for (state.levels, 0..) |level, level_index| {
+                for ([_]struct { hash: Hash, snapshot: bool }{
+                    .{ .hash = level.curr, .snapshot = false },
+                    .{ .hash = level.snap, .snapshot = true },
+                }) |slot| {
+                    if (std.mem.eql(u8, &slot.hash, &state.empty)) continue;
+                    var entry: Scan(T).SlotCursor = .{
+                        .cursor = try self.store.scanBucket(slot.hash, self.mergeLimits()),
+                        .current = null,
+                        .ordinal = 2 * level_index + @intFromBool(slot.snapshot),
+                    };
+                    errdefer entry.cursor.deinit();
+                    try positionSlot(&entry, T.id, start, end);
+                    if (entry.current == null) {
+                        // The slot holds nothing in range: verify it fully
+                        // now and release its scratch immediately.
+                        try entry.cursor.finish();
+                        entry.cursor.deinit();
+                        continue;
+                    }
+                    try cursors.append(gpa, entry);
+                }
+            }
+            result.cursors = try cursors.toOwnedSlice(gpa);
+            result.gpa = gpa;
+            result.pending = null;
+            return result;
         }
 
         fn proveRangeState(self: *Self, state: *const Frontier, comptime name: Name, start_key: Def.table(name).Key, end_key: Def.table(name).Key, gpa: Allocator) !RangeBundle {
