@@ -563,3 +563,75 @@ test "disk: pre_publish commits batch blob syncs per publication and reopens ide
     for (0..7) |key| try std.testing.expectEqual(expected[key], try db.get(.accounts, key));
     try std.testing.expectEqual(reference, db.reference());
 }
+
+test "disk: proofs pin retained references and read views across later advances" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try pathOf(&tmp, &buf);
+    const V2Disk = native.DatabaseWithDepth(Schema, 4);
+    const v2_format: store.BucketFormat = .{ .v2 = .{ .target_block_bytes = 96 } };
+    var db = try V2Disk.open(gpa, io, path, .{ .merge_workers = 1, .format = v2_format });
+    defer db.deinit();
+    {
+        var batch = V2Disk.Batch.init(gpa);
+        defer batch.deinit();
+        try batch.put(.accounts, 0, 7);
+        try batch.put(.accounts, 5, 9);
+        var prepared = try db.prepare(1, &batch, "historical");
+        defer prepared.deinit();
+        try prepared.commit();
+    }
+    const historical = db.reference();
+    var view = try db.readView();
+    // The pinned state and the live frontier diverge after the next advance.
+    {
+        var batch = V2Disk.Batch.init(gpa);
+        defer batch.deinit();
+        try batch.delete(.accounts, 0);
+        try batch.put(.accounts, 6, 11);
+        var prepared = try db.prepare(2, &batch, "live");
+        defer prepared.deinit();
+        try prepared.commit();
+    }
+    try std.testing.expectEqual(@as(?u64, null), try db.get(.accounts, 0));
+    try std.testing.expectEqual(@as(?u64, 7), try view.get(.accounts, 0));
+
+    // Live proof: the tombstone decides; the pinned states disagree.
+    {
+        var bundle = try db.prove(.accounts, 0, gpa);
+        defer bundle.deinit();
+        try lib.proofs.verifyVisible(&bundle.proof, db.commitment().digest);
+        try std.testing.expect(!bundle.proof.absent);
+        try std.testing.expect(bundle.proof.value == null);
+    }
+    // Pinned-view proof: value 7 against the view's own digest.
+    {
+        var bundle = try view.prove(.accounts, 0, gpa);
+        defer bundle.deinit();
+        const digest = view.commitment().digest;
+        try lib.proofs.verifyVisible(&bundle.proof, digest);
+        try std.testing.expect(!bundle.proof.absent);
+        try std.testing.expectEqual(@as(u64, 7), try lib.Codec(u64).decode(bundle.proof.value.?));
+        // A historical proof does not verify against the live digest.
+        var wrong = digest;
+        wrong[0] ^= 0xff;
+        try std.testing.expectError(error.InvalidProof, lib.proofs.verifyVisible(&bundle.proof, wrong));
+        try std.testing.expectError(error.InvalidProof, lib.proofs.verifyVisible(&bundle.proof, db.commitment().digest));
+    }
+    // Retained-reference proof survives collection that explicitly retains it
+    // (the first collect also drops a superseded pending output).
+    _ = try db.collect(&.{historical});
+    {
+        var bundle = try db.proveReference(historical, .accounts, 0, gpa);
+        defer bundle.deinit();
+        try lib.proofs.verifyVisible(&bundle.proof, historical.database_digest);
+        try std.testing.expect(!bundle.proof.absent);
+        try std.testing.expectEqual(@as(u64, 7), try lib.Codec(u64).decode(bundle.proof.value.?));
+        try std.testing.expectError(error.InvalidProof, lib.proofs.verifyVisible(&bundle.proof, db.commitment().digest));
+    }
+    view.deinit();
+    // Dropping the view releases its pin; the retained reference still holds
+    // its history and collection remains a no-op for it.
+    try std.testing.expectEqual(@as(usize, 0), try db.collect(&.{historical}));
+}

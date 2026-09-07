@@ -59,6 +59,7 @@ DiskDatabase.get: fn (*disk.DatabaseWithDepth(api.Schema,11), comptime meta.Fiel
 DiskDatabase.prepare: fn (*disk.DatabaseWithDepth(api.Schema,11), u64, *disk.DatabaseWithDepth(api.Schema,11).Batch, []const u8) @typeInfo(@typeInfo(@TypeOf(disk.DatabaseWithDepth(api.Schema,11).prepare)).@"fn".return_type.?).error_union.error_set!disk.DatabaseWithDepth(api.Schema,11).Prepared
 DiskDatabase.readView: fn (*disk.DatabaseWithDepth(api.Schema,11)) @typeInfo(@typeInfo(@TypeOf(disk.DatabaseWithDepth(api.Schema,11).readView)).@"fn".return_type.?).error_union.error_set!*disk.DatabaseWithDepth(api.Schema,11).ReadView
 DiskDatabase.prove: fn (*disk.DatabaseWithDepth(api.Schema,11), comptime meta.FieldEnum(api.Schema.tables__struct_ANON), anytype, mem.Allocator) @typeInfo(@typeInfo(@TypeOf(disk.DatabaseWithDepth(api.Schema,11).prove)).@"fn".return_type.?).error_union.error_set!disk.DatabaseWithDepth(api.Schema,11).ProofBundle
+DiskDatabase.proveReference: fn (*disk.DatabaseWithDepth(api.Schema,11), disk.Reference, comptime meta.FieldEnum(api.Schema.tables__struct_ANON), anytype, mem.Allocator) @typeInfo(@typeInfo(@TypeOf(disk.DatabaseWithDepth(api.Schema,11).proveReference)).@"fn".return_type.?).error_union.error_set!disk.DatabaseWithDepth(api.Schema,11).ProofBundle
 DiskDatabase.collect: fn (*disk.DatabaseWithDepth(api.Schema,11), []const disk.Reference) @typeInfo(@typeInfo(@TypeOf(disk.DatabaseWithDepth(api.Schema,11).collect)).@"fn".return_type.?).error_union.error_set!usize
 DiskBatch.init: fn (mem.Allocator) disk.DatabaseWithDepth(api.Schema,11).Batch
 DiskBatch.initBounded: fn (mem.Allocator, usize, usize) disk.DatabaseWithDepth(api.Schema,11).Batch
@@ -72,6 +73,7 @@ DiskPrepared.commit: fn (*disk.DatabaseWithDepth(api.Schema,11).Prepared) @typeI
 DiskReadView.commitment: fn (*const disk.DatabaseWithDepth(api.Schema,11).ReadView) database.Commitment
 DiskReadView.reference: fn (*const disk.DatabaseWithDepth(api.Schema,11).ReadView) disk.Reference
 DiskReadView.get: fn (*disk.DatabaseWithDepth(api.Schema,11).ReadView, comptime meta.FieldEnum(api.Schema.tables__struct_ANON), anytype) @typeInfo(@typeInfo(@TypeOf(disk.DatabaseWithDepth(api.Schema,11).ReadView.get)).@"fn".return_type.?).error_union.error_set!anytype
+DiskReadView.prove: fn (*disk.DatabaseWithDepth(api.Schema,11).ReadView, comptime meta.FieldEnum(api.Schema.tables__struct_ANON), anytype, mem.Allocator) @typeInfo(@typeInfo(@TypeOf(disk.DatabaseWithDepth(api.Schema,11).ReadView.prove)).@"fn".return_type.?).error_union.error_set!disk.DatabaseWithDepth(api.Schema,11).ProofBundle
 DiskReadView.deinit: fn (*disk.DatabaseWithDepth(api.Schema,11).ReadView) void
 DiskOptions.merge_workers: usize
 DiskOptions.max_batch_bytes: usize

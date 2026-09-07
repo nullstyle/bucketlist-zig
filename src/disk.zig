@@ -564,6 +564,11 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             pub fn get(self: *ReadView, comptime name: Name, key: Def.table(name).Key) !?Def.table(name).Value {
                 return self.owner.getFrom(&self.state, name, key);
             }
+            /// Prove one key's visible state at this pinned view, verifiable
+            /// against `self.commitment().digest`.
+            pub fn prove(self: *ReadView, comptime name: Name, key: Def.table(name).Key, gpa: Allocator) !ProofBundle {
+                return self.owner.proveState(&self.state, name, key, gpa);
+            }
             pub fn deinit(self: *ReadView) void {
                 const owner = self.owner;
                 var link = &owner.views;
@@ -681,6 +686,15 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
         /// Generate the youngest-wins visible-state proof for one key from
         /// the current frontier. Requires a v2 profile.
         pub fn prove(self: *Self, comptime name: Name, key: Def.table(name).Key, gpa: Allocator) !ProofBundle {
+            return self.proveState(&self.frontier, name, key, gpa);
+        }
+
+        /// Generation against any authenticated frontier state: the live
+        /// frontier, a pinned read view, or a loaded retained reference.
+        /// Soundness needs only the state's bucket bytes (every scanned
+        /// bucket is fully re-verified during generation) and the caller's
+        /// trusted digest for the returned proof.
+        fn proveState(self: *Self, state: *const Frontier, comptime name: Name, key: Def.table(name).Key, gpa: Allocator) !ProofBundle {
             const target = self.v2Target() orelse return error.ProfileMismatch;
             _ = target;
             const T = Def.table(name);
@@ -707,12 +721,12 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             var deciding_value: ?[]const u8 = null;
             _ = &deciding_value;
             var deciding_present = false;
-            generate: for (self.frontier.levels, 0..) |level, level_index| {
+            generate: for (state.levels, 0..) |level, level_index| {
                 for ([_]struct { hash: Hash, snapshot: bool }{
                     .{ .hash = level.curr, .snapshot = false },
                     .{ .hash = level.snap, .snapshot = true },
                 }) |slot| {
-                    if (std.mem.eql(u8, &slot.hash, &self.frontier.empty)) continue;
+                    if (std.mem.eql(u8, &slot.hash, &state.empty)) continue;
                     const scanned = try self.scanForProof(gpa, slot.hash, T.id, key_bytes);
                     defer gpa.free(scanned.leaves);
                     const path = try lib.proofs.blockPath(gpa, scanned.leaves, @intCast(scanned.block_index));
@@ -749,7 +763,7 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             }
             const levels = try gpa.alloc(lib.proofs.ChainLevel, depth);
             errdefer gpa.free(levels);
-            for (self.frontier.levels, 0..) |level, i| {
+            for (state.levels, 0..) |level, i| {
                 levels[i] = .{ .curr = level.curr, .snap = level.snap, .next = level.next };
             }
             return .{
@@ -761,8 +775,8 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
                     .younger = try placements.toOwnedSlice(gpa),
                     .deciding = final_placement,
                     .schema_hash = schema_hash,
-                    .profile_hash = self.frontier.profile_hash,
-                    .advance = self.frontier.seq,
+                    .profile_hash = state.profile_hash,
+                    .advance = state.seq,
                     .levels = levels,
                 },
                 .levels = levels,
@@ -770,6 +784,18 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
                 .steps = try steps.toOwnedSlice(gpa),
                 .gpa = gpa,
             };
+        }
+
+        /// Prove one key's visible state at a RETAINED checkpoint reference.
+        /// The reference's manifest is loaded and digest-checked; generation
+        /// then re-verifies every bucket it touches, so the proof is sound
+        /// against `reference.database_digest`. The caller must keep the
+        /// reference retained against collection.
+        pub fn proveReference(self: *Self, ref: Reference, comptime name: Name, key: Def.table(name).Key, gpa: Allocator) !ProofBundle {
+            if (self.poisoned) return error.Poisoned;
+            var loaded = try self.load(ref);
+            defer loaded.deinit(self.gpa);
+            return self.proveState(&loaded.frontier, name, key, gpa);
         }
 
         /// Requires quiescent readers. Retains current, pinned views, and each
