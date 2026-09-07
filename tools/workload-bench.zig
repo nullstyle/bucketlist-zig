@@ -1,10 +1,13 @@
 //! Production workload qualification harness (three pre-registered shapes).
 //!
-//! workload-bench ledger  <empty-root> [advances=50000] [keys=1000000] [seed=1]
+//! workload-bench ledger  <empty-root> [advances=50000] [keys=1000000] [seed=1] [compress] [pre_publish]
 //!   Sustained consensus-node writing: batches of 50-200 changes, 85% puts /
 //!   15% deletes over a bounded key space; 93% of values 32-64 B, 6% 256 B-
 //!   1 KiB, 1% blobs 1-64 KiB. Reports commit latency distribution and
 //!   write amplification (positional write bytes per logical advance byte).
+//!   The optional trailing policy strings select compression ("compress")
+//!   and the pre_publish durability barrier ("pre_publish"); any other
+//!   value (or omission) keeps the default off.
 //!
 //! workload-bench zipf <empty-root> [keys=500000] [ops=200000] [skew=1.0] [seed=1]
 //!   Read serving: builds the key space, then a 95/5 read/write mix over a
@@ -35,6 +38,7 @@ const Db = native.Database(Schema);
 
 var active_io: *IoCounter = undefined;
 var compress_flag: bool = false;
+var relaxed_durability: bool = false;
 const IoCounter = struct {
     original: std.Io,
     vtable: std.Io.VTable,
@@ -158,7 +162,12 @@ fn advanceOnce(db: *Db, gpa: Allocator, random: std.Random, keys: u64, batch_max
 fn runLedger(gpa: Allocator, writer: *std.Io.Writer, path: []const u8, advances: usize, keys: u64, seed: u64) !void {
     const clock = std.Io.Clock.awake;
     const io = active_io.original;
-    var db = try Db.open(gpa, active_io.io(), path, .{ .merge_workers = 2, .max_metadata_bytes = 16, .compression = compress_flag });
+    var db = try Db.open(gpa, active_io.io(), path, .{
+        .merge_workers = 2,
+        .max_metadata_bytes = 16,
+        .compression = compress_flag,
+        .durability = if (relaxed_durability) .pre_publish else .per_blob,
+    });
     defer db.deinit();
     var prng = std.Random.DefaultPrng.init(seed);
     const random = prng.random();
@@ -200,6 +209,7 @@ fn runLedger(gpa: Allocator, writer: *std.Io.Writer, path: []const u8, advances:
         .blob_total_bytes = blobs.bytes,
         .largest_blob_bytes = blobs.largest,
         .compressed = compress_flag,
+        .durability = if (relaxed_durability) "pre_publish" else "per_blob",
     });
 }
 
@@ -425,8 +435,10 @@ pub fn main(init: std.process.Init) !void {
         const advances = try argument(&args, 50_000);
         const keys = try argument(&args, 1_000_000);
         const seed = try argument(&args, 1);
-        // WORKLOAD_COMPRESS=1 style fourth argument toggles compression.
-        compress_flag = args.next() != null;
+        // Fourth and fifth arguments are policy strings: "compress" (vs any
+        // other value) and "pre_publish" (vs any other value).
+        if (args.next()) |flag| compress_flag = std.mem.eql(u8, flag, "compress");
+        if (args.next()) |flag| relaxed_durability = std.mem.eql(u8, flag, "pre_publish");
         try runLedger(gpa, writer, path, advances, @intCast(keys), @intCast(seed));
     } else if (std.mem.eql(u8, mode, "zipf")) {
         const keys = try argument(&args, 500_000);

@@ -227,9 +227,13 @@ an allocator that supports freeing on the receiving thread.
 Review also rejected a missing catalog with non-genesis blobs instead of
 silently creating an empty database; an interrupted genesis remains retryable.
 
-Process SIGKILL is tested. Native publication fault injection checks all seven
-implemented write/sync/replace boundaries, reopens the store, and verifies the
-expected old or new frontier and both referenced blobs. Neither emulates physical power loss or
+Process SIGKILL is tested. Native publication fault injection checks all eight
+implemented barrier/write/sync/replace boundaries under both durability modes
+(per_blob and pre_publish), reopens the store, and verifies the
+expected old or new frontier and both referenced blobs. Barrier tests pin the
+pre_publish sync economics (unsynced relaxed writes, one sync per distinct
+pending blob per publication, failed barriers retry the remainder, collected
+blobs skipped). Neither emulates physical power loss or
 proves a filesystem's flush guarantees. The store excludes hostile concurrent
 replacement of its directory entries; see [storage.md](storage.md).
 

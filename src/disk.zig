@@ -40,6 +40,12 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             /// Transparent deflate framing for written blobs; names keep
             /// hashing the uncompressed bytes (local policy only).
             compression: bool = false,
+            /// Blob durability policy (storage.Durability). The default
+            /// `.per_blob` syncs every blob individually before its write
+            /// returns; `.pre_publish` defers blob syncs to one batched
+            /// barrier at each commit's catalog publication. Local policy,
+            /// never committed bytes.
+            durability: storage.Durability = .per_blob,
             /// Local read index for point reads: after one fully verified
             /// bucket pass, warm lookups read only the sampled span instead
             /// of rehashing the whole blob. `null` keeps per-read whole-bucket
@@ -72,6 +78,7 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             errdefer self.store.deinit();
             if (options.read_index) |read_index| try self.store.enableReadIndex(read_index);
             if (options.compression) self.store.enableCompression();
+            self.store.setDurability(options.durability);
             if (self.v2Target()) |target| self.frontier = Frontier.initProfile(lib.proofs.profileHash(@intCast(depth), target), lib.proofs.emptyBucketHash());
             const catalog = try self.store.readManifest(gpa, catalog_domain.len + 64);
             defer if (catalog) |bytes| gpa.free(bytes);

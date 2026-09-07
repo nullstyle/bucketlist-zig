@@ -73,6 +73,35 @@ pub const ReadIndexOptions = struct {
     max_buckets: usize = 512,
 };
 
+/// Local durability policy: not part of any hash or committed byte.
+pub const Durability = enum {
+    /// Every blob write is individually durable before its call returns:
+    /// file sync, directory sync, then a post-rename file sync. Publication
+    /// adds only its own manifest barriers. This is the default.
+    per_blob,
+    /// Blob writes skip per-file syncs; `publish` first performs one batched
+    /// barrier — a file sync for every blob written since the last
+    /// successful publication, then the blobs-directory sync — strictly
+    /// before the atomic manifest replace. A published manifest therefore
+    /// never references non-durable bytes, and a crash before publication
+    /// leaves the previous frontier recoverable. Such a crash (or closing
+    /// without publishing) may leave unsynced debris at canonical blob
+    /// names; the debris is unreachable, and `collect` removes it.
+    pre_publish,
+};
+
+/// Canonical blob file name: 64 lowercase hex characters.
+const Name = [64]u8;
+
+const PendingContext = struct {
+    pub fn hash(_: PendingContext, name: Name) u64 {
+        return std.hash.Wyhash.hash(0, &name);
+    }
+    pub fn eql(_: PendingContext, a: Name, b: Name) bool {
+        return std.mem.eql(u8, &a, &b);
+    }
+};
+
 /// One sampled span start: records at `offset` begin with key `key`.
 const Sample = struct {
     table: u32,
@@ -378,6 +407,7 @@ const header_len = magic.len + 8 + 32;
 const manifest_name = "manifest";
 const PublishFault = enum {
     none,
+    before_barrier,
     after_header_write,
     after_payload_write,
     after_file_sync,
@@ -395,6 +425,11 @@ pub const Store = struct {
     lock: std.Io.File,
     read_index: ?*ReadIndexCache = null,
     compress_writes: bool = false,
+    durability: Durability = .per_blob,
+    /// Blobs written under `.pre_publish` and not yet synced by a publication
+    /// barrier. Guarded by `pending_mutex`; puts may run concurrently.
+    pending: std.HashMapUnmanaged(Name, void, PendingContext, std.hash_map.default_max_load_percentage) = .empty,
+    pending_mutex: std.Io.Mutex = .init,
 
     /// Owns open directory and exclusive advisory lock handles. The allocator
     /// and Io must remain valid until deinit and support every calling thread.
@@ -441,6 +476,9 @@ pub const Store = struct {
     pub fn deinit(self: *Store) void {
         if (self.read_index) |cache| cache.destroy();
         self.read_index = null;
+        // Blobs pending under .pre_publish are deliberately NOT synced here:
+        // unpublished content is expendable by that mode's contract.
+        self.pending.deinit(self.gpa);
         self.blobs.close(self.io);
         self.lock.close(self.io);
         self.root.close(self.io);
@@ -468,9 +506,65 @@ pub const Store = struct {
         return compressBytes(self.gpa, bytes);
     }
 
+    /// Set the durability policy for future writes and publications. Call
+    /// once after open, before concurrent use. Switching back to `.per_blob`
+    /// keeps blobs written during a `.pre_publish` window pending: the next
+    /// `publish` still syncs them before replacing the manifest.
+    pub fn setDurability(self: *Store, mode: Durability) void {
+        self.durability = mode;
+    }
+
+    /// Record a blob written but not yet synced (`.pre_publish`). The
+    /// allocation failure is caller-visible so no unwitnessed blob can slip
+    /// past a later barrier.
+    fn notePending(self: *Store, name: *const Name) Error!void {
+        self.pending_mutex.lockUncancelable(self.io);
+        defer self.pending_mutex.unlock(self.io);
+        self.pending.put(self.gpa, name.*, {}) catch return error.OutOfMemory;
+    }
+
+    /// The `.pre_publish` barrier: sync every blob written since the last
+    /// successful publication. A name leaves the set only after its file
+    /// sync succeeds, so a failed barrier (or any later publication)
+    /// naturally retries the remainder; already-synced files may sync again,
+    /// which is redundant but sound. Names deleted by `collect` are skipped:
+    /// nothing can reference them.
+    fn syncPendingBlobs(self: *Store) Error!void {
+        while (true) {
+            self.pending_mutex.lockUncancelable(self.io);
+            var iter = self.pending.keyIterator();
+            const name: Name = if (iter.next()) |key| key.* else {
+                self.pending_mutex.unlock(self.io);
+                return;
+            };
+            self.pending_mutex.unlock(self.io);
+            const file = openRegular(self.blobs, self.io, &name) catch |err| switch (err) {
+                error.NotFound => {
+                    self.removePending(&name);
+                    continue;
+                },
+                else => return err,
+            };
+            fullSync(self.io, file) catch |err| {
+                file.close(self.io);
+                return err;
+            };
+            file.close(self.io);
+            self.removePending(&name);
+        }
+    }
+
+    fn removePending(self: *Store, name: *const Name) void {
+        self.pending_mutex.lockUncancelable(self.io);
+        defer self.pending_mutex.unlock(self.io);
+        _ = self.pending.remove(name.*);
+    }
+
     /// SHA256(bytes) names immutable contents. Existing contents must verify;
     /// an existing corrupt file is an error, never silently overwritten.
-    /// A successful return means the file and its directory entry are synced.
+    /// Under the default `.per_blob` durability a successful return means
+    /// the file and its directory entry are synced; under `.pre_publish` the
+    /// write is only recorded for the next publication barrier.
     pub fn putBlob(self: *Store, bytes: []const u8) Error!Hash {
         const hash = digest(bytes);
         const name = std.fmt.bytesToHex(hash, .lower);
@@ -491,32 +585,36 @@ pub const Store = struct {
             if (!std.mem.eql(u8, plain, bytes)) return error.CorruptBlob;
             const kept = try openRegular(self.blobs, self.io, &name);
             defer kept.close(self.io);
-            try fullSync(self.io, kept);
+            if (self.durability == .per_blob) try fullSync(self.io, kept);
         } else if (existing) |file| {
             defer file.close(self.io);
-            try fullSync(self.io, file);
+            if (self.durability == .per_blob) try fullSync(self.io, file);
         } else {
             var atomic = self.blobs.createFileAtomic(self.io, &name, .{}) catch return error.IoFailed;
             defer atomic.deinit(self.io);
             try writeBytes(self.io, atomic.file, stored);
-            try fullSync(self.io, atomic.file);
+            if (self.durability == .per_blob) try fullSync(self.io, atomic.file);
             atomic.link(self.io) catch |err| switch (err) {
                 error.PathAlreadyExists => {
                     // A file can appear after the initial absence check. Keep
                     // no-replace publication and verify the winning file too.
                     const file = try openVerified(self.blobs, self.io, &name, hash, bytes.len);
                     defer file.close(self.io);
-                    try fullSync(self.io, file);
+                    if (self.durability == .per_blob) try fullSync(self.io, file);
                 },
                 else => return error.IoFailed,
             };
         }
-        try syncDir(self.io, self.blobs);
-        // A final full sync after the directory barrier flushes the renamed
-        // entry's metadata through the drive cache on macOS too.
-        const installed = try openRegular(self.blobs, self.io, &name);
-        defer installed.close(self.io);
-        try fullSync(self.io, installed);
+        if (self.durability == .per_blob) {
+            try syncDir(self.io, self.blobs);
+            // A final full sync after the directory barrier flushes the renamed
+            // entry's metadata through the drive cache on macOS too.
+            const installed = try openRegular(self.blobs, self.io, &name);
+            defer installed.close(self.io);
+            try fullSync(self.io, installed);
+        } else {
+            try self.notePending(&name);
+        }
         return hash;
     }
 
@@ -537,7 +635,7 @@ pub const Store = struct {
             if (!std.mem.eql(u8, plain, bytes)) return error.CorruptBlob;
             const file = try openRegular(self.blobs, self.io, &name);
             defer file.close(self.io);
-            try fullSync(self.io, file);
+            if (self.durability == .per_blob) try fullSync(self.io, file);
             return hash;
         }
         const stored: []const u8 = if (self.compress_writes) try compressBytes(self.gpa, bytes) else bytes;
@@ -545,7 +643,7 @@ pub const Store = struct {
         var atomic = self.blobs.createFileAtomic(self.io, &name, .{}) catch return error.IoFailed;
         defer atomic.deinit(self.io);
         try writeBytes(self.io, atomic.file, stored);
-        try fullSync(self.io, atomic.file);
+        if (self.durability == .per_blob) try fullSync(self.io, atomic.file);
         atomic.link(self.io) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 const plain = try self.readBlobPlain(self.gpa, &name, bytes.len);
@@ -554,10 +652,14 @@ pub const Store = struct {
             },
             else => return error.IoFailed,
         };
-        try syncDir(self.io, self.blobs);
-        const installed = try openRegular(self.blobs, self.io, &name);
-        defer installed.close(self.io);
-        try fullSync(self.io, installed);
+        if (self.durability == .per_blob) {
+            try syncDir(self.io, self.blobs);
+            const installed = try openRegular(self.blobs, self.io, &name);
+            defer installed.close(self.io);
+            try fullSync(self.io, installed);
+        } else {
+            try self.notePending(&name);
+        }
         return hash;
     }
 
@@ -847,15 +949,19 @@ pub const Store = struct {
             atomic.file.writePositionalAll(self.io, &length, compress_magic.len) catch return error.IoFailed;
         }
         name = std.fmt.bytesToHex(hash, .lower);
-        try fullSync(self.io, atomic.file);
+        if (self.durability == .per_blob) try fullSync(self.io, atomic.file);
         atomic.link(self.io) catch |err| switch (err) {
             error.PathAlreadyExists => try self.verifyInstalled(&name, hash, first.size, limits),
             else => return error.IoFailed,
         };
-        try syncDir(self.io, self.blobs);
-        const installed = try openRegular(self.blobs, self.io, &name);
-        defer installed.close(self.io);
-        try fullSync(self.io, installed);
+        if (self.durability == .per_blob) {
+            try syncDir(self.io, self.blobs);
+            const installed = try openRegular(self.blobs, self.io, &name);
+            defer installed.close(self.io);
+            try fullSync(self.io, installed);
+        } else {
+            try self.notePending(&name);
+        }
         return hash;
     }
 
@@ -907,16 +1013,25 @@ pub const Store = struct {
         if (!std.mem.eql(u8, &actual, &hash)) return error.CorruptBlob;
     }
 
-    /// Publish an opaque application manifest after putBlob has durably
-    /// installed EVERY referenced blob. This layer cannot inspect references.
-    /// After a post-rename error the new manifest may already be visible.
-    /// An owner may publish alongside independent blob jobs, but must await
-    /// every referenced output and serialize its own publication decisions.
+    /// Publish an opaque application manifest after putBlob has installed
+    /// EVERY referenced blob. This layer cannot inspect references. Under
+    /// `.per_blob` those blobs are already durable; under `.pre_publish`
+    /// publication first syncs every pending blob in one batched barrier
+    /// before the atomic manifest replace. After a post-rename error the new
+    /// manifest may already be visible. An owner may publish alongside
+    /// independent blob jobs, but must await every referenced output and
+    /// serialize its own publication decisions.
     pub fn publish(self: *Store, manifest_bytes: []const u8) Error!void {
         return self.publishImpl(manifest_bytes, .none);
     }
 
     fn publishImpl(self: *Store, bytes: []const u8, fault: PublishFault) Error!void {
+        if (fault == .before_barrier) return error.IoFailed;
+        // The pre_publish barrier: blob data becomes durable before the
+        // directory sync below persists the names, and both precede the
+        // atomic manifest replace. No published manifest can reference a
+        // blob whose bytes are not durable.
+        try self.syncPendingBlobs();
         try syncDir(self.io, self.blobs);
         var header: [header_len]u8 = undefined;
         @memcpy(header[0..magic.len], magic);
@@ -1734,6 +1849,7 @@ test "atomic manifest failure before replace preserves old frontier and reopen r
 
 test "manifest publication fault matrix recovers the frontier at every boundary" {
     const points = [_]PublishFault{
+        .before_barrier,
         .after_header_write,
         .after_payload_write,
         .after_file_sync,
@@ -1746,39 +1862,174 @@ test "manifest publication fault matrix recovers the frontier at every boundary"
     const new_bytes = "new referenced bucket";
     const old_hash = digest(old_bytes);
     const new_hash = digest(new_bytes);
-    for (points) |point| {
-        var tmp = testing.tmpDir(.{});
-        defer tmp.cleanup();
-        {
-            var store = try testStore(&tmp);
-            defer store.deinit();
-            try testing.expectEqual(old_hash, try store.putBlob(old_bytes));
-            try store.publish(&old_hash);
-            try testing.expectEqual(new_hash, try store.putBlob(new_bytes));
-            try testing.expectError(error.IoFailed, store.publishImpl(&new_hash, point));
+    for ([_]Durability{ .per_blob, .pre_publish }) |mode| {
+        for (points) |point| {
+            var tmp = testing.tmpDir(.{});
+            defer tmp.cleanup();
+            {
+                var store = try testStore(&tmp);
+                defer store.deinit();
+                store.setDurability(mode);
+                try testing.expectEqual(old_hash, try store.putBlob(old_bytes));
+                try store.publish(&old_hash);
+                try testing.expectEqual(new_hash, try store.putBlob(new_bytes));
+                try testing.expectError(error.IoFailed, store.publishImpl(&new_hash, point));
+            }
+            var restored = try testStore(&tmp);
+            defer restored.deinit();
+            const frontier = (try restored.readManifest(testing.allocator, 32)).?;
+            defer testing.allocator.free(frontier);
+            const replaced = switch (point) {
+                .after_replace, .after_directory_sync, .after_final_file_sync => true,
+                else => false,
+            };
+            try testing.expectEqualSlices(u8, if (replaced) &new_hash else &old_hash, frontier);
+            const referenced_hash = frontier[0..32].*;
+            const referenced = try restored.getBlob(testing.allocator, referenced_hash, 100);
+            defer testing.allocator.free(referenced);
+            try testing.expectEqualStrings(if (replaced) new_bytes else old_bytes, referenced);
+            // Both complete blobs survive every boundary, including the new blob
+            // that is still unreferenced when publication failed before replace.
+            const old = try restored.getBlob(testing.allocator, old_hash, 100);
+            defer testing.allocator.free(old);
+            const new = try restored.getBlob(testing.allocator, new_hash, 100);
+            defer testing.allocator.free(new);
+            try testing.expectEqualStrings(old_bytes, old);
+            try testing.expectEqualStrings(new_bytes, new);
         }
-        var restored = try testStore(&tmp);
-        defer restored.deinit();
-        const frontier = (try restored.readManifest(testing.allocator, 32)).?;
-        defer testing.allocator.free(frontier);
-        const replaced = switch (point) {
-            .after_replace, .after_directory_sync, .after_final_file_sync => true,
-            else => false,
-        };
-        try testing.expectEqualSlices(u8, if (replaced) &new_hash else &old_hash, frontier);
-        const referenced_hash = frontier[0..32].*;
-        const referenced = try restored.getBlob(testing.allocator, referenced_hash, 100);
-        defer testing.allocator.free(referenced);
-        try testing.expectEqualStrings(if (replaced) new_bytes else old_bytes, referenced);
-        // Both complete blobs survive every boundary, including the new blob
-        // that is still unreferenced when publication failed before replace.
-        const old = try restored.getBlob(testing.allocator, old_hash, 100);
-        defer testing.allocator.free(old);
-        const new = try restored.getBlob(testing.allocator, new_hash, 100);
-        defer testing.allocator.free(new);
-        try testing.expectEqualStrings(old_bytes, old);
-        try testing.expectEqualStrings(new_bytes, new);
     }
+}
+
+test "pre_publish batches blob syncs into one publication barrier" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    store.setDurability(.pre_publish);
+    const Guard = struct {
+        var syncs: usize = 0;
+        fn sync(ctx: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            syncs += 1;
+            return testing.io.vtable.fileSync(ctx, file);
+        }
+    };
+    var vtable = testing.io.vtable.*;
+    vtable.fileSync = Guard.sync;
+    store.io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    defer store.io = testing.io;
+
+    // Relaxed writes perform no syncs: blob puts, bucket merges, and v2
+    // installs only record their names for the next barrier.
+    const old = try store.putBlob(fixture_old);
+    const new = try store.putBlob(fixture_new);
+    const merged = try store.mergeBuckets(old, new, false, .{ .max_key_bytes = 1, .max_value_bytes = 5 });
+    const v2 = try store.putBucketV2(fixture_old, .{
+        .max_key_bytes = 1,
+        .max_value_bytes = 5,
+        .format = .{ .v2 = .{ .target_block_bytes = 128 } },
+    });
+    try testing.expect(!std.mem.eql(u8, &old, &v2)); // a distinct pending name
+    try testing.expectEqual(@as(usize, 0), Guard.syncs);
+
+    // One publication syncs each distinct pending blob exactly once, then
+    // applies the manifest barriers: blobs dir, manifest file, root dir,
+    // and the installed manifest.
+    try store.publish(&merged);
+    try testing.expectEqual(@as(usize, 4 + 4), Guard.syncs);
+    Guard.syncs = 0;
+    try store.publish(&merged);
+    try testing.expectEqual(@as(usize, 4), Guard.syncs);
+
+    // Re-putting an existing blob in relaxed mode re-arms exactly one name.
+    Guard.syncs = 0;
+    try testing.expectEqual(old, try store.putBlob(fixture_old));
+    try testing.expectEqual(@as(usize, 0), Guard.syncs);
+    try store.publish(&merged);
+    try testing.expectEqual(@as(usize, 5), Guard.syncs);
+
+    // Switching back to .per_blob makes writes individually durable again
+    // (file, blobs dir, installed file), and publication drains any blob
+    // still pending from the relaxed window.
+    store.setDurability(.per_blob);
+    Guard.syncs = 0;
+    const late = try store.putBlob("late durable blob");
+    try testing.expectEqual(@as(usize, 3), Guard.syncs);
+    Guard.syncs = 0;
+    try store.publish(&late);
+    try testing.expectEqual(@as(usize, 4), Guard.syncs);
+}
+
+test "pre_publish barrier failure keeps unsynced blobs pending for the next publication" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    store.setDurability(.pre_publish);
+    const first = try store.putBlob("first pending blob");
+    const second = try store.putBlob("second pending blob");
+    const Guard = struct {
+        var syncs: usize = 0;
+        var fail_sync: ?usize = null;
+        fn sync(ctx: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            const index = syncs;
+            syncs += 1;
+            if (fail_sync == index) return error.InputOutput;
+            return testing.io.vtable.fileSync(ctx, file);
+        }
+    };
+    var vtable = testing.io.vtable.*;
+    vtable.fileSync = Guard.sync;
+    store.io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    defer store.io = testing.io;
+
+    // A failure before any blob sync aborts the publication with both blobs
+    // still pending; a clean retry syncs both.
+    Guard.fail_sync = 0;
+    try testing.expectError(error.IoFailed, store.publish(&first));
+    Guard.fail_sync = null;
+    Guard.syncs = 0;
+    try store.publish(&first);
+    try testing.expectEqual(@as(usize, 2 + 4), Guard.syncs);
+
+    // A failure partway through the barrier keeps only the unsynced
+    // remainder pending: three names re-arm (existing files included), one
+    // drops out before the failure, two retry (barrier order is arbitrary).
+    _ = try store.putBlob("first pending blob");
+    _ = try store.putBlob("second pending blob");
+    _ = try store.putBlob("third pending blob");
+    Guard.syncs = 0;
+    Guard.fail_sync = 1;
+    try testing.expectError(error.IoFailed, store.publish(&second));
+    Guard.fail_sync = null;
+    Guard.syncs = 0;
+    try store.publish(&second);
+    try testing.expectEqual(@as(usize, 2 + 4), Guard.syncs);
+}
+
+test "pre_publish barrier skips blobs deleted by collection" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    store.setDurability(.pre_publish);
+    const keep = try store.putBlob("kept pending blob");
+    _ = try store.putBlob("collected pending blob");
+    // Collect before the counting guard: its own deletion barriers are not
+    // part of the assertion.
+    try testing.expectEqual(@as(usize, 1), try store.collect(&.{keep}));
+    const Guard = struct {
+        var syncs: usize = 0;
+        fn sync(ctx: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            syncs += 1;
+            return testing.io.vtable.fileSync(ctx, file);
+        }
+    };
+    var vtable = testing.io.vtable.*;
+    vtable.fileSync = Guard.sync;
+    store.io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    defer store.io = testing.io;
+    try store.publish(&keep);
+    try testing.expectEqual(@as(usize, 1 + 4), Guard.syncs);
 }
 
 test "manifest corruption and truncation fail closed" {

@@ -516,3 +516,50 @@ test "disk: every prepare allocation failure allows retry on the same owner and 
     defer reopened.deinit();
     try std.testing.expectEqual(before, reopened.reference());
 }
+
+test "disk: pre_publish commits batch blob syncs per publication and reopens identically" {
+    const Guard = struct {
+        var syncs: usize = 0;
+        fn sync(ctx: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            syncs += 1;
+            return io.vtable.fileSync(ctx, file);
+        }
+    };
+    var counted = io;
+    {
+        var vtable = io.vtable.*;
+        vtable.fileSync = Guard.sync;
+        counted = .{ .userdata = io.userdata, .vtable = &vtable };
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try pathOf(&tmp, &buf);
+    var expected: [7]?u64 = undefined;
+    const reference = blk: {
+        var db = try Disk.open(gpa, counted, path, .{ .merge_workers = 1, .durability = .pre_publish });
+        defer db.deinit();
+        Guard.syncs = 0;
+        for (1..35) |seq| try advance(db, seq);
+        const relaxed_syncs = Guard.syncs;
+        for (0..7) |key| expected[key] = try db.get(.accounts, key);
+        const ref = db.reference();
+        // The same operations under the default policy: every blob costs
+        // three sync calls (file, blobs dir, installed file), while the
+        // publication barrier syncs each distinct blob once.
+        var plain_tmp = std.testing.tmpDir(.{});
+        defer plain_tmp.cleanup();
+        var plain_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var steady = try Disk.open(gpa, counted, try pathOf(&plain_tmp, &plain_buf), .{ .merge_workers = 1 });
+        defer steady.deinit();
+        Guard.syncs = 0;
+        for (1..35) |seq| try advance(steady, seq);
+        try std.testing.expect(relaxed_syncs * 2 < Guard.syncs);
+        break :blk ref;
+    };
+    // A reopen under the default policy validates every barrier-synced blob.
+    var db = try Disk.open(gpa, io, path, .{ .expected = reference, .merge_workers = 1 });
+    defer db.deinit();
+    for (0..7) |key| try std.testing.expectEqual(expected[key], try db.get(.accounts, key));
+    try std.testing.expectEqual(reference, db.reference());
+}

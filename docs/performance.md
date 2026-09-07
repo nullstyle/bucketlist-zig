@@ -302,8 +302,11 @@ the recorded workloads above:
 - **ledger** — consensus-node writing: 50-200 change batches, 85/15
   put/delete over a bounded key space, 93% values 32-64 B, 6% 256 B-1 KiB,
   1% blobs 1-64 KiB. Metrics: commit latency distribution, advances/sec,
-  write amplification (positional write bytes per logical payload byte),
-  blob growth.
+  sync operations, write amplification (positional write bytes per logical
+  payload byte), blob growth. Optional trailing policy strings select
+  compression (`compress`) and the pre_publish durability barrier
+  (`pre_publish`); raw JSONL for the recorded durability runs lives in
+  `docs/benchmarks/workload-durability-2000.jsonl`.
 - **zipf** — read serving: builds the key space, then a 95/5 read/write
   mix over a Zipf-Mandelbrot distribution (skew sweeps via the `skew_x10`
   parameter). Metrics: read and write latency distributions, sustained
@@ -319,7 +322,29 @@ blobs instead of 907 MB with the compression option enabled; p50 69 ms); zipf (s
 50k keys) reads at p50 361 us / p99 1.4 ms with writes p99 80 ms;
 catchup over ~1 GB of blobs reopens in 102 ms — **9.14 GiB/s validated**,
 so reopen cost scales linearly at roughly a tenth of a second per GiB and
-restart floors stay sub-second into multi-GiB stores. These are
-first-contact numbers at toy scale, recorded to anchor the parameter
+restart floors stay sub-second into multi-GiB stores.
+
+Durability dial re-measurement (same ledger shape, all four policy
+combinations back-to-back in one session — during a background guided-fuzz
+soak, so absolute latencies carry CPU contention, but every comparison is
+same-conditions; the per_blob numbers reproduce the originals above):
+
+| durability | compression | commit p50 | commit p99 | sync ops/commit | WA | blobs |
+| --- | --- | --- | --- | --- | --- | --- |
+| per_blob | off | 53.7 ms | 86.6 ms | 15.0 | 11.85x | 908 MB |
+| pre_publish | off | 39.2 ms | 62.0 ms | 7.2 | 11.85x | 908 MB |
+| per_blob | on | 69.2 ms | 122.3 ms | 15.0 | 0.50x | 38 MB |
+| pre_publish | on | 54.0 ms | 99.7 ms | 7.2 | 0.50x | 38 MB |
+
+The `pre_publish` barrier halves sync operations exactly (each distinct
+blob syncs once per publication instead of three sync calls per write)
+and with it compression's latency tax almost disappears: compressed
+`pre_publish` (54.0 ms) commits as fast as uncompressed `per_blob`
+(53.7 ms) at 1/24th the storage, and uncompressed `pre_publish` is the
+fastest combination (39.2 ms, +37% advances/sec). Write amplification
+and blob bytes are identical across durability modes — the dial is a
+local policy and never touches committed bytes.
+
+These are first-contact numbers at toy scale, recorded to anchor the parameter
 space; qualification runs at target scale with pre-registered thresholds
 remain open work.

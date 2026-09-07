@@ -36,7 +36,9 @@ blob directory. An existing blob is checked for exact length and hash using
 blob. The initial absence/link-collision path verifies the winning file too.
 Both paths retain file/directory/file synchronization. On macOS the file sync
 includes `F_FULLFSYNC`. Corruption is reported and never silently repaired.
-Successful `putBlob` means the blob is durable before its hash is returned.
+Under the default `per_blob` durability, successful `putBlob` means the blob is
+durable before its hash is returned; under `pre_publish` it means the write is
+recorded for the next publication barrier (see Durability).
 
 `getBlob(gpa, hash, max_bytes)` checks that the file is regular, enforces the
 inclusive byte limit before allocation and during reading, and recomputes the
@@ -82,6 +84,42 @@ verify whole blobs per lookup by default. Recorded ledger workload
 (2,000 advances, 50k keys, blob-heavy mix): write amplification 11.8x ->
 0.5x and blob storage 907 MB -> 38 MB, at a p50 commit cost of 55 ms ->
 69 ms from fastest-preset compression CPU.
+
+## Durability
+
+`setDurability(mode)` selects a local durability policy (never a consensus
+input; commitments and blob bytes are identical under both modes):
+
+- `per_blob` (default) — every `putBlob`/`putBucketV2`/`mergeBuckets` is
+  individually durable before returning: file sync, blob-directory sync, then
+  a post-rename file sync. A successful write means the bytes survive a crash.
+- `pre_publish` — blob writes skip all per-file syncs and record their names
+  in a pending set instead. `publish` then performs one batched barrier
+  before the atomic manifest replace: it opens and full-syncs every pending
+  blob (each name leaves the set only after its sync succeeds), then syncs
+  the blob directory, and only then writes, syncs, and replaces the
+  manifest. Blob data is durable before the directory entry that names it,
+  and both precede any manifest that could reference them, so a published
+  manifest never names non-durable bytes. A crash or close before
+  publication leaves the previous frontier recoverable and abandons the
+  unsynced writes as unreachable debris.
+
+Operational notes: the barrier syncs each distinct pending blob exactly once
+per publication (re-putting an existing blob re-arms one name), a failed
+barrier retries the unsynced remainder on the next publication (already
+synced files may sync again, which is redundant but sound), and blobs
+deleted by `collect` are skipped. A crash under `pre_publish` can leave
+truncated debris at canonical blob names — unlike `per_blob`, where a blob
+is complete before its name exists — so a later put of the same content
+fails closed with `CorruptBlob` until `collect` removes the unreachable
+debris. The pending set is mutex-guarded, so concurrent puts and merges on
+one thread-safe Store remain safe; call `setDurability` once after open,
+before concurrent use. Switching back to `per_blob` does not discard the
+pending set: the next `publish` still drains it before replacing the
+manifest. The disk engine exposes this as `DiskOptions.durability`, where
+each `prepare`/`commit` pair publishes exactly once, so the barrier batches
+every blob a commit wrote (fresh bucket, merges, manifest) into one sync
+point.
 
 ## Read index
 
@@ -159,13 +197,16 @@ plus constant stack and I/O backend state. Memory does not grow with bucket
 size; lower per-record limits reduce the workspace. Each pass allocates and
 releases its readers, so the peak bound covers only one pass at a time.
 
-`publish(manifest_bytes)` first syncs the blob directory, writes a new manifest
+`publish(manifest_bytes)` first performs the durability barrier (`per_blob`
+has nothing pending; `pre_publish` syncs every blob written since the last
+successful publication), syncs the blob directory, writes a new manifest
 to a temporary file, flushes and syncs it, atomically replaces `manifest`, and
 syncs the store directory. Every referenced blob must already have been written
 successfully through `putBlob`. The payload is opaque, so this precondition is
 the caller's responsibility: the store cannot prove that references exist.
 An owner may publish alongside independent blob jobs, provided every referenced
-output has already completed durably. Completion of an unrelated background
+output has already completed (durably under `per_blob`; at least installed and
+pending under `pre_publish`). Completion of an unrelated background
 job does not choose which manifest is authoritative.
 
 The local storage envelope is `"BKLSTOR1" || payload_length:u64be ||
@@ -217,16 +258,23 @@ hostile concurrent entry replacement. The store lock serializes cooperating
 users, but it cannot stop a process that ignores that lock from replacing a
 checked regular file with a FIFO before the open.
 
-The publication test matrix injects `IoFailed` after the header write call,
-after the payload write call, after temporary-file sync, immediately before
-replacement, after replacement, after directory sync, and after final-file
-sync. It then closes and reopens the store through its ordinary API. Every
-pre-replacement error preserves the old frontier; every post-replacement error
-exposes the new frontier, and both referenced blobs still verify. The write
+The publication test matrix injects `IoFailed` before the durability barrier,
+after the header write call, after the payload write call, after
+temporary-file sync, immediately before replacement, after replacement, after
+directory sync, and after final-file sync. It runs every point under both
+durability modes and then closes and reopens the store through its ordinary
+API. Every pre-replacement error preserves the old frontier; every
+post-replacement error exposes the new frontier, and both referenced blobs
+still verify. Barrier-specific tests additionally pin the sync economics
+(relaxed writes perform no syncs; one publication syncs each distinct
+pending blob exactly once plus the manifest barriers), that a failed barrier
+keeps the unsynced remainder pending for the next publication, that
+collected blobs are skipped, and that a disk-level commit sequence syncs
+strictly less than half the per-blob policy over identical work. The write
 calls may still be buffered before the flush phase. These are injected-error
 and crash-boundary recovery-ordering tests, not physical power-loss tests or a
-proof of the filesystem/device's `fsync` fidelity. They do not emulate abruptly
-killing the process while bypassing error cleanup.
+proof of the filesystem/device's `fsync` fidelity. They do not emulate
+abruptly killing the process while bypassing error cleanup.
 
 Tests cover exact and zero-byte limits, idempotent immutable writes, missing and
 corrupt/truncated blobs, manifest replacement and reopening, an injected failure
