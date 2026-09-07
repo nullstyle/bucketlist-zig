@@ -797,3 +797,44 @@ test "disk: range proofs match an independent model across a random workload" {
     }
     try std.testing.expect(checked > 24 and stale_checks > 8);
 }
+
+test "disk: proof generation survives struct-literal reordering across depths" {
+    // Regression: scanForProof's return literal once mixed computed fields
+    // with `try` expressions, and the pinned compiler evaluated
+    // `.block_count` against stale state, producing internally inconsistent
+    // placements (this exact history made a one-block bucket claim two).
+    // The same shape is exercised at the default depth and a shallow one.
+    const Repro = struct {
+        fn run(comptime depth: usize) !void {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            const path = try pathOf(&tmp, &buf);
+            const Db = native.DatabaseWithDepth(Schema, depth);
+            const format: store.BucketFormat = .{ .v2 = .{ .target_block_bytes = 96 } };
+            var db = try Db.open(gpa, io, path, .{ .merge_workers = 1, .format = format });
+            defer db.deinit();
+            var seq: u64 = 0;
+            while (seq < 12) : (seq += 1) {
+                var batch = Db.Batch.init(gpa);
+                defer batch.deinit();
+                for (0..6) |i| {
+                    const key = seq * 6 + i;
+                    if (key % 9 == 8) try batch.delete(.accounts, key - 3) else try batch.put(.accounts, key, key * 31 + 7);
+                }
+                var prepared = try db.prepare(seq + 1, &batch, "fixture");
+                defer prepared.deinit();
+                try prepared.commit();
+            }
+            const digest = db.commitment().digest;
+            var bundle = try db.prove(.accounts, 4, gpa);
+            defer bundle.deinit();
+            try lib.proofs.verifyVisible(&bundle.proof, digest);
+            var range = try db.proveRange(.accounts, 0, 72, gpa);
+            defer range.deinit();
+            try lib.proofs.verifyRange(&range.proof, digest);
+        }
+    };
+    try Repro.run(4);
+    try Repro.run(11);
+}

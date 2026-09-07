@@ -670,15 +670,21 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             } else if (chosen == null) {
                 return error.NoBracketingBlock;
             }
+            // Build every field from locals: this compiler can evaluate
+            // struct-literal fields out of order when one carries a `try`,
+            // which once made `.block_count` observe post-clear state.
+            const final_partial = block.items.len > 0;
+            const block_count = block_index + @intFromBool(final_partial);
             block.deinit(gpa);
             const picked = chosen.?;
+            const owned_leaves = try leaves.toOwnedSlice(gpa);
             return .{
                 .present = present,
                 .block = picked.bytes,
                 .block_index = picked.index,
-                .block_count = block_index + @intFromBool(block.items.len > 0),
+                .block_count = block_count,
                 .record_count = record_count,
-                .leaves = try leaves.toOwnedSlice(gpa),
+                .leaves = owned_leaves,
                 .bracketed = bracketed or present,
             };
         }
@@ -766,13 +772,21 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             for (state.levels, 0..) |level, i| {
                 levels[i] = .{ .curr = level.curr, .snap = level.snap, .next = level.next };
             }
+            const key_copy = try gpa.dupe(u8, key_bytes);
+            errdefer gpa.free(key_copy);
+            const owned_placements = try placements.toOwnedSlice(gpa);
+            errdefer gpa.free(owned_placements);
+            const owned_blocks = try blocks.toOwnedSlice(gpa);
+            errdefer gpa.free(owned_blocks);
+            const owned_steps = try steps.toOwnedSlice(gpa);
+            errdefer gpa.free(owned_steps);
             return .{
                 .proof = .{
                     .table = T.id,
-                    .key = try gpa.dupe(u8, key_bytes),
+                    .key = key_copy,
                     .value = deciding_value,
                     .absent = !deciding_present,
-                    .younger = try placements.toOwnedSlice(gpa),
+                    .younger = owned_placements,
                     .deciding = final_placement,
                     .schema_hash = schema_hash,
                     .profile_hash = state.profile_hash,
@@ -780,8 +794,8 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
                     .levels = levels,
                 },
                 .levels = levels,
-                .blocks = try blocks.toOwnedSlice(gpa),
-                .steps = try steps.toOwnedSlice(gpa),
+                .blocks = owned_blocks,
+                .steps = owned_steps,
                 .gpa = gpa,
             };
         }
@@ -952,12 +966,22 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
             }
             const owned_runs = try runs.toOwnedSlice(gpa);
             errdefer gpa.free(owned_runs);
+            const owned_entries = try entries.toOwnedSlice(gpa);
+            errdefer gpa.free(owned_entries);
+            const owned_blocks = try blocks.toOwnedSlice(gpa);
+            errdefer gpa.free(owned_blocks);
+            const owned_steps = try steps.toOwnedSlice(gpa);
+            errdefer gpa.free(owned_steps);
+            const start_copy = try gpa.dupe(u8, start);
+            errdefer gpa.free(start_copy);
+            const end_copy = try gpa.dupe(u8, end);
+            errdefer gpa.free(end_copy);
             return .{
                 .proof = .{
                     .table = T.id,
-                    .start = try gpa.dupe(u8, start),
-                    .end = try gpa.dupe(u8, end),
-                    .entries = try entries.toOwnedSlice(gpa),
+                    .start = start_copy,
+                    .end = end_copy,
+                    .entries = owned_entries,
                     .runs = owned_runs,
                     .schema_hash = schema_hash,
                     .profile_hash = state.profile_hash,
@@ -966,8 +990,8 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
                 },
                 .levels = levels,
                 .runs = owned_runs,
-                .blocks = try blocks.toOwnedSlice(gpa),
-                .steps = try steps.toOwnedSlice(gpa),
+                .blocks = owned_blocks,
+                .steps = owned_steps,
                 .gpa = gpa,
             };
         }
@@ -1061,12 +1085,13 @@ pub fn DatabaseWithDepth(comptime S: type, comptime depth: usize) type {
                     try run_blocks.append(gpa, .{ .block = blocks.items[first_kept + i], .block_index = index, .path = path });
                 }
             }
+            const owned_blocks = try run_blocks.toOwnedSlice(gpa);
             return .{
                 .slot_level = 0,
                 .slot_snapshot = false,
                 .block_count = meta.items.len,
                 .record_count = record_count,
-                .blocks = try run_blocks.toOwnedSlice(gpa),
+                .blocks = owned_blocks,
             };
         }
 
