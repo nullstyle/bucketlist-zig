@@ -320,6 +320,14 @@ pub const IndexedCursor = struct {
         return self.store.read_index.?.options;
     }
     fn install(self: *IndexedCursor) Error!void {
+        // Framed (compressed) blobs carry no stable uncompressed offsets on
+        // disk; the index is only sound for plain blobs.
+        if (self.cursor.reader.decomp != null) {
+            for (self.samples.items) |sample| self.store.gpa.free(sample.key);
+            self.samples.deinit(self.store.gpa);
+            self.installed = true;
+            return;
+        }
         if (self.store.read_index) |cache| {
             // Ownership transfers on success; a failed install frees them.
             const owned = try self.samples.toOwnedSlice(self.store.gpa);
@@ -334,6 +342,38 @@ pub const IndexedCursor = struct {
 };
 
 const magic = "BKLSTOR1";
+const compress_magic = "BKLZRAW1";
+const compress_header_len = compress_magic.len + 8;
+
+/// Decompress a framed payload (magic + u64be length + raw deflate).
+/// Returns the uncompressed bytes; the caller frees.
+fn inflateBytes(gpa: std.mem.Allocator, payload: []const u8, expected_len: usize) Error![]u8 {
+    if (payload.len < compress_header_len - compress_magic.len) return error.CorruptBlob;
+    const out = gpa.alloc(u8, expected_len) catch return error.OutOfMemory;
+    errdefer gpa.free(out);
+    var source: std.Io.Reader = .fixed(payload);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var decomp = std.compress.flate.Decompress.init(&source, .raw, &window);
+    decomp.reader.readSliceAll(out) catch return error.CorruptBlob;
+    if (decomp.reader.peekByte()) |_| return error.CorruptBlob else |_| {}
+    return out;
+}
+
+fn compressBytes(gpa: std.mem.Allocator, bytes: []const u8) Error![]u8 {
+    const framed = gpa.alloc(u8, compress_header_len + bytes.len + bytes.len / 64 + 128) catch return error.OutOfMemory;
+    errdefer gpa.free(framed);
+    @memcpy(framed[0..compress_magic.len], compress_magic);
+    std.mem.writeInt(u64, framed[compress_magic.len..][0..8], @intCast(bytes.len), .big);
+    var sink: std.Io.Writer = .fixed(framed[compress_header_len..]);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    // Fastest preset: write-path economics favors CPU over ratio.
+    const fast = std.compress.flate.Compress.Options{ .good = 4, .nice = 8, .lazy = 0, .chain = 4 };
+    var compressor = std.compress.flate.Compress.init(&sink, &window, .raw, fast) catch return error.IoFailed;
+    compressor.writer.writeAll(bytes) catch return error.IoFailed;
+    compressor.finish() catch return error.IoFailed;
+    const written = compress_header_len + sink.end;
+    if (gpa.realloc(framed, written)) |shrunk| return shrunk else |_| return framed[0..written];
+}
 const header_len = magic.len + 8 + 32;
 const manifest_name = "manifest";
 const PublishFault = enum {
@@ -354,6 +394,7 @@ pub const Store = struct {
     blobs: std.Io.Dir,
     lock: std.Io.File,
     read_index: ?*ReadIndexCache = null,
+    compress_writes: bool = false,
 
     /// Owns open directory and exclusive advisory lock handles. The allocator
     /// and Io must remain valid until deinit and support every calling thread.
@@ -414,25 +455,50 @@ pub const Store = struct {
         self.read_index = try ReadIndexCache.create(self.gpa, self.io, options);
     }
 
+    /// Opt future writes into transparent deflate framing: blob names keep
+    /// hashing the canonical uncompressed bytes (a local policy, never a
+    /// consensus input); reads autodetect the framing, so mixed and legacy
+    /// stores remain readable. The read index is not installed for
+    /// compressed blobs (span offsets lose meaning under decompression).
+    pub fn enableCompression(self: *Store) void {
+        self.compress_writes = true;
+    }
+
+    fn compressStaged(self: *Store, bytes: []const u8) Error![]u8 {
+        return compressBytes(self.gpa, bytes);
+    }
+
     /// SHA256(bytes) names immutable contents. Existing contents must verify;
     /// an existing corrupt file is an error, never silently overwritten.
     /// A successful return means the file and its directory entry are synced.
     pub fn putBlob(self: *Store, bytes: []const u8) Error!Hash {
         const hash = digest(bytes);
         const name = std.fmt.bytesToHex(hash, .lower);
+        const stored: []const u8 = if (self.compress_writes) try self.compressStaged(bytes) else bytes;
+        defer if (stored.len != bytes.len or stored.ptr != bytes.ptr) self.gpa.free(stored);
         // Shared buckets are common across checkpoints. Verify the immutable
         // file with bounded scratch before allocating/writing a temporary copy.
-        const existing: ?std.Io.File = openVerified(self.blobs, self.io, &name, hash, bytes.len) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
-        if (existing) |file| {
+        const existing: ?std.Io.File = if (self.compress_writes)
+            null // framed reuse is verified below by content comparison
+        else
+            openVerified(self.blobs, self.io, &name, hash, bytes.len) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+        if (self.compress_writes and try self.blobExists(&name)) {
+            const plain = try self.readBlobPlain(self.gpa, &name, bytes.len);
+            defer self.gpa.free(plain);
+            if (!std.mem.eql(u8, plain, bytes)) return error.CorruptBlob;
+            const kept = try openRegular(self.blobs, self.io, &name);
+            defer kept.close(self.io);
+            try fullSync(self.io, kept);
+        } else if (existing) |file| {
             defer file.close(self.io);
             try fullSync(self.io, file);
         } else {
             var atomic = self.blobs.createFileAtomic(self.io, &name, .{}) catch return error.IoFailed;
             defer atomic.deinit(self.io);
-            try writeBytes(self.io, atomic.file, bytes);
+            try writeBytes(self.io, atomic.file, stored);
             try fullSync(self.io, atomic.file);
             atomic.link(self.io) catch |err| switch (err) {
                 error.PathAlreadyExists => {
@@ -466,24 +532,25 @@ pub const Store = struct {
         const hash = try v2BucketHash(bytes, target, limits);
         const name = std.fmt.bytesToHex(hash, .lower);
         if (try self.blobExists(&name)) {
-            const existing = try readBounded(self.blobs, self.io, &name, self.gpa, bytes.len);
-            defer self.gpa.free(existing);
-            if (existing.len != bytes.len or !std.mem.eql(u8, existing, bytes) or
-                !std.mem.eql(u8, &hash, &(try v2BucketHash(existing, target, limits)))) return error.CorruptBlob;
+            const plain = try self.readBlobPlain(self.gpa, &name, bytes.len);
+            defer self.gpa.free(plain);
+            if (!std.mem.eql(u8, plain, bytes)) return error.CorruptBlob;
             const file = try openRegular(self.blobs, self.io, &name);
             defer file.close(self.io);
             try fullSync(self.io, file);
             return hash;
         }
+        const stored: []const u8 = if (self.compress_writes) try compressBytes(self.gpa, bytes) else bytes;
+        defer if (stored.ptr != bytes.ptr) self.gpa.free(stored);
         var atomic = self.blobs.createFileAtomic(self.io, &name, .{}) catch return error.IoFailed;
         defer atomic.deinit(self.io);
-        try writeBytes(self.io, atomic.file, bytes);
+        try writeBytes(self.io, atomic.file, stored);
         try fullSync(self.io, atomic.file);
         atomic.link(self.io) catch |err| switch (err) {
             error.PathAlreadyExists => {
-                const existing = try readBounded(self.blobs, self.io, &name, self.gpa, bytes.len);
-                defer self.gpa.free(existing);
-                if (!std.mem.eql(u8, existing, bytes)) return error.CorruptBlob;
+                const plain = try self.readBlobPlain(self.gpa, &name, bytes.len);
+                defer self.gpa.free(plain);
+                if (!std.mem.eql(u8, plain, bytes)) return error.CorruptBlob;
             },
             else => return error.IoFailed,
         };
@@ -495,18 +562,32 @@ pub const Store = struct {
     }
 
     fn blobExists(self: *Store, name: []const u8) Error!bool {
-        _ = self.blobs.statFile(self.io, name, .{ .follow_symlinks = false }) catch |err| return switch (err) {
-            error.FileNotFound => false,
-            else => true,
+        _ = self.blobs.statFile(self.io, name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return error.IoFailed,
         };
         return true;
     }
 
     /// The caller owns the returned allocation. max_bytes is an inclusive
     /// bound, checked before allocation and again while reading.
+    /// Read a blob's plain (uncompressed) bytes, inflating framed payloads.
+    fn readBlobPlain(self: *Store, gpa: std.mem.Allocator, name: []const u8, max_bytes: usize) Error![]u8 {
+        const raw = try readBounded(self.blobs, self.io, name, gpa, max_bytes + compress_header_len + max_bytes / 64 + 128);
+        defer gpa.free(raw);
+        if (raw.len >= compress_magic.len and std.mem.eql(u8, raw[0..compress_magic.len], compress_magic)) {
+            if (raw.len < compress_header_len) return error.CorruptBlob;
+            const expected = std.mem.readInt(u64, raw[compress_magic.len..][0..8], .big);
+            if (expected > max_bytes) return error.TooLarge;
+            return inflateBytes(gpa, raw[compress_header_len..], @intCast(expected));
+        }
+        if (raw.len > max_bytes) return error.TooLarge;
+        return gpa.dupe(u8, raw) catch return error.OutOfMemory;
+    }
+
     pub fn getBlob(self: *Store, gpa: std.mem.Allocator, hash: Hash, max_bytes: usize) Error![]u8 {
         const name = std.fmt.bytesToHex(hash, .lower);
-        const bytes = try readBounded(self.blobs, self.io, &name, gpa, max_bytes);
+        const bytes = try self.readBlobPlain(gpa, &name, max_bytes);
         errdefer gpa.free(bytes);
         if (!std.mem.eql(u8, &hash, &digest(bytes))) return error.CorruptBlob;
         return bytes;
@@ -516,15 +597,20 @@ pub const Store = struct {
     /// from the Store allocator. Its allocator and Io must outlive the cursor.
     /// Record slices are provisional until successful verified EOF.
     pub fn scanBucket(self: *Store, hash: Hash, limits: MergeLimits) Error!BucketCursor {
-        const reader = try BucketReader.init(self, hash, limits);
+        var reader = try BucketReader.init(self, hash, limits);
+        try reader.wireCompressed(self.gpa, limits);
         return .{ .reader = reader, .record_count = reader.remaining };
     }
 
     /// Verified scan that seeds the read index at EOF (see IndexedCursor).
     pub fn scanBucketIndexed(self: *Store, hash: Hash, limits: MergeLimits) Error!IndexedCursor {
-        const cursor = try BucketReader.init(self, hash, limits);
-        const total = cursor.remaining;
-        return .{ .cursor = .{ .reader = cursor, .record_count = total }, .store = self, .hash = hash, .total_records = total };
+        var cursor = try BucketReader.init(self, hash, limits);
+        // The cursor struct below is the reader's final address; wire any
+        // decompressor against it before moving in.
+        var indexed: IndexedCursor = undefined;
+        try cursor.wireCompressed(self.gpa, limits);
+        indexed = .{ .cursor = .{ .reader = cursor, .record_count = cursor.remaining }, .store = self, .hash = hash, .total_records = cursor.remaining };
+        return indexed;
     }
 
     /// Stream and verify the WHOLE bucket, even after finding the key. Runtime
@@ -586,6 +672,7 @@ pub const Store = struct {
     fn lookupIndexedCold(self: *Store, gpa: std.mem.Allocator, hash: Hash, table: u32, key: []const u8, limits: MergeLimits) Error!BucketLookup {
         var reader = try BucketReader.init(self, hash, limits);
         defer reader.deinit();
+        try reader.wireCompressed(self.gpa, limits);
         const total_records = reader.remaining;
         const cache = self.read_index;
         const options = if (cache) |c| c.options else undefined;
@@ -723,8 +810,24 @@ pub const Store = struct {
             .v1 => undefined,
             .v2 => |v2| V2Hasher.init(v2.target_block_bytes),
         };
+        var compressor_state: ?std.compress.flate.Compress = null;
+        var compress_window: ?[]u8 = null;
+        defer if (compress_window) |window| self.gpa.free(window);
+        if (self.compress_writes) {
+            // The framing header must flow through the same writer as the
+            // compressed payload: a second writer restarts at offset zero
+            // and would clobber it.
+            var header: [compress_header_len]u8 = undefined;
+            @memcpy(header[0..compress_magic.len], compress_magic);
+            std.mem.writeInt(u64, header[compress_magic.len..][0..8], 0, .big); // length patched after hash known
+            writer.interface.writeAll(&header) catch return error.IoFailed;
+            const window = self.gpa.alloc(u8, std.compress.flate.max_window_len) catch return error.OutOfMemory;
+            compress_window = window;
+            const fast = std.compress.flate.Compress.Options{ .good = 4, .nice = 8, .lazy = 0, .chain = 4 };
+            compressor_state = std.compress.flate.Compress.init(&writer.interface, window, .raw, fast) catch return error.IoFailed;
+        }
         var output: MergeOutput = .{
-            .writer = &writer.interface,
+            .writer = if (compressor_state) |*c| &c.writer else &writer.interface,
             .limit = limits.max_bucket_bytes,
             .v2 = if (limits.format == .v2) &v2_hasher else null,
         };
@@ -735,20 +838,18 @@ pub const Store = struct {
         const second = try mergePass(self, older, newer, drop_tombstones, limits, &output);
         if (second.count != first.count or second.size != first.size or output.size != first.size)
             return error.CorruptBlob;
+        if (compressor_state) |*c| c.finish() catch return error.IoFailed;
         writer.interface.flush() catch return error.IoFailed;
         const hash = if (output.v2) |hasher| hasher.final() else output.hash.finalResult();
+        if (compress_window != null) {
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, first.size, .big);
+            atomic.file.writePositionalAll(self.io, &length, compress_magic.len) catch return error.IoFailed;
+        }
         name = std.fmt.bytesToHex(hash, .lower);
         try fullSync(self.io, atomic.file);
         atomic.link(self.io) catch |err| switch (err) {
-            error.PathAlreadyExists => switch (limits.format) {
-                .v1 => try verifyFile(self.blobs, self.io, &name, hash, first.size),
-                .v2 => |v2| {
-                    const existing = try readBounded(self.blobs, self.io, &name, self.gpa, @intCast(first.size));
-                    defer self.gpa.free(existing);
-                    if (!std.mem.eql(u8, &(try v2BucketHash(existing, v2.target_block_bytes, limits)), &hash))
-                        return error.CorruptBlob;
-                },
-            },
+            error.PathAlreadyExists => try self.verifyInstalled(&name, hash, first.size, limits),
             else => return error.IoFailed,
         };
         try syncDir(self.io, self.blobs);
@@ -785,6 +886,25 @@ pub const Store = struct {
             return error.MergeMismatch;
         const actual = if (sink.v2) |hasher| hasher.final() else sink.hash.finalResult();
         if (!std.mem.eql(u8, &expected, &actual)) return error.MergeMismatch;
+    }
+
+    /// Verify an already-installed merge winner: streaming verification
+    /// keeps the fixed-workspace bound for plain files; framed winners and
+    /// size mismatches fall back to a full read, still failing closed.
+    fn verifyInstalled(self: *Store, name: []const u8, hash: Hash, plain_size: u64, limits: MergeLimits) Error!void {
+        if (verifyFile(self.blobs, self.io, name, hash, plain_size)) |_| {
+            return;
+        } else |verify_err| switch (verify_err) {
+            error.CorruptBlob, error.CorruptManifest, error.TooLarge => {},
+            else => return verify_err,
+        }
+        const plain = try self.readBlobPlain(self.gpa, name, @intCast(plain_size));
+        defer self.gpa.free(plain);
+        const actual = switch (limits.format) {
+            .v1 => digest(plain),
+            .v2 => |v2| try v2BucketHash(plain, v2.target_block_bytes, limits),
+        };
+        if (!std.mem.eql(u8, &actual, &hash)) return error.CorruptBlob;
     }
 
     /// Publish an opaque application manifest after putBlob has durably
@@ -1047,6 +1167,9 @@ const BucketReader = struct {
     value_buffer: []u8,
     hash: std.crypto.hash.sha2.Sha256 = .init(.{}),
     v2: ?V2Hasher = null,
+    compressed: bool = false,
+    decomp: ?std.compress.flate.Decompress = null,
+    decomp_window: ?[]u8 = null,
     expected: Hash,
     size: u64,
     consumed: u64 = 0,
@@ -1060,7 +1183,9 @@ const BucketReader = struct {
         errdefer file.close(store.io);
         const size = (file.stat(store.io) catch return error.IoFailed).size;
         if (size > limits.max_bucket_bytes) return error.TooLarge;
-        if (size < empty_bucket.len) return error.InvalidBucket;
+        // A framed (compressed) blob may be smaller than the plain bucket
+        // header; the sniff below distinguishes them.
+        if (size < compress_header_len) return error.InvalidBucket;
         const key_len: usize = limits.max_key_bytes;
         const value_len: usize = limits.max_value_bytes;
         const keys_len = std.math.mul(usize, key_len, 2) catch return error.TooLarge;
@@ -1080,8 +1205,28 @@ const BucketReader = struct {
             .expected = expected,
             .size = size,
         };
+        // Sniff the compression framing on the first 8 bytes before any
+        // hashing: framed payloads decompress through a window; plain ones
+        // hash those first bytes as the domain prefix.
+        var prefix: [compress_magic.len]u8 = undefined;
+        self.reader.interface.readSliceAll(&prefix) catch return error.IoFailed;
         var header: [empty_bucket.len]u8 = undefined;
-        try self.read(&header);
+        if (std.mem.eql(u8, &prefix, compress_magic)) {
+            var length: [8]u8 = undefined;
+            self.reader.interface.readSliceAll(&length) catch return error.IoFailed;
+            const uncompressed = std.mem.readInt(u64, &length, .big);
+            if (uncompressed > limits.max_bucket_bytes) return error.TooLarge;
+            self.size = uncompressed;
+            self.compressed = true;
+            // The decompressor is wired up after this struct is moved into
+            // place (see scanBucket): it must point at the final reader.
+            return self;
+        } else {
+            @memcpy(header[0..prefix.len], &prefix);
+            self.hash.update(&prefix);
+            self.consumed += prefix.len;
+            try self.read(header[prefix.len..]);
+        }
         if (!std.mem.eql(u8, header[0..bucket_domain.len], bucket_domain)) return error.InvalidBucket;
         self.remaining = std.mem.readInt(u64, header[bucket_domain.len..][0..8], .big);
         if (self.remaining > limits.max_records) return error.TooLarge;
@@ -1095,16 +1240,49 @@ const BucketReader = struct {
 
     fn deinit(self: *BucketReader) void {
         self.file.close(self.io);
+        if (self.decomp_window) |window| self.gpa.free(window);
         self.gpa.free(self.scratch);
         self.* = undefined;
     }
 
+    /// Complete compressed setup once the reader lives at its final
+    /// address: the decompressor must point at that instance's interface.
+    fn wireCompressed(self: *BucketReader, gpa: std.mem.Allocator, limits: MergeLimits) Error!void {
+        if (!self.compressed) return;
+        const window = gpa.alloc(u8, std.compress.flate.max_window_len) catch return error.OutOfMemory;
+        self.decomp = std.compress.flate.Decompress.init(&self.reader.interface, .raw, window);
+        self.decomp_window = window;
+        switch (limits.format) {
+            .v1 => {},
+            .v2 => |v2| self.v2 = V2Hasher.init(v2.target_block_bytes),
+        }
+        var header: [empty_bucket.len]u8 = undefined;
+        try self.read(&header);
+        if (!std.mem.eql(u8, header[0..bucket_domain.len], bucket_domain)) return error.InvalidBucket;
+        self.remaining = std.mem.readInt(u64, header[bucket_domain.len..][0..8], .big);
+        if (self.remaining > limits.max_records) return error.TooLarge;
+    }
+
+    fn readCompressedHeader(self: *BucketReader) Error!void {
+        var header: [empty_bucket.len]u8 = undefined;
+        try self.read(&header);
+        if (!std.mem.eql(u8, header[0..bucket_domain.len], bucket_domain)) return error.InvalidBucket;
+        self.remaining = std.mem.readInt(u64, header[bucket_domain.len..][0..8], .big);
+    }
+
     fn read(self: *BucketReader, bytes: []u8) Error!void {
         if (bytes.len > self.size - self.consumed) return error.InvalidBucket;
-        self.reader.interface.readSliceAll(bytes) catch |err| return switch (err) {
-            error.EndOfStream => error.InvalidBucket,
-            error.ReadFailed => error.IoFailed,
-        };
+        if (self.decomp != null) {
+            self.decomp.?.reader.readSliceAll(bytes) catch |err| return switch (err) {
+                error.EndOfStream => error.InvalidBucket,
+                else => error.CorruptBlob,
+            };
+        } else {
+            self.reader.interface.readSliceAll(bytes) catch |err| return switch (err) {
+                error.EndOfStream => error.InvalidBucket,
+                error.ReadFailed => error.IoFailed,
+            };
+        }
         self.hash.update(bytes);
         self.consumed += bytes.len;
     }
@@ -1120,11 +1298,15 @@ const BucketReader = struct {
             self.current = null;
             if (self.finished) return;
             if (self.consumed != self.size) return error.InvalidBucket;
-            if (self.reader.interface.peekByte()) |_| {
+            const trailing = if (self.decomp != null)
+                self.decomp.?.reader.peekByte()
+            else
+                self.reader.interface.peekByte();
+            if (trailing) |_| {
                 return error.InvalidBucket;
             } else |err| switch (err) {
                 error.EndOfStream => {},
-                error.ReadFailed => return error.IoFailed,
+                else => return error.IoFailed,
             }
             const actual = if (self.v2) |*v2| v2.final() else self.hash.finalResult();
             if (!std.mem.eql(u8, &self.expected, &actual)) return error.CorruptBlob;
@@ -1199,8 +1381,10 @@ const MergeSize = struct { count: u64 = 0, size: u64 = empty_bucket.len };
 fn mergePass(store: *Store, older: Hash, newer: Hash, drop_tombstones: bool, limits: MergeLimits, output: ?*MergeOutput) Error!MergeSize {
     var old = try BucketReader.init(store, older, limits);
     defer old.deinit();
+    try old.wireCompressed(store.gpa, limits);
     var new = try BucketReader.init(store, newer, limits);
     defer new.deinit();
+    try new.wireCompressed(store.gpa, limits);
     try old.advance();
     try new.advance();
     var result: MergeSize = .{};
@@ -2155,6 +2339,61 @@ test "v2 merges produce block-hashed outputs and verify without writes" {
     var flat = try store.scanBucket(merged, .{ .max_key_bytes = 4, .max_value_bytes = 4 });
     defer flat.deinit();
     try testing.expectError(error.CorruptBlob, flat.finish());
+}
+
+test "compressed blobs keep content addressing over plain bytes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try testStore(&tmp);
+    defer store.deinit();
+    store.enableCompression();
+    const payload = try manyRecords(testing.allocator, 1000, 0);
+    defer testing.allocator.free(payload);
+    // Plain and compressed writers agree on the name and content.
+    const hash = try store.putBlob(payload);
+    const name = std.fmt.bytesToHex(hash, .lower);
+    try testing.expectEqual(@as(Hash, digest(payload)), hash);
+    const stat = try store.blobs.statFile(testing.io, &name, .{ .follow_symlinks = false });
+    try testing.expect(stat.size < payload.len); // framed and actually smaller
+    const read_back = try store.getBlob(testing.allocator, hash, payload.len);
+    defer testing.allocator.free(read_back);
+    try testing.expectEqualSlices(u8, payload, read_back);
+    // Streaming scans, v2 hashing, and merges work through the framing.
+    const limits: MergeLimits = .{
+        .max_key_bytes = 4,
+        .max_value_bytes = 4,
+        .format = .{ .v2 = .{ .target_block_bytes = 128 } },
+    };
+    const v2 = try store.putBucketV2(payload, limits);
+    var cursor = try store.scanBucket(v2, limits);
+    defer cursor.deinit();
+    try cursor.finish();
+    try testing.expectEqual(@as(u64, 1000), cursor.recordCount());
+    const odd = try manyRecords(testing.allocator, 1000, 1);
+    defer testing.allocator.free(odd);
+    const other = try store.putBucketV2(odd, limits);
+    const merged = try store.mergeBuckets(v2, other, false, limits);
+    var drain = try store.scanBucket(merged, limits);
+    defer drain.deinit();
+    try drain.finish();
+    try testing.expectEqual(@as(u64, 2000), drain.recordCount());
+    // A legacy (unframed) blob written before the opt-in stays readable.
+    {
+        var legacy_tmp = testing.tmpDir(.{});
+        defer legacy_tmp.cleanup();
+        var legacy = try testStore(&legacy_tmp);
+        defer legacy.deinit();
+        const legacy_hash = try legacy.putBlob(payload);
+        try testing.expectEqual(hash, legacy_hash);
+        const legacy_read = try store.getBlob(testing.allocator, legacy_hash, payload.len);
+        defer testing.allocator.free(legacy_read);
+        try testing.expectEqualSlices(u8, payload, legacy_read);
+    }
+    // Corrupt the compressed payload: verification must fail closed.
+    const file = try store.blobs.openFile(testing.io, &name, .{ .mode = .read_write });
+    defer file.close(testing.io);
+    try file.writePositionalAll(testing.io, "X", stat.size / 2);
+    try testing.expectError(error.CorruptBlob, store.getBlob(testing.allocator, hash, payload.len));
 }
 
 test "one store supports concurrent immutable puts merges and independent cursors" {

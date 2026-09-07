@@ -81,6 +81,7 @@ DiskOptions.max_bucket_bytes: u64
 DiskOptions.max_bucket_records: u64
 DiskOptions.max_read_views: usize
 DiskOptions.format: ?store.BucketFormat
+DiskOptions.compression: bool
 DiskOptions.read_index: ?store.ReadIndexOptions
 DiskOptions.expected: ?disk.Reference
 DiskReference.manifest_hash: [32]u8
@@ -107,6 +108,7 @@ ProofsWire.read: fn (mem.Allocator, *const serialization.message.Message) error{
 Store.open: fn (mem.Allocator, Io, []const u8) error{CorruptBlob,CorruptManifest,InvalidBucket,InvalidPath,IoFailed,MergeMismatch,NotFound,NotRegularFile,OutOfMemory,StoreBusy,TooLarge,UnsupportedPlatform}!store.Store
 Store.deinit: fn (*store.Store) void
 Store.enableReadIndex: fn (*store.Store, store.ReadIndexOptions) error{CorruptBlob,CorruptManifest,InvalidBucket,InvalidPath,IoFailed,MergeMismatch,NotFound,NotRegularFile,OutOfMemory,StoreBusy,TooLarge,UnsupportedPlatform}!void
+Store.enableCompression: fn (*store.Store) void
 Store.putBlob: fn (*store.Store, []const u8) error{CorruptBlob,CorruptManifest,InvalidBucket,InvalidPath,IoFailed,MergeMismatch,NotFound,NotRegularFile,OutOfMemory,StoreBusy,TooLarge,UnsupportedPlatform}![32]u8
 Store.putBucketV2: fn (*store.Store, []const u8, store.MergeLimits) error{CorruptBlob,CorruptManifest,InvalidBucket,InvalidPath,IoFailed,MergeMismatch,NotFound,NotRegularFile,OutOfMemory,StoreBusy,TooLarge,UnsupportedPlatform}![32]u8
 Store.getBlob: fn (*store.Store, mem.Allocator, [32]u8, usize) error{CorruptBlob,CorruptManifest,InvalidBucket,InvalidPath,IoFailed,MergeMismatch,NotFound,NotRegularFile,OutOfMemory,StoreBusy,TooLarge,UnsupportedPlatform}![]u8

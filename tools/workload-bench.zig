@@ -34,6 +34,7 @@ const Schema = struct {
 const Db = native.Database(Schema);
 
 var active_io: *IoCounter = undefined;
+var compress_flag: bool = false;
 const IoCounter = struct {
     original: std.Io,
     vtable: std.Io.VTable,
@@ -157,7 +158,7 @@ fn advanceOnce(db: *Db, gpa: Allocator, random: std.Random, keys: u64, batch_max
 fn runLedger(gpa: Allocator, writer: *std.Io.Writer, path: []const u8, advances: usize, keys: u64, seed: u64) !void {
     const clock = std.Io.Clock.awake;
     const io = active_io.original;
-    var db = try Db.open(gpa, active_io.io(), path, .{ .merge_workers = 2, .max_metadata_bytes = 16 });
+    var db = try Db.open(gpa, active_io.io(), path, .{ .merge_workers = 2, .max_metadata_bytes = 16, .compression = compress_flag });
     defer db.deinit();
     var prng = std.Random.DefaultPrng.init(seed);
     const random = prng.random();
@@ -198,6 +199,7 @@ fn runLedger(gpa: Allocator, writer: *std.Io.Writer, path: []const u8, advances:
         .blob_count = blobs.count,
         .blob_total_bytes = blobs.bytes,
         .largest_blob_bytes = blobs.largest,
+        .compressed = compress_flag,
     });
 }
 
@@ -423,6 +425,8 @@ pub fn main(init: std.process.Init) !void {
         const advances = try argument(&args, 50_000);
         const keys = try argument(&args, 1_000_000);
         const seed = try argument(&args, 1);
+        // WORKLOAD_COMPRESS=1 style fourth argument toggles compression.
+        compress_flag = args.next() != null;
         try runLedger(gpa, writer, path, advances, @intCast(keys), @intCast(seed));
     } else if (std.mem.eql(u8, mode, "zipf")) {
         const keys = try argument(&args, 500_000);

@@ -314,7 +314,8 @@ the recorded workloads above:
 
 Smoke-scale first measurements (ReleaseFast, this machine, blob-heavy
 default value mix): ledger 2,000 advances over 50k keys commits at
-p50 55 ms / p99 94 ms with write amplification 11.8x; zipf (skew 1.0,
+p50 55 ms / p99 94 ms with write amplification 11.8x (0.5x and 38 MB of
+blobs instead of 907 MB with the compression option enabled; p50 69 ms); zipf (skew 1.0,
 50k keys) reads at p50 361 us / p99 1.4 ms with writes p99 80 ms;
 catchup over ~1 GB of blobs reopens in 102 ms — **9.14 GiB/s validated**,
 so reopen cost scales linearly at roughly a tenth of a second per GiB and

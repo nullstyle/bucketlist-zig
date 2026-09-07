@@ -66,6 +66,23 @@ allocates `2 * max_key_bytes + max_value_bytes + 8192` scratch bytes. Limits
 apply to every parsed record, even one unrelated to the lookup target; a corrupt
 or oversized tail cannot be hidden by an early match.
 
+## Compression
+
+`enableCompression()` opts future writes into transparent deflate framing:
+each blob file becomes `BKLZRAW1 || u64be(plain_length) || raw-deflate(bytes)`,
+while the blob's name keeps hashing the canonical uncompressed bytes. Reads
+autodetect the framing, so stores may mix compressed and legacy plain blobs
+indefinitely, and commitments are unaffected -- compression is a local
+policy, never a consensus input. Streaming scans, verified lookups, v2
+block hashing, merges (whose outputs are framed with the exact plain length
+patched in before installation), and existing-winner verification all run
+through the framing; the read index is not installed for framed blobs
+because span offsets lose meaning under decompression, so compressed stores
+verify whole blobs per lookup by default. Recorded ledger workload
+(2,000 advances, 50k keys, blob-heavy mix): write amplification 11.8x ->
+0.5x and blob storage 907 MB -> 38 MB, at a p50 commit cost of 55 ms ->
+69 ms from fastest-preset compression CPU.
+
 ## Read index
 
 `enableReadIndex(options)` opts a Store into `lookupBucketIndexed`, the same
