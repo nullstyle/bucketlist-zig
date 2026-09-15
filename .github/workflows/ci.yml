@@ -23,6 +23,22 @@ jobs:
       - run: just doctor
       - run: just fmt-check
       - run: just ci-lint
+      - run: just toolchain-test
+      - run: just bootstrap-toolchain
+      - name: Reject accidental native compiler use
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/no-native-capnp"
+          for tool in capnp capnpc capnpc-zig; do
+            cat > "$RUNNER_TEMP/no-native-capnp/$tool" <<'SH'
+          #!/bin/sh
+          echo "Native Cap'n Proto tools are disabled in the WASM tooling gate" >&2
+          exit 1
+          SH
+            chmod +x "$RUNNER_TEMP/no-native-capnp/$tool"
+          done
+          echo "$RUNNER_TEMP/no-native-capnp" >> "$GITHUB_PATH"
+      - run: just gen-check-pinned
       - run: just vectors-check
       - run: just test
       - run: zig build test -Doptimize=ReleaseSafe --summary all

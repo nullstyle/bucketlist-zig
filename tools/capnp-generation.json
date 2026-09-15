@@ -1,0 +1,7 @@
+{
+  "schemas_root": "schema",
+  "entrypoints": ["proof.capnp"],
+  "outputs": {"proof.zig": "src/proof_gen.zig"},
+  "format": true,
+  "dependency": "capnp"
+}

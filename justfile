@@ -8,6 +8,25 @@ doctor:
     echo "Zig: $have"
     mise exec -- just --version
 
+# Fetch and verify the locked capnp-wasm compiler package.
+bootstrap-toolchain:
+    mise exec -- python3 tools/capnp_tool.py bootstrap
+
+# Regenerate proof bindings with the generator from the pinned capnp dependency.
+gen:
+    mise exec -- python3 tools/capnp_tool.py gen
+
+# Compare staged bindings without changing the checkout.
+gen-check:
+    mise exec -- python3 tools/capnp_tool.py check
+
+# Explicit pinned check; every generation command uses the pinned generator.
+gen-check-pinned: gen-check
+
+# Exercise archive validation and generation failure handling.
+toolchain-test:
+    mise exec -- python3 -m unittest discover -s tools -p 'test_capnp_tool.py'
+
 # Unit/property/fixture tests, storage tests, and two-table example.
 test:
     mise exec -- zig build test --summary all
@@ -86,7 +105,7 @@ linux-check:
 core-oracle:
     mise exec -- python3 tools/check-core-oracle.py
 
-preflight: doctor fmt-check ci-lint vectors-check test wasm-diff wasm-verify guided-self-test
+preflight: doctor fmt-check ci-lint toolchain-test bootstrap-toolchain gen-check vectors-check test wasm-diff wasm-verify guided-self-test
     mise exec -- zig build test -Doptimize=ReleaseSafe --summary all
     mise exec -- zig build check -Dtarget=x86_64-linux --summary all
     mise exec -- python3 tools/package-preflight.py

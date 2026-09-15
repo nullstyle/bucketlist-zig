@@ -61,7 +61,9 @@ bucket frames during save and restore one bucket at a time, avoiding a second
 full serialized checkpoint in memory. See [measurements](docs/performance.md).
 
 A standalone consumer [build](examples/directory/build.zig) imports
-`dependency.module("bucketlist")`. The package has no external dependencies.
+`dependency.module("bucketlist")`. The `bucketlist-proofs` transport uses the
+pinned capnp-zig runtime; the database's canonical storage format is independent
+of Cap'n Proto.
 For native storage, also import `dependency.module("bucketlist-store")` and
 provide `std.Io` explicitly.
 
@@ -92,6 +94,33 @@ mise exec -- just preflight
 `mise.toml` is the exact compiler/tool pin. Zig matches the inspected SLCP
 revision; use `mise exec -- ...` to avoid another compiler manager taking PATH
 precedence. Ordinary library consumers do not need the development tools.
+
+### Proof schema generation
+
+`schema/proof.capnp` defines the `bucketlist-proofs` transport. Its generated
+bindings are checked in as `src/proof_gen.zig`; normal builds and tests use those
+files directly.
+
+```sh
+mise exec -- just bootstrap-toolchain
+mise exec -- just gen-check-pinned
+# After editing schema/proof.capnp:
+mise exec -- just gen
+```
+
+Generation runs the checksum-pinned [capnp-wasm](https://github.com/nullstyle/capnpc-wasm)
+compiler under the Wasmtime version in `mise.toml`. The driver builds a WASI
+generator from this package's capnp-zig dependency in `build.zig.zon`, formats
+the staged output with the pinned Zig version, and maps `proof.zig` to
+`src/proof_gen.zig`. `tools/capnp-toolchain.json` locks the compiler artifact;
+`tools/capnp-generation.json` declares the schema and output mapping.
+
+`just gen-check` and `just gen-check-pinned` compare staged output without
+rewriting tracked files. The Linux and macOS CI gates require matching bindings.
+Bootstrap fetches the verified compiler package into a local cache. Generation
+requires that verified package to be installed; it does not require native
+`capnp` or a sibling checkout. `just toolchain-test` checks the tooling's archive
+validation and failure handling.
 
 Other checks:
 
